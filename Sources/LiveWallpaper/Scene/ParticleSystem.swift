@@ -966,8 +966,13 @@ final class ParticleSimulator {
                 uvOffset = SIMD2(Float(col) * sheetUVScale.x, Float(row) * sheetUVScale.y)
                 uvSc = sheetUVScale
             }
-            // 单帧贴图宽高比可能非 1:1,用 uvScale 比例修正 quad 让贴图不变形。
-            let aspect = uvSc.x > 0 && uvSc.y > 0 ? uvSc.x / uvSc.y : 1
+            // 单帧贴图宽高比可能非 1:1,修正 quad 让贴图不变形。**每帧像素宽高比** = 帧UV比 × 贴图高宽比的倒数
+            //   = (uvSc.x/uvSc.y) / trailTextureRatio(=(uvSc.x·atlasW)/(uvSc.y·atlasH) = frameW/frameH 像素比)。
+            //   shader 把此 aspect 乘到 quad 的 X(width)→ 宽:高 = aspect:1 = 真实帧像素比。对齐 lwe CParticle.cpp:1936。
+            //   之前只用 uvSc.x/uvSc.y(=网格 cols 比,忽略 atlas 非方形)→ rosepetals(512×128横排5)算成 0.2,花瓣压成
+            //   5:1 竖条;正确应 0.8。方形贴图(trailTextureRatio=1)不变 → 零回归。
+            let tr = desc.trailTextureRatio
+            let aspect = (uvSc.x > 0 && uvSc.y > 0 && tr > 0) ? (uvSc.x / uvSc.y) / tr : 1
             var instSize = abs(s)
             var instRot = p.rotation
             var instAspect = aspect

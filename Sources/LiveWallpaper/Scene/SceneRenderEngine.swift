@@ -889,9 +889,10 @@ final class SceneRenderEngine {
                                         sheetFrames: frames, sheetCols: cols, sheetUVScale: uvScale,
                                         frameRects: frameRects, frameDuration: frameDuration)
             sim.randomFrameMode = em.randomFrame
-            // spritetrail:注入贴图原始高宽比(g_RenderVar1.w 的基,CParticle.cpp:1948 texH/texW),
-            // 拖尾长度 = size·trailLenClamped·textureRatio 要用到。建组时才知道真实贴图尺寸。
-            if em.isSpriteTrail && tex.width > 0 {
+            // 贴图原始高宽比 texH/texW(CParticle.cpp:1948)。**所有 sprite 粒子都要**(不只 trail):普通
+            // sprite 的每帧像素高宽比 = 帧UV比 × 此值,用于把非方形精灵表/非方形贴图按真实比例渲(否则花瓣
+            // 被压成竖条 = 御剑樱花的真因)。trail 的拖尾长度也用它。建组时才知道真实贴图尺寸。
+            if tex.width > 0 {
                 sim.desc.trailTextureRatio = Float(tex.height) / Float(tex.width)
             }
             sim.warmup(seconds: max(2, em.lifetimeMax))   // 预热到稳态,避免开场空屏
@@ -1169,10 +1170,12 @@ final class SceneRenderEngine {
                 layers[i].origin = SIMD2(pa.x + rotated.x, pa.y + rotated.y)
                 layers[i].baseModel = matModel(centerPx: layers[i].origin, sizePx: layers[i].sizePx, angleDegZ: layers[i].baseAngleZ)
             }
-            // 音频条 opacity 关键帧(剑音条 id=510 静态回退 opacity=0 → 全透明不可见的真因):仅对 audioBars 层
-            // 把 weAnim 逐帧求值写回 weParams。**只放行 audioBars 层**——打雷 composelayer 的 opacity×pulse 链
-            // 仍不应用(过曝回归),与 1026 注释的全局停用一致,这里是针对音频条的白名单放行。
-            if layers[i].audioBars != nil {
+            // 音频条 opacity 关键帧(剑音条 id=510/654 静态回退 opacity=0 → 全透明不可见的真因):把 weAnim 逐帧
+            // 求值写回 weParams。放行 audioBars 层 **+ 非 pulse 的 region composelayer**(frameBufferInput &&
+            // regionFit:御剑的剑音条/下音条/中音条都是 composelayer,audioBars==nil,但 opacity 是关键帧动画)。
+            // **regionFit 天然排除打雷 pulse**(pulse 是 frameBufferInput && !regionFit)→ 不会触发 opacity×pulse
+            // 过曝回归(与 1026 注释一致)。修缺口:任何带 opacity 关键帧的音频 composelayer 此前都不显示。
+            if layers[i].audioBars != nil || (layers[i].frameBufferInput && layers[i].regionFit) {
                 for j in layers[i].effects.indices {
                     for (key, anim) in layers[i].effects[j].weAnim {
                         let vals = anim.evaluate(time: t)
