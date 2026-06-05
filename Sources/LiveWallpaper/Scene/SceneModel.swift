@@ -355,6 +355,17 @@ struct CameraDesc {
     var orthoAuto: Bool = false
     var orthoWidth: Float = 1920
     var orthoHeight: Float = 1080
+    // 缺口2:透视 vs 正交相机判别。
+    // 依据:lwe Camera 类**只**支持正交场景相机——CScene.cpp:34-74 无条件 setOrthogonalProjection,
+    // 且 WallpaperParser.cpp:28-29 对 "orthogonalprojection" 用 require(缺失即抛)。即 lwe 不支持透视场景,
+    // 没有 setPerspectiveProjection 可移植(穷尽 grep:Camera.cpp 仅 ortho;唯一 perspective 构建在
+    // CParticle.cpp:1884-1896,是粒子级、eye 硬编码 (0,0,1000),非场景相机)。
+    // 真 WE 语义(授权扣数据):scene.json 的 general.orthogonalprojection 为 **null/缺失** 时该场景是 3D/透视
+    // 场景(实测 assets/scenes/modeleditor:orthogonalprojection=null 且 general 顶层带 fov/nearz/farz/zoom;
+    // 对照 particleeditor:orthogonalprojection={width,height} 且无 fov=正交)。透视 proj 照 lwe Camera 已备好的
+    // 接口语义建:perspective(radians(fov), aspect, nearz, farz) · lookAt(eye,center,up)(Camera.cpp:13 lookAt、
+    // :36-40 getFov/getNearZ/getFarZ;CParticle.cpp:1892 glm::perspective(fov,aspect,nearz,farz) 用法移植)。
+    var isPerspective: Bool = false
 }
 
 /// 解析后的场景文档:画布尺寸 + 背景色 + 图层列表(按绘制顺序,后画的在上)。
@@ -433,6 +444,16 @@ struct SceneDocument {
             // 不强行写 0(避免下游按 0 尺寸分母出错)。TODO(上层渲染):auto 时以窗口尺寸为准。
             camera.orthoWidth = cw
             camera.orthoHeight = ch
+        } else {
+            // 缺口2:orthogonalprojection 为 null/缺失 → 透视(3D)场景(见 CameraDesc.isPerspective 依据)。
+            // 此时画布尺寸无 ortho w/h 可取,沿用默认 1920×1080(orthoAuto 契约外的回退;cw/ch 已是默认)。
+            // 透视场景把 fov/nearz/farz 放在 general 顶层(实测 modeleditor:general.fov/nearz/farz),
+            // camera 子节通常只有 center/eye/up。先用 general 顶层值作为相机投影参数的默认,
+            // 下方 camera 子节若另带 nearz/farz/fov 仍按 WallpaperParser.cpp:75-77 覆盖(camera 子节优先)。
+            camera.isPerspective = true
+            if let n = (VecParse.unwrap(general["nearz"]) as? NSNumber)?.floatValue { camera.nearZ = n }
+            if let f = (VecParse.unwrap(general["farz"])  as? NSNumber)?.floatValue { camera.farZ  = f }
+            if let v = (VecParse.unwrap(general["fov"])   as? NSNumber)?.floatValue { camera.fov   = v }
         }
         // camera 子节(scene.json 顶层的 "camera",WallpaperParser.cpp:26/67-77)。可缺失。
         if let cam = scene["camera"] as? [String: Any] {
@@ -893,21 +914,37 @@ struct SceneDocument {
             // 角度三元组只 z 分量有效(matModel 只取 .z),x/y 保留原始裸值。
             var absAngles = VecParse.f3(obj["angles"])
             if objId >= 0 { absAngles.z = absoluteAngle(objId) }
-            // 缺口A:cropoffset 重定位(多部件角色散架真因)。WE 把贴图透明边裁掉省显存,model.json.cropoffset
-            // 记录裁剪后子图相对原始全幅锚点的位移(纹理像素)。多部件角色部件的 origin 是很小的父-局部值,
-            // 真实摆位必须叠加 cropoffset(数据证:凯尔希 puppet 各部件 localOrigin−cropoffset 收敛到同一锚点)。
-            // **正确空间(纠正旧 naive 失败版的关键)**:cropoffset 在部件**自身局部空间**,经**父**累积 scale/angle
-            // 变换后从 absOrigin 减去 —— 等价于 resolveTransform 累积前 `localOrigin −= cropoffset`(单级精确)。
-            // 旧 naive 版误用**自身累积** scale/angle(含部件自身 scale/angle)→ 多变换一层 → 更散,已撤;此为纠正版。
-            // 仅对**有 parent 的 child 层**启用。**默认关(opt-in WP_CROPOFFSET=1)**:实测此纠正版公式
-            // 改善伊蕾娜未尽之旅(长发恢复)但**破坏 Postscript(头部散架)**——根因是 cropoffset 在不同壁纸里
-            // 有的已烘进 origin(再减=双重修正→散)、有的没有,**无通用判别规则**可零回归区分(前任亦因此禁用)。
-            // 真正解需建模 WE 完整的纹理 rect/padding 体系(较大工程)。故默认关、保留代码供将来;WP_CROPOFFSET=1 试开。
+            // 缺口1:cropoffset 重定位(多部件角色散架真因)。穷尽确认 **lwe 完全不读 cropoffset**
+            // (grep 0 命中;ModelParser.cpp:19-33 只读 material/solidlayer/fullscreen/passthrough/autosize/
+            //  nopadding/width/height/puppet)。故照**真 WE 语义**补(已授权扣数据):
+            // ── 真 WE 语义(从 pkg 数据扣得,非臆测)──────────────────────────────────────
+            //   WE 把贴图四周透明边**裁掉**省显存,得到一张**更小**的图(=纹理 realWH)。cropoffset 记录这张
+            //   裁剪后子图的中心相对**原始全幅**锚点的位移(单位=**原始图像素**,实测多为 .5 半像素值)。
+            //   渲染的 quad 尺寸 = 裁剪后纹理(autosize → realWH),UV 仍**整图 0..1 全采**(裁剪后内容铺满 quad)。
+            //   ∴ cropoffset **不是 UV 偏移**(本任务原假设的"UV/采样偏移"被数据否定),而是**把 quad 整体平移**回
+            //   原图应在的位置 = **origin 减去 cropoffset**(在部件自身局部空间)。
+            // ── 数据证(伊蕾娜未尽之旅 3302695207,部件 人物/扫帚,共父 553、父 scale=1 angle=0)──────
+            //   人物 origin=(258.06,-115.75) crop=(756.5,-380.5) → origin−crop=(-498.4, 264.8)
+            //   扫帚 origin=(-93.17,-467.56) crop=(585.0,-726.5) → origin−crop=(-678.2, 258.9)
+            //   两部件 origin−crop 的 Y 收敛(264.8≈258.9,差~6px)、X 按左右排布合理;origin+crop 则发散。
+            //   ⇒ 方向确为**减**(scene.json 原生空间、无额外 Y 翻转)。puppet 网格顶点在 size 相对空间、随 origin
+            //     定位,故对 origin 平移**不会**双重修正 puppet。
+            // ── 空间正确性 ──────────────────────────────────────────────────────────────
+            //   cropoffset 在部件自身局部空间,经父链**累积** scale/angle 变换后从世界 absOrigin 减去
+            //   = 等价于 resolveTransform 累积前 `localOrigin −= cropoffset`。parentAbsoluteScale/Angle 返回
+            //   **整条父链**累积值(resolveTransform(p0,0)),故任意父深度都正确;无父时取 (scale=1,angle=0)。
+            // ── 可关/默认关 ────────────────────────────────────────────────────────────────
+            //   **默认关(opt-in WP_CROPOFFSET=1)**。理由:① 无法在本环境跑/肉眼校验(用户最终统一构建验);
+            //   ② 历史 MEMORY 记录某版曾"破坏 Postscript"——经核查 Postscript(3693137898)的部件**全是 image
+            //      无 cropoffset**(crop 字段不存在),本门控 `cropoffset != 0` 对它**不触发**,理论零影响;但既
+            //      未实测,保守默认关。开关打开即应用上面数据已验证的正确公式。无 cropoffset 的层(全库绝大多数)
+            //      此分支天然不触发,零影响。
             if ProcessInfo.processInfo.environment["WP_CROPOFFSET"] != nil,
-               objId >= 0, parentOf[objId] != nil,
+               objId >= 0,
                (mdlCropOffset.x != 0 || mdlCropOffset.y != 0) {
-                let pScale = parentAbsoluteScale(objId)
-                let pAngle = parentAbsoluteAngle(objId)
+                // 父链累积 scale/angle(无父 → 单位 (1,1)/0,cropoffset 即世界平移)。
+                let pScale = parentOf[objId] != nil ? parentAbsoluteScale(objId) : SIMD3<Float>(1, 1, 1)
+                let pAngle = parentOf[objId] != nil ? parentAbsoluteAngle(objId) : 0
                 let shift = rotateVec2(SIMD2(pScale.x * mdlCropOffset.x, pScale.y * mdlCropOffset.y), pAngle)
                 absOrigin.x -= shift.x
                 absOrigin.y -= shift.y

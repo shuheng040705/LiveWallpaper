@@ -18,6 +18,36 @@ private func matOrtho(width: Float, height: Float) -> simd_float4x4 {
     ))
 }
 
+/// 缺口2:透视投影矩阵。移植 lwe 唯一的 perspective 用法 CParticle.cpp:1892
+/// `glm::perspective(fov_radians, aspect, nearz, farz)`(场景透视相机 lwe 自身不支持,见 SceneModel
+/// CameraDesc.isPerspective;此处按真 WE 语义用 lwe 已备好的 fov/nearz/farz 建)。
+/// glm::perspective 是右手系、列主序、深度映射到 [-1,1](OpenGL 风格,与本工程现有 matOrtho 一致:
+/// 列主序、CImage 顶点 z=0)。fov 传**弧度**(CParticle.cpp:1891 glm::radians(getFov()))。
+private func matPerspective(fovRadians: Float, aspect: Float, nearZ: Float, farZ: Float) -> simd_float4x4 {
+    let f = 1 / tan(fovRadians / 2)
+    let nf = 1 / (nearZ - farZ)
+    return simd_float4x4(columns: (
+        SIMD4(f / aspect, 0, 0,  0),
+        SIMD4(0,          f, 0,  0),
+        SIMD4(0, 0, (farZ + nearZ) * nf, -1),
+        SIMD4(0, 0, 2 * farZ * nearZ * nf, 0)
+    ))
+}
+
+/// 缺口2:视图矩阵。移植 lwe Camera.cpp:13 `glm::lookAt(eye, center, up)`(右手系、列主序)。
+/// 仅在透视场景使用;正交场景照旧不用 lookAt(见 load() 中等价性证明:ortho 下 (+eye)(−eye) 相消)。
+private func matLookAt(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> simd_float4x4 {
+    let zf = simd_normalize(eye - center)   // glm lookAt: f = normalize(center-eye); 这里 z = -f = normalize(eye-center)
+    let xf = simd_normalize(simd_cross(up, zf))
+    let yf = simd_cross(zf, xf)
+    return simd_float4x4(columns: (
+        SIMD4(xf.x, yf.x, zf.x, 0),
+        SIMD4(xf.y, yf.y, zf.y, 0),
+        SIMD4(xf.z, yf.z, zf.z, 0),
+        SIMD4(-simd_dot(xf, eye), -simd_dot(yf, eye), -simd_dot(zf, eye), 1)
+    ))
+}
+
 private func matModel(centerPx: SIMD2<Float>, sizePx: SIMD2<Float>, angleDegZ: Float) -> simd_float4x4 {
     // ⚠ angleDegZ 名字是历史误称——WE 的 angles 单位其实是**弧度**(lwe CImage.cpp:1083
     // "already in radians from scene.json";glm::rotate 取弧度),不是角度!之前 ×π/180 当成
@@ -449,7 +479,31 @@ final class SceneRenderEngine {
         // (lwe 自己 Camera.cpp:11-12 注释:lookAt 对正交相机 "throws off points",translate(eye) 正是去抵消它)。
         // 故 matOrtho(无 eye、无 lookAt)与 lwe 的 proj·lookAt 在 XY 上逐位相同。**单独 translate(eye) 会双重偏移
         // = 引入 bug**(实测 3679853952 灰条)。全库 57 张 scene 的 eye.xy 要么为 0、要么经抵消后框取与纯 ortho 一致。
-        let proj = matOrtho(width: canvas.x, height: canvas.y)
+        //
+        // 缺口2:透视(3D)场景相机。判别见 SceneModel CameraDesc.isPerspective(general.orthogonalprojection
+        // 为 null/缺失 → 透视)。**正交保持上面的等价做法不动**;仅当 isPerspective 时才走透视分支。
+        // lwe 自身不支持透视场景相机(Camera 类只有 setOrthogonalProjection),无可直接移植的 Camera 透视分支;
+        // 这里按真 WE 语义、用 lwe Camera 已备好的 fov/nearz/farz(Camera.cpp:36-40)与 lookAt(Camera.cpp:13)、
+        // 以及 lwe 唯一 perspective 构建用法(CParticle.cpp:1892 glm::perspective)建:proj = perspective · lookAt。
+        // ⚠ 不确定/留作裁决:本工程其余几何(matModel 像素 quad、matOrtho 像素→NDC、CImage Y 翻转、视差/footprint)
+        //   全部围绕**像素空间正交**搭建。WE 透视场景的对象坐标是 3D 世界单位(非画布像素),完整正确渲染需要
+        //   把对象 origin/size 当世界单位、模型用 puppet/model mesh 真 3D 顶点喂进 perspective·lookAt——这是更大的
+        //   3D 管线工程,本任务范围只补**相机投影矩阵**本身(机制就位、可独立编译),供 3D 场景接入时使用。
+        //   现有 2D 像素管线在透视 proj 下取景**不会自动正确**(像素当世界单位会缩到极小)。故透视分支默认**关**
+        //   (opt-in WP_PERSPECTIVE_CAMERA=1),避免把当前按 2D 处理的场景显示弄坏;开关打开则用真透视 proj。
+        let proj: simd_float4x4
+        if document.camera.isPerspective,
+           ProcessInfo.processInfo.environment["WP_PERSPECTIVE_CAMERA"] != nil {
+            let cam = document.camera
+            let aspect = canvas.x / canvas.y
+            let p = matPerspective(fovRadians: cam.fov * Float.pi / 180,   // CParticle.cpp:1891 glm::radians(fov)
+                                   aspect: aspect, nearZ: cam.nearZ, farZ: cam.farZ)
+            let v = matLookAt(eye: cam.eye, center: cam.center, up: cam.up) // Camera.cpp:13
+            proj = p * v                                                    // CImage.cpp:389 getProjection()*getLookAt()
+            Log.write("scene: perspective camera fov=\(cam.fov) eye=\(cam.eye) near=\(cam.nearZ) far=\(cam.farZ)")
+        } else {
+            proj = matOrtho(width: canvas.x, height: canvas.y)
+        }
         let loader = MTKTextureLoader(device: device)
 
         var result: [GPULayer] = []

@@ -124,9 +124,21 @@ struct ParticleEmitterDesc {
     var oscAFreqMin: Float = 0, oscAFreqMax: Float = 10, oscAScaleMin: Float = 0, oscAScaleMax: Float = 1, oscAPhaseMin: Float = 0, oscAPhaseMax: Float = 6.2831853
     var hasOscSize = false
     var oscSFreqMin: Float = 0, oscSFreqMax: Float = 10, oscSScaleMin: Float = 0.8, oscSScaleMax: Float = 1.2, oscSPhaseMin: Float = 0, oscSPhaseMax: Float = 6.2831853
-    var hasOscPos = false
-    var oscPFreqMin: Float = 0, oscPFreqMax: Float = 5, oscPScaleMin: Float = 0, oscPScaleMax: Float = 10, oscPPhaseMin: Float = 0, oscPPhaseMax: Float = 6.2831853
-    var oscPMask: SIMD3<Float> = SIMD3(1, 1, 0)
+    // oscillateposition:WE 把每个 operator 当独立条目逐个 apply(lwe setupOperators CParticle.cpp:971-1011
+    // 遍历 m_particle.operators,每个 oscillateposition 在 :1001-1002 各自生成一个 OperatorFunc 压进 m_operators,
+    // update 时全部执行 :1631-1641)。**同一 group 可声明多个 oscillateposition**(如雪的「双摆」:一个左右、
+    // 一个上下),旧实现用单字段 → 后一个覆盖前一个,丢了主力摆动。改为**配置数组**,每个配置各自一套逐粒子
+    // freq/scale/phase 状态,独立 apply(对齐 lwe 的 operator 列表逐个执行)。
+    // 注:lwe 自身把逐粒子振荡状态存在单个 struct(CParticle.h:59-64),多个 oscillateposition 会**共享**该随机
+    // 状态(lwe 已知局限);我们给每个配置独立状态,是更准的 WE 语义(每个 operator 独立随机),也正是用户要的
+    // 「双摆各自摆动」。默认 freq 0-5 / scale 0-10 / phase 0-2π / mask (1,1,0)。
+    struct OscPos {
+        var freqMin: Float = 0, freqMax: Float = 5
+        var scaleMin: Float = 0, scaleMax: Float = 10
+        var phaseMin: Float = 0, phaseMax: Float = 6.2831853
+        var mask: SIMD3<Float> = SIMD3(1, 1, 0)
+    }
+    var oscPositions: [OscPos] = []
     // controlpointattract 算子:阈值内朝控制点恒力吸引。threshold = thresholdRaw/2;
     // dist∈(0.001, threshold) 时 vel += (toCenter/dist)·scale·dt·speedOverride。scale<0 = 排斥。
     // 中心 = controlpoint[index].offset + op.origin(WE 用 operator 的 `controlpoint` 整数索引指向粒子层
@@ -135,11 +147,23 @@ struct ParticleEmitterDesc {
     // 对照 CParticle.cpp:1462-1505 + ObjectParser.cpp:962-966。
     struct CPAttract { var center: SIMD3<Float>; var scale: Float; var threshold: Float }
     var cpAttracts: [CPAttract] = []
-    // remapvalue 算子(只实现 output:"velocity" + transformfunction:"simplexnoise"):用 simplex 噪声把
-    // 粒子位置驱动出一个噪声值 t∈[0,1],在 outputrangemin..outputrangemax(SIMD3)间 mix 得速度增量,加到速度。
-    // 输入坐标按 transforminputscale 缩放。用于屏幕雨的速度噪声驱动(rain_screen_*)。
-    // 对照 WE remapvalue operator(simplexnoise→remap→output velocity)。
-    var hasRemapVelocity = false
+    // remapvalue 算子。**lwe 根本没有 remapvalue**(穷尽搜 src/WallpaperEngine:setupOperators 分发表无、
+    // CParticle.cpp/.h/Data/Parsers 全无;唯一的 "remap" 命中是 TextureMap 与 External/spirv-remap,非粒子逻辑)。
+    // 故此算子按**真 WE remapvalue 语义**移植(用户授权扣数据):用一个噪声场把粒子的某个标量 source 映射出
+    // 噪声值 t∈[0,1],在 outputrangemin..outputrangemax(SIMD3)间 mix 成一个增量,加到 output 指向的量上。
+    //   source(被采样/被映射的输入):
+    //     • "velocity"(默认):用**粒子位置**驱动噪声(位置 → 噪声场 → 速度增量),屏幕雨的速度噪声驱动(rain_screen_*)。
+    //     • "speed":用**粒子速度大小**(|vel|)驱动噪声相位 → 按速度快慢调制(Gouttes 玻璃水珠等按速度飘)。
+    //   transformfunction(噪声类型):
+    //     • "simplexnoise":单倍频噪声(我们用 perlin 近似 simplex,见下,可接受;标注)。
+    //     • "fbmnoise":分形布朗噪声 = 多个 octave 的 perlin 按 amplitude/frequency 倍增叠加(lacunarity/gain 标准值)。
+    //   output(增量加到何处):目前实现 "velocity"(加到速度);其余 output 暂不置位。
+    // 输入坐标按 transforminputscale 缩放。
+    //【WE 语义不确定处已显式标注】:source=speed 的「速度→噪声坐标」精确公式、fbm 的 octave 数/lacunarity/gain
+    //  在 WE 中无公开规范 → 采用标准 fBm 约定(octaves=4, lacunarity=2, gain=0.5),并在使用处标注为假设。
+    var hasRemap = false
+    var remapSourceSpeed = false        // source=="speed"(否则按位置驱动,=velocity)
+    var remapFbm = false                // transformfunction=="fbmnoise"(否则单倍频 simplex/perlin)
     var remapInputScale: Float = 1
     var remapOutputMin: SIMD3<Float> = .zero
     var remapOutputMax: SIMD3<Float> = .zero
@@ -248,7 +272,15 @@ private struct Particle {
     // oscillate 逐粒子状态(spawn 时随机一次;照 WE 的 per-particle frequency/phase)。
     var oscAFreq: Float = 0, oscAPhase: Float = 0
     var oscSFreq: Float = 0, oscSPhase: Float = 0
-    var oscPFreq: SIMD3<Float> = .zero, oscPScale: SIMD3<Float> = .zero, oscPPhase: SIMD3<Float> = .zero
+    // oscillateposition 逐粒子状态:**每个 oscPositions 配置一套**(支持多个 oscillateposition 各自独立摆动)。
+    var oscPState: [OscPState] = []
+}
+
+/// 单个 oscillateposition 配置的逐粒子随机状态(每个配置 spawn 时独立随机一次)。
+private struct OscPState {
+    var freq: SIMD3<Float> = .zero
+    var scale: SIMD3<Float> = .zero
+    var phase: SIMD3<Float> = .zero
 }
 
 /// CPU 粒子模拟器:发射 + 更新 + 输出渲染实例。
@@ -309,6 +341,28 @@ final class ParticleSimulator {
     private func rotate(_ v: SIMD3<Float>, _ k: SIMD3<Float>, _ a: Float) -> SIMD3<Float> {
         let c = cos(a), s = sin(a)
         return v * c + cross(k, v) * s + k * (dot(k, v) * (1 - c))
+    }
+
+    /// 分形布朗噪声(fBm):多个 octave 的 perlin 噪声按 amplitude(gain)/frequency(lacunarity)倍增叠加,
+    /// 归一到 ~[-1,1]。供 remapvalue transformfunction=="fbmnoise" 用(lwe 无此算子,按真 WE 语义移植)。
+    ///【WE 语义不确定:WE 的 fbm octave 数 / lacunarity / gain 无公开规范 → 取业界标准 fBm 约定:
+    ///  octaves=4、lacunarity=2.0(每倍频频率 ×2)、gain=0.5(每倍频幅度 ×0.5);可接受近似,标为假设。】
+    private static func fbm(_ p: SIMD3<Float>) -> Float {
+        let octaves = 4
+        let lacunarity: Double = 2.0
+        let gain: Double = 0.5
+        var freq: Double = 1.0
+        var amp: Double = 0.5
+        var sum: Double = 0.0
+        var norm: Double = 0.0   // 累计幅度,末尾归一保持 ~[-1,1]
+        let x = Double(p.x), y = Double(p.y), z = Double(p.z)
+        for _ in 0..<octaves {
+            sum += amp * WENoise.perlin(x * freq, y * freq, z * freq)
+            norm += amp
+            freq *= lacunarity
+            amp *= gain
+        }
+        return norm > 0 ? Float(sum / norm) : 0
     }
     private var simTime: Float = 0   // 当前 sim 时间(turbVelRand 在 spawn 采 curl 用)
 
@@ -453,24 +507,44 @@ final class ParticleSimulator {
                     particles[i].vel += (toCenter / dist) * attract.scale * d * desc.ioSpeed
                 }
             }
-            if desc.hasRemapVelocity {
-                // remapvalue(output velocity + simplexnoise):噪声值 t∈[0,1] 在 outputrangemin..max 间 mix,
-                // 加到速度。输入坐标按 transforminputscale 缩放(与 turbulence 用同一 WENoise)。
-                // WENoise.perlin 返回 ~[-1,1] 的标量 → (n+1)/2 归一到 [0,1] 当 simplex 噪声替身。
-                let np = particles[i].pos * desc.remapInputScale
-                let n = Float(WENoise.perlin(Double(np.x), Double(np.y), Double(np.z + simTime)))
+            if desc.hasRemap {
+                // remapvalue → output velocity:噪声值 t∈[0,1] 在 outputrangemin..max 间 mix,加到速度。
+                // 噪声坐标按 source 选择(velocity=位置驱动 / speed=速度大小驱动),按 transforminputscale 缩放。
+                // 噪声标量 ∈ ~[-1,1] → (n+1)/2 归一到 [0,1]。
+                var np: SIMD3<Float>
+                if desc.remapSourceSpeed {
+                    // source=speed:用粒子速度大小 |vel| 作主驱动维,叠时间漂移。
+                    //【WE 语义不确定:speed→噪声坐标的精确映射无公开规范,此处取 |vel|×inputScale 为 x 维 + 位置微扰为 y/z + 时间为 z 漂移,标为假设】
+                    let spd = simd_length(particles[i].vel)
+                    np = SIMD3(spd * desc.remapInputScale,
+                               particles[i].pos.y * desc.remapInputScale,
+                               particles[i].pos.z * desc.remapInputScale + simTime)
+                } else {
+                    // source=velocity(默认):位置驱动噪声场。
+                    let p = particles[i].pos * desc.remapInputScale
+                    np = SIMD3(p.x, p.y, p.z + simTime)
+                }
+                // transformfunction:fbmnoise=分形布朗(多倍频叠加)/ 否则单倍频 perlin(simplex 的 perlin 近似)。
+                let n: Float = desc.remapFbm
+                    ? ParticleSimulator.fbm(np)
+                    : Float(WENoise.perlin(Double(np.x), Double(np.y), Double(np.z)))
                 let t = max(0, min(1, (n + 1) * 0.5))
                 let remapped = desc.remapOutputMin + (desc.remapOutputMax - desc.remapOutputMin) * t
                 particles[i].vel += remapped * d * desc.ioSpeed
             }
             // (位置积分已在受力之前完成,见上方 #1;此处不再重复积分。)
-            if desc.hasOscPos {
-                // 位置振荡(cos 摆动的导数 = -sin × dt,逐轴 freq/scale/phase)。对照 CParticle.cpp:1631-1641。
-                let t = particles[i].age, w = particles[i].oscPFreq
-                let sn = SIMD3(sin(w.x*t + particles[i].oscPPhase.x),
-                               sin(w.y*t + particles[i].oscPPhase.y),
-                               sin(w.z*t + particles[i].oscPPhase.z))
-                particles[i].pos += (-particles[i].oscPScale * w * sn * d) * desc.oscPMask
+            // oscillateposition:**多个配置各自独立 apply**(对齐 lwe operator 列表逐个执行,CParticle.cpp:1001-1002)。
+            // 每个配置:位置振荡(cos 摆动的导数 = -sin × dt,逐轴 freq/scale/phase × mask)。对照 CParticle.cpp:1625-1634。
+            if !desc.oscPositions.isEmpty {
+                let t = particles[i].age
+                for (ci, cfg) in desc.oscPositions.enumerated() where ci < particles[i].oscPState.count {
+                    let st = particles[i].oscPState[ci]
+                    let w = st.freq
+                    let sn = SIMD3(sin(w.x*t + st.phase.x),
+                                   sin(w.y*t + st.phase.y),
+                                   sin(w.z*t + st.phase.z))
+                    particles[i].pos += (-st.scale * w * sn * d) * cfg.mask
+                }
             }
             // 【审计修复 #2/#3】angularmovement:lwe CParticle.cpp:1088-1100 顺序 = 先积分 rotation(用上一帧角速度)、
             // 再受力、再角阻力;且 rotation **仅在 angularmovement 算子存在时**积分(lwe 全文唯一的 rotation+= 在此算子内,
@@ -688,10 +762,15 @@ final class ParticleSimulator {
             p.oscSFreq = rnd(desc.oscSFreqMin, desc.oscSFreqMax)
             p.oscSPhase = rnd(desc.oscSPhaseMin, desc.oscSPhaseMax + tau)
         }
-        if desc.hasOscPos {
-            p.oscPFreq = rnd3(SIMD3(repeating: desc.oscPFreqMin), SIMD3(repeating: desc.oscPFreqMax))
-            p.oscPScale = rnd3(SIMD3(repeating: desc.oscPScaleMin), SIMD3(repeating: desc.oscPScaleMax))
-            p.oscPPhase = rnd3(SIMD3(repeating: desc.oscPPhaseMin), SIMD3(repeating: desc.oscPPhaseMax + tau))
+        // 每个 oscillateposition 配置各自随机一套逐粒子 freq/scale/phase(对齐 lwe 逐 operator 独立初始化,
+        // CParticle.cpp:1611-1618;phase = rand(phaseMin, phaseMax+2π))。
+        if !desc.oscPositions.isEmpty {
+            p.oscPState = desc.oscPositions.map { cfg in
+                OscPState(
+                    freq:  rnd3(SIMD3(repeating: cfg.freqMin),  SIMD3(repeating: cfg.freqMax)),
+                    scale: rnd3(SIMD3(repeating: cfg.scaleMin), SIMD3(repeating: cfg.scaleMax)),
+                    phase: rnd3(SIMD3(repeating: cfg.phaseMin), SIMD3(repeating: cfg.phaseMax + tau)))
+            }
         }
         return p
     }
@@ -1236,17 +1315,25 @@ enum ParticleParser {
                 d.oscSScaleMin = num(op["scalemin"], 0.8); d.oscSScaleMax = num(op["scalemax"], 1.2)
                 d.oscSPhaseMin = num(op["phasemin"], 0); d.oscSPhaseMax = num(op["phasemax"], 6.2831853)
             case "oscillateposition":
-                d.hasOscPos = true
-                d.oscPFreqMin = num(op["frequencymin"], 0); d.oscPFreqMax = num(op["frequencymax"], 5)
-                d.oscPScaleMin = num(op["scalemin"], 0); d.oscPScaleMax = num(op["scalemax"], 10)
-                d.oscPPhaseMin = num(op["phasemin"], 0); d.oscPPhaseMax = num(op["phasemax"], 6.2831853)
-                d.oscPMask = VecParse.f3(op["mask"], default: SIMD3(1, 1, 0))
+                // **每个 oscillateposition 各自 append 一个配置**(不再覆盖单字段)——同一 group 的多个
+                // oscillateposition(雪「双摆」:一个 mask(1,0,0) 左右、一个 mask(0,1,0) 上下)各自独立 apply,
+                // 对齐 lwe operator 列表逐个执行(setupOperators CParticle.cpp:971-1011 / :1001-1002)。
+                d.oscPositions.append(ParticleEmitterDesc.OscPos(
+                    freqMin: num(op["frequencymin"], 0),  freqMax: num(op["frequencymax"], 5),
+                    scaleMin: num(op["scalemin"], 0),     scaleMax: num(op["scalemax"], 10),
+                    phaseMin: num(op["phasemin"], 0),     phaseMax: num(op["phasemax"], 6.2831853),
+                    mask: VecParse.f3(op["mask"], default: SIMD3(1, 1, 0))))
             case "remapvalue":
-                // 只实现 output:"velocity" + transformfunction:"simplexnoise"(屏幕雨速度噪声驱动)。
-                // 其余(output:"speed" / fbmnoise 等)暂不实现 → 不置位。
-                if (op["output"] as? String) == "velocity",
-                   (op["transformfunction"] as? String) == "simplexnoise" {
-                    d.hasRemapVelocity = true
+                // lwe 无此算子(穷尽搜确认)→ 按真 WE remapvalue 语义移植。
+                // output 指增量加到何处,目前实现 "velocity"(加到速度);source/transformfunction 决定输入与噪声类型。
+                //   source: "velocity"(默认,位置驱动) / "speed"(速度大小驱动)。
+                //   transformfunction: "simplexnoise"(单倍频,perlin 近似) / "fbmnoise"(分形布朗,多倍频叠加)。
+                if (op["output"] as? String) == "velocity" {
+                    let src = (op["source"] as? String) ?? "velocity"
+                    let tf = (op["transformfunction"] as? String) ?? "simplexnoise"
+                    d.hasRemap = true
+                    d.remapSourceSpeed = (src == "speed")
+                    d.remapFbm = (tf == "fbmnoise")
                     d.remapInputScale = num(op["transforminputscale"], 1)
                     d.remapOutputMin = VecParse.f3(op["outputrangemin"], default: .zero)
                     d.remapOutputMax = VecParse.f3(op["outputrangemax"], default: .zero)
