@@ -75,13 +75,10 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     private let fftLength = 1024
     private var fftSetup: FFTSetup?
     private let log2n: vDSP_Length
-    private var window: [Float]
 
     private override init() {
         log2n = vDSP_Length(log2(Float(fftLength)))
         fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))
-        window = [Float](repeating: 0, count: fftLength)
-        vDSP_hann_window(&window, vDSP_Length(fftLength), Int32(vDSP_HANN_NORM))
         super.init()
     }
 
@@ -294,18 +291,17 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         // 取最后 fftLength 个样本,清掉旧的。
         let samples = Array(sampleAccum.suffix(fftLength))
         sampleAccum.removeAll(keepingCapacity: true)
-        // Hann 窗(用户确认:此原始版本的音频条强度是对的)。2026-06 曾以「对齐 lwe 无窗」为由去掉,
-        // 但用户(对照真 WE 的 ground truth)反馈改后强度不对 → 撤回原始 Hann 窗版本。
-        var windowed = [Float](repeating: 0, count: fftLength)
-        vDSP_vmul(samples, 1, window, 1, &windowed, 1, vDSP_Length(fftLength))
-
+        // 无窗:lwe(PulseAudioPlaybackRecorder.cpp:236-242)把 (x-128)/128 归一样本**直接**喂 kiss_fftr,
+        // 不加任何窗。我方曾在当前会话误加 Hann 窗——Hann 会削平宽带(音乐)频谱峰值 → 条普遍变矮变弱,
+        // 这正是用户报的「强度变弱」真因。两天前(6-2)的版本也无窗。删窗 = 对齐 lwe + 恢复强度正确版本。
+        // samples 直接当 FFT 输入(vDSP_ctoz 把实样本拆成偶/奇 split complex)。
         var real = [Float](repeating: 0, count: fftLength / 2)
         var imag = [Float](repeating: 0, count: fftLength / 2)
         var mags = [Float](repeating: 0, count: fftLength / 2)
         real.withUnsafeMutableBufferPointer { rp in
             imag.withUnsafeMutableBufferPointer { ip in
                 var split = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
-                windowed.withUnsafeBytes { raw in
+                samples.withUnsafeBytes { raw in
                     raw.bindMemory(to: DSPComplex.self).baseAddress.map {
                         vDSP_ctoz($0, 2, &split, 1, vDSP_Length(fftLength / 2))
                     }
