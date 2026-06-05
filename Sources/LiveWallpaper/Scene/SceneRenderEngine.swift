@@ -1653,6 +1653,9 @@ final class SceneRenderEngine {
             let v = (-(p.y / p.w)) * 0.5 + 0.5
             u0 = min(u0, u); u1 = max(u1, u); v0 = min(v0, v); v1 = max(v1, v)
         }
+        // 注:曾试「不钳裁、region 覆盖完整 quad」修中音条「只有左边」(超界条),但实测**弄坏 Postscript 云层**
+        // (它也是 regionFit、quad 略超画布,unclamp 后云扭曲读到透明边 → 整片变暗,meanDiff 60)→ 已撤回钳裁。
+        // 中音条超界错位待更安全的针对性方案(只对音频条而非所有 regionFit composelayer)。
         let px0 = max(0, min(W - 1, Int(u0 * Float(W))))
         let py0 = max(0, min(H - 1, Int(v0 * Float(H))))
         let rw = max(8, min(W - px0, Int((u1 - u0) * Float(W))))
