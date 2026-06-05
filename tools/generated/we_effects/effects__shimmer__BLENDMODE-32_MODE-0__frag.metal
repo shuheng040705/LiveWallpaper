@@ -1,0 +1,70 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct _Globals
+{
+    float g_Time;
+    float u_direction;
+    float u_scale;
+    float u_speed;
+    float u_delay;
+    float u_width;
+    float u_amount;
+    float u_offset;
+    float u_timeoffsetScale;
+    float3 u_color;
+};
+
+struct main0_out
+{
+    float4 _fragColor [[color(0)]];
+};
+
+struct main0_in
+{
+    float4 v_TexCoord [[user(locn0)]];
+};
+
+static inline __attribute__((always_inline))
+float2 rotateVec2(thread const float2& v, thread const float& r)
+{
+    float2 cs = float2(cos(r), sin(r));
+    return float2((v.x * cs.x) - (v.y * cs.y), (v.x * cs.y) + (v.y * cs.x));
+}
+
+static inline __attribute__((always_inline))
+float3 ApplyBlending(int blendMode, thread const float3& A, thread const float3& B, thread const float& opacity)
+{
+    return mix(A, A + (A * B), float3(opacity));
+}
+
+fragment main0_out main0(main0_in in [[stage_in]], constant _Globals& _96 [[buffer(0)]], texture2d<float> g_Texture0 [[texture(0)]], texture2d<float> g_Texture3 [[texture(1)]], sampler g_Texture0Smplr [[sampler(0)]], sampler g_Texture3Smplr [[sampler(1)]])
+{
+    main0_out out = {};
+    float4 albedo = g_Texture0.sample(g_Texture0Smplr, in.v_TexCoord.xy);
+    float mask = 1.0;
+    float offset = 0.0;
+    float2 param = in.v_TexCoord.xy;
+    float param_1 = (-_96.u_direction) + 1.57079637050628662109375;
+    float2 shimmerCoord = rotateVec2(param, param_1) * _96.u_scale;
+    shimmerCoord.x += (_96.u_offset + (_96.u_speed * (_96.g_Time + offset)));
+    shimmerCoord.x = fast::clamp((fract(shimmerCoord.x / (_96.u_scale * _96.u_delay)) * _96.u_scale) * _96.u_delay, 0.0, 1.0);
+    float3 shimmerColor = g_Texture3.sample(g_Texture3Smplr, fract(shimmerCoord)).xyz;
+    float3 effectAlbedo = shimmerColor * _96.u_color;
+    float3 param_2 = albedo.xyz;
+    float3 param_3 = effectAlbedo;
+    float param_4 = 1.0;
+    effectAlbedo = ApplyBlending(32, param_2, param_3, param_4);
+    float4 _170 = albedo;
+    float3 _180 = mix(_170.xyz, effectAlbedo, (shimmerColor * mask) * _96.u_amount);
+    albedo.x = _180.x;
+    albedo.y = _180.y;
+    albedo.z = _180.z;
+    out._fragColor = albedo;
+    return out;
+}
+

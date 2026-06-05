@@ -1,0 +1,22 @@
+[
+ {
+  "key": "workshop/2798319181/bokeh_blur/base",
+  "error": "glslang frag: ar/folders/f0/q7zy1xln64vgghtt8d5zs58h0000gp/T/tmp3qfzxvqd.frag:379: '' : compilation terminated \nERROR: 4 compilation errors.  No code generated.\n\n\nSPIR-V is not generated for failed co"
+ },
+ {
+  "key": "workshop/2798319181/bokeh_blur/MASK-1",
+  "error": "glslang frag: ar/folders/f0/q7zy1xln64vgghtt8d5zs58h0000gp/T/tmpena1hx25.frag:380: '' : compilation terminated \nERROR: 4 compilation errors.  No code generated.\n\n\nSPIR-V is not generated for failed co"
+ },
+ {
+  "key": "workshop/2798319181/bokeh_blur/PRECISE-1",
+  "error": "glslang frag: ar/folders/f0/q7zy1xln64vgghtt8d5zs58h0000gp/T/tmp7_8v3kq3.frag:379: '' : compilation terminated \nERROR: 4 compilation errors.  No code generated.\n\n\nSPIR-V is not generated for failed co"
+ },
+ {
+  "key": "workshop/2798319181/bokeh_blur/PRECISE-1_VERTICAL-1",
+  "error": "glslang frag: ar/folders/f0/q7zy1xln64vgghtt8d5zs58h0000gp/T/tmp6euf2io2.frag:380: '' : compilation terminated \nERROR: 4 compilation errors.  No code generated.\n\n\nSPIR-V is not generated for failed co"
+ },
+ {
+  "key": "workshop/2798319181/bokeh_blur/VERTICAL-1",
+  "error": "glslang frag: ar/folders/f0/q7zy1xln64vgghtt8d5zs58h0000gp/T/tmpfajg6_xb.frag:380: '' : compilation terminated \nERROR: 4 compilation errors.  No code generated.\n\n\nSPIR-V is not generated for failed co"
+ }
+]

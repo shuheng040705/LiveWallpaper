@@ -1,0 +1,10 @@
+# 可重建产物
+.build/
+.swiftpm/
+LiveWallpaper.app/
+LiveWallpaper-bin
+*.dmg
+# 大截图(非源码)
+ui_shot.png
+particle_check.png
+particle_preview.png

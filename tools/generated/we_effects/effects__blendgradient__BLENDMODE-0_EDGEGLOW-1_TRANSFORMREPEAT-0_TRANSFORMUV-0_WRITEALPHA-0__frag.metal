@@ -1,0 +1,79 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct _Globals
+{
+    float g_Multiply;
+    float g_GradientScale;
+    float g_AlphaMultiply;
+    float g_EdgeBrightness;
+    float3 g_EdgeColor;
+};
+
+struct main0_out
+{
+    float4 _fragColor [[color(0)]];
+};
+
+struct main0_in
+{
+    float4 v_TexCoord [[user(locn0)]];
+};
+
+static inline __attribute__((always_inline))
+float GetUVBlend(thread const float2& uv)
+{
+    return 1.0;
+}
+
+static inline __attribute__((always_inline))
+float3 ApplyBlending(int blendMode, thread const float3& A, thread const float3& B, thread const float& opacity)
+{
+    return mix(A, B, float3(opacity));
+}
+
+static inline __attribute__((always_inline))
+float4 PerformBlend(thread float4& albedo, thread const float4& blendColors, thread float& blendAlpha)
+{
+    blendAlpha *= blendColors.w;
+    float3 param = albedo.xyz;
+    float3 param_1 = blendColors.xyz;
+    float param_2 = blendAlpha;
+    float3 _54 = ApplyBlending(0, param, param_1, param_2);
+    albedo.x = _54.x;
+    albedo.y = _54.y;
+    albedo.z = _54.z;
+    return albedo;
+}
+
+fragment main0_out main0(main0_in in [[stage_in]], constant _Globals& _99 [[buffer(0)]], texture2d<float> g_Texture0 [[texture(0)]], texture2d<float> g_Texture1 [[texture(1)]], texture2d<float> g_Texture2 [[texture(2)]], sampler g_Texture0Smplr [[sampler(0)]], sampler g_Texture1Smplr [[sampler(1)]], sampler g_Texture2Smplr [[sampler(2)]])
+{
+    main0_out out = {};
+    float4 albedo = g_Texture0.sample(g_Texture0Smplr, in.v_TexCoord.xy);
+    float2 blendUV = in.v_TexCoord.zw;
+    float4 blendColors = g_Texture1.sample(g_Texture1Smplr, blendUV);
+    float blend = 1.0;
+    float gradient = g_Texture2.sample(g_Texture2Smplr, blendUV).x;
+    blend = smoothstep(fast::clamp(gradient - _99.g_GradientScale, 0.0, 1.0), fast::clamp(gradient + _99.g_GradientScale, 0.0, 1.0), _99.g_Multiply);
+    float2 param = blendUV;
+    float blendAlpha = GetUVBlend(param) * blend;
+    float4 param_1 = albedo;
+    float4 param_2 = blendColors;
+    float param_3 = blendAlpha;
+    float4 _127 = PerformBlend(param_1, param_2, param_3);
+    albedo = _127;
+    float burnWidth = _99.g_GradientScale * 0.5;
+    float burnAmount = ((step(gradient - burnWidth, _99.g_Multiply) * step(_99.g_Multiply, gradient + burnWidth)) * step(0.00999999977648258209228515625, _99.g_Multiply)) * step(_99.g_Multiply, 0.999000012874603271484375);
+    float4 _158 = albedo;
+    float3 _171 = fast::max(float3(0.0), mix(_158.xyz, _99.g_EdgeColor, float3(burnAmount * _99.g_EdgeBrightness)));
+    albedo.x = _171.x;
+    albedo.y = _171.y;
+    albedo.z = _171.z;
+    out._fragColor = albedo;
+    return out;
+}
+

@@ -1,0 +1,79 @@
+=== 2983345987 files ===
+   effects/blurprecise/effect.json 961
+   effects/iris/effect.json 411
+   effects/shake/effect.json 418
+   effects/shine/effect.json 2089
+   effects/tint/effect.json 412
+   effects/waterflow/effect.json 539
+   materials/2k bg.json 265
+   materials/2k bg.tex 5094231
+   materials/Kafka night bg.json 274
+   materials/Kafka night bg.tex 4273206
+   materials/Redused Kafka.json 273
+   materials/Redused Kafka.tex 1485305
+   materials/effects/blur_precise_gaussian_x.json 178
+   materials/effects/blur_precise_gaussian_y.json 240
+   materials/effects/iris.json 161
+   materials/effects/shake.json 162
+   materials/effects/shine_cast.json 167
+   materials/effects/shine_combine.json 170
+   materials/effects/shine_downsample2.json 174
+   materials/effects/shine_gaussian_x.json 171
+   materials/effects/shine_gaussian_y.json 211
+   materials/effects/tint.json 161
+   materials/effects/waterflow.json 222
+   materials/effects/waterflowphase.tex 4183
+   materials/masks/iris_mask_5a62c14b.tex 2934
+   materials/masks/shake_mask_331c437f.tex 87338
+   materials/masks/shake_mask_86c52726.tex 56627
+   materials/masks/shake_mask_fc15e3cd.tex 83127
+   materials/masks/waterflow_mask_0d0049df.tex 180710
+   materials/presets/rainperspective.json 224
+   materials/rectangle.json 269
+   materials/rectangle.tex 37905
+   models/2k bg.json 63
+   models/Kafka night bg.json 72
+   models/Redused Kafka.json 110
+   models/rectangle.json 67
+   particles/presets/rainperspective.json 1596
+   scene.json 10349
+   shaders/effects/blur_precise_gaussian.frag 1015
+   shaders/effects/blur_precise_gaussian.vert 1090
+   shaders/effects/iris.frag 1082
+   shaders/effects/iris.vert 1730
+   shaders/effects/shake.frag 3071
+   shaders/effects/shake.vert 3268
+   shaders/effects/shine_cast.frag 2941
+   shaders/effects/shine_cast.vert 2132
+   shaders/effects/shine_combine.frag 1044
+   shaders/effects/shine_combine.vert 705
+   shaders/effects/shine_downsample2.frag 1342
+   shaders/effects/shine_downsample2.vert 1094
+   shaders/effects/shine_gaussian.frag 369
+   shaders/effects/shine_gaussian.vert 681
+   shaders/effects/tint.frag 949
+   shaders/effects/tint.vert 492
+   shaders/effects/waterflow.frag 2099
+   shaders/effects/waterflow.vert 449
+objects: 5
+IMG obj id 13 image= models/2k bg.json
+  model: {"autosize": true, "material": "materials/2k bg.json"}
+  material keys: ['passes']
+    pass 0 shader= genericimage2 textures= ["2k bg"]
+IMG obj id 311 image= models/Kafka night bg.json
+  model: {"autosize": true, "material": "materials/Kafka night bg.json"}
+  material keys: ['passes']
+    pass 0 shader= genericimage2 textures= ["Kafka night bg"]
+IMG obj id 233 image= models/rectangle.json
+  model: {"autosize": true, "material": "materials/rectangle.json"}
+  material keys: ['passes']
+    pass 0 shader= genericimage2 textures= ["rectangle"]
+IMG obj id 19 image= models/Redused Kafka.json
+  model: {"autosize": true, "cropoffset": "-14.50000 -0.00000", "material": "materials/Redused Kafka.json"}
+  material keys: ['passes']
+    pass 0 shader= genericimage2 textures= ["Redused Kafka"]
+
+=== 43 scene texture-resolution survey ===
+3257043844 MISS model_missing
+
+RESOLVED 42/43 image-scenes (no-image-layer scenes: 0)

@@ -1,0 +1,245 @@
+{
+  "totalFolders": 129,
+  "pkgScanned": 57,
+  "noScene": 72,
+  "readFail": 0,
+  "audioWallpapers": [
+    {
+      "id": "3233141951",
+      "name": "熠烛 御剑驭龙-红鸾樱落 高度自定义Red Warbler-Sakura falls （Highly customizable）",
+      "audioObjectCount": 8,
+      "shapes": [
+        "2",
+        "7"
+      ],
+      "usesComposelayer": true,
+      "composeCount": 8,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        false,
+        true,
+        true,
+        true,
+        false,
+        false,
+        true,
+        true
+      ],
+      "objNames": [
+        "下音条02",
+        "下音条01",
+        "中音条0下",
+        "中音条0上",
+        "中y02",
+        "音条-身体",
+        "剑音条02",
+        "剑音条01"
+      ]
+    },
+    {
+      "id": "3470764447",
+      "name": "【Time Variation时间变化】Elaina 伊蕾娜：闲憩微息——夜莺Night【魔女之旅】Day Night Gradient",
+      "audioObjectCount": 4,
+      "shapes": [
+        "2"
+      ],
+      "usesComposelayer": false,
+      "composeCount": 0,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        true,
+        false,
+        false,
+        true
+      ],
+      "objNames": [
+        "纯色",
+        "纯色",
+        "纯色",
+        "Audio Bars"
+      ]
+    },
+    {
+      "id": "3302695207",
+      "name": "【五种天气  景深视差 高度自定义】伊蕾娜 未尽之旅——夜莺Night【魔女之旅】",
+      "audioObjectCount": 2,
+      "shapes": [
+        "2"
+      ],
+      "usesComposelayer": false,
+      "composeCount": 0,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        true,
+        true
+      ],
+      "objNames": [
+        "纯色",
+        "Audio Bars"
+      ]
+    },
+    {
+      "id": "3713073223",
+      "name": "Lost Landscape 3 | northway.",
+      "audioObjectCount": 2,
+      "shapes": [
+        "7"
+      ],
+      "usesComposelayer": false,
+      "composeCount": 0,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        true,
+        true
+      ],
+      "objNames": [
+        "Solide",
+        "Solide"
+      ]
+    },
+    {
+      "id": "3147346398",
+      "name": "⛏🧱Minecraft Lo-Fi Fireplace [4k HDR] WE adaptation by Becco38",
+      "audioObjectCount": 1,
+      "shapes": [],
+      "usesComposelayer": false,
+      "composeCount": 0,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        true
+      ],
+      "objNames": [
+        "Bars"
+      ]
+    },
+    {
+      "id": "3174556087",
+      "name": "Cozy, LoFi Shop",
+      "audioObjectCount": 1,
+      "shapes": [],
+      "usesComposelayer": false,
+      "composeCount": 0,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        true
+      ],
+      "objNames": [
+        "Audio Bars"
+      ]
+    },
+    {
+      "id": "3680422061",
+      "name": "4K_咕咕嘎嘎_管理员",
+      "audioObjectCount": 1,
+      "shapes": [],
+      "usesComposelayer": true,
+      "composeCount": 1,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        true
+      ],
+      "objNames": [
+        "Green"
+      ]
+    },
+    {
+      "id": "3693137898",
+      "name": "「Postscript」时间变化",
+      "audioObjectCount": 1,
+      "shapes": [
+        "2"
+      ],
+      "usesComposelayer": true,
+      "composeCount": 1,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        true
+      ],
+      "objNames": [
+        "Green"
+      ]
+    },
+    {
+      "id": "3716133097",
+      "name": "碧蓝航线-亚尔薇特",
+      "audioObjectCount": 1,
+      "shapes": [],
+      "usesComposelayer": true,
+      "composeCount": 1,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        true
+      ],
+      "objNames": [
+        "Audio bar"
+      ]
+    },
+    {
+      "id": "3718176724",
+      "name": "Kal'tsit·Esperanta 【凯尔希·思衡托】明日方舟【Arknights】",
+      "audioObjectCount": 1,
+      "shapes": [],
+      "usesComposelayer": false,
+      "composeCount": 0,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        true
+      ],
+      "objNames": [
+        "凯尔希·思衡托"
+      ]
+    },
+    {
+      "id": "3719111841",
+      "name": "【明日方舟/Arknights】凯尔希•思衡托——Kal'tsit·Esperanta",
+      "audioObjectCount": 1,
+      "shapes": [],
+      "usesComposelayer": false,
+      "composeCount": 0,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        true
+      ],
+      "objNames": [
+        "音频线Audio Spectrum Visualizer"
+      ]
+    },
+    {
+      "id": "3728421093",
+      "name": "PostPunkGirl",
+      "audioObjectCount": 1,
+      "shapes": [],
+      "usesComposelayer": false,
+      "composeCount": 0,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        true
+      ],
+      "objNames": [
+        "音频线Audio Spectrum Visualizer"
+      ]
+    },
+    {
+      "id": "3737267090",
+      "name": "WLOP Chapter4 上",
+      "audioObjectCount": 1,
+      "shapes": [],
+      "usesComposelayer": true,
+      "composeCount": 1,
+      "allDefaultHidden": false,
+      "visibleFlags": [
+        true
+      ],
+      "objNames": [
+        "可调整组合层"
+      ]
+    }
+  ],
+  "shapeDist": {
+    "2": 4,
+    "7": 2
+  },
+  "nAudioObjsTotal": 25,
+  "nComposeObjs": 12,
+  "nAllHiddenWp": 0
+}

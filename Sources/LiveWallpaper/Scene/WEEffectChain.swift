@@ -1,0 +1,774 @@
+import Metal
+import MetalKit
+import simd
+import Foundation
+
+/// 多 pass 特效合成器:消费 Tools/we_build_effects.py 生成的 WEEffects.json manifest +
+/// 转译出的 MSL,把 WE 的**真实**特效着色器跑在 Metal 上,替代手写近似。
+///
+/// 每个 effect 一条 pass 链(照 effect.json):图层先渲到纹理,逐 pass 跑转译 shader,
+/// uniform 喂 pkg 真实参数(g_Speed←"speed" 等)+ 引擎值(g_Time/MVP/分辨率),
+/// 命名 FBO(previous / _rt_*)做 ping-pong,最后输出。
+final class WEEffectChain {
+
+    // MARK: - Manifest 模型(对应 WEEffects.json)
+    // array/arrayStride:数组 uniform(如 g_AudioSpectrum16Left[16])。std140 下每个 float 元素
+    // 占一个 vec4 槽(16B),spirv-cross MSL 用 float4[N] 表示、值落在每元素的 .x。Swift 侧按
+    // offset + i*arrayStride 写第 i 个元素的 .x。非数组时为 nil。
+    struct UniformVar: Codable { let name: String; let offset: Int; let type: String; let array: Int?; let arrayStride: Int? }
+    // texIndex/sampIndex = MSL 真实 [[texture(N)]]/[[sampler(N)]] 索引(spirv-cross 自排,≠SPIR-V binding)。
+    struct SamplerVar: Codable { let name: String; let texIndex: Int; let sampIndex: Int }
+    struct StageDef: Codable { let metal: String; let entry: String; let uniforms: [UniformVar]; let samplers: [SamplerVar]; let ubuf: Int }
+    // 审计修复 #2:解码 manifest bind 项的 conditions(如 {'index':2,'conditions':[{'LIGHTING':1}]})。
+    // conditions 是「条件组」列表,每组为 combo名→期望值(整数)的字典;**全部组都满足**(AND)
+    // 才绑该纹理。值用 Int 解码(manifest 里 LIGHTING:1 / RENDERING:3 都是整数),与 run() 的 combo
+    // 归一化字符串比较时按整数语义对齐。decodeIfPresent 容错:无 conditions 的 bind(全库绝大多数)→ nil,
+    // 行为与改动前完全一致。
+    struct Bind: Codable {
+        let name: String
+        let index: Int
+        let conditions: [[String: Int]]?
+        enum CodingKeys: String, CodingKey { case name, index, conditions }
+        init(from d: Decoder) throws {
+            let c = try d.container(keyedBy: CodingKeys.self)
+            name = try c.decode(String.self, forKey: .name)
+            index = try c.decode(Int.self, forKey: .index)
+            conditions = try c.decodeIfPresent([[String: Int]].self, forKey: .conditions)
+        }
+    }
+    struct UniformMeta: Codable { let material: String?; let `default`: AnyCodable?; let combo: String? }
+    struct PassDef: Codable {
+        let shader: String?      // 命令 pass(copy/swap)无 shader → 可选,容错解码(否则整 manifest 解码崩)
+        let target: String?
+        let bind: [Bind]
+        let uniformMeta: [String: UniformMeta]
+        let vert: StageDef?
+        let frag: StageDef?
+        let targetScale: Int?    // 目标 FBO 降采样分母(来自 effect.json fbos[].scale;无则 1)
+        let command: String?     // 命令 pass:copy(motionblur 帧间拷贝)/swap(fluidsim 乒乓)等,无 vert/frag
+        let copy: Bool?
+        let source: String?
+        // 自定义解码:命令 pass 缺 shader/uniformMeta/bind,用 decodeIfPresent + 默认值容错,
+        // 否则 JSONDecoder 对整个 manifest 抛错 → 所有特效全丢(连 bloom/filmgrain 都没了)。
+        // 命令 pass 解出后无 vert/frag,run() 的 `guard let vstage=p.vert...` 会安全跳过。
+        enum CodingKeys: String, CodingKey {
+            case shader, target, bind, uniformMeta, vert, frag, targetScale, command, copy, source
+        }
+        init(from d: Decoder) throws {
+            let c = try d.container(keyedBy: CodingKeys.self)
+            shader      = try c.decodeIfPresent(String.self, forKey: .shader)
+            target      = try c.decodeIfPresent(String.self, forKey: .target)
+            bind        = try c.decodeIfPresent([Bind].self, forKey: .bind) ?? []
+            uniformMeta = try c.decodeIfPresent([String: UniformMeta].self, forKey: .uniformMeta) ?? [:]
+            vert        = try c.decodeIfPresent(StageDef.self, forKey: .vert)
+            frag        = try c.decodeIfPresent(StageDef.self, forKey: .frag)
+            targetScale = try c.decodeIfPresent(Int.self, forKey: .targetScale)
+            command     = try c.decodeIfPresent(String.self, forKey: .command)
+            copy        = try c.decodeIfPresent(Bool.self, forKey: .copy)
+            source      = try c.decodeIfPresent(String.self, forKey: .source)
+        }
+    }
+    struct Variant: Codable { let combos: [String: String]; let passes: [PassDef] }
+    struct EffectDef: Codable { let variants: [Variant] }
+
+    private let device: MTLDevice
+    private let sampler: MTLSamplerState          // clamp + linear(默认/兜底)
+    private let samplerRepeat: MTLSamplerState    // repeat + linear:WE 默认 wrap(无 ClampUVs flag);平铺噪声等
+    private let samplerNearest: MTLSamplerState        // clamp  + nearest(NoInterpolation + ClampUVs)
+    private let samplerRepeatNearest: MTLSamplerState  // repeat + nearest(NoInterpolation,无 ClampUVs)
+    private let manifest: [String: EffectDef]
+
+    /// 按 WE 纹理 flags 选采样器:ClampUVs→clamp 否则 repeat;NoInterpolation→nearest 否则 linear。
+    /// flags=nil(无真实 flags 可用)→ 保守用 clamp+linear(改动前默认),不破坏现有渲染。
+    private func samplerFor(_ flags: TexFlags?) -> MTLSamplerState {
+        guard let f = flags else { return sampler }
+        switch (f.clamp, f.nearest) {
+        case (true, false):  return sampler
+        case (false, false): return samplerRepeat
+        case (true, true):   return samplerNearest
+        case (false, true):  return samplerRepeatNearest
+        }
+    }
+    private let mslDir: URL
+
+    private var libCache: [String: MTLLibrary] = [:]          // metal 文件 → library
+    private var pipeCache: [String: MTLRenderPipelineState] = [:]
+    private var pipeFailed: Set<String> = []                 // 建管线失败的 key:负缓存,避免每帧重试+刷日志
+    private var rtPool: [String: MTLTexture] = [:]            // 命名 FBO
+    private let quadBuf: MTLBuffer                            // 全屏 quad: pos.xyz + uv.xy
+    private let whiteTex: MTLTexture                          // 1x1 白:兜底
+    private var utilCache: [String: (tex: MTLTexture, flags: TexFlags?)] = [:]   // WE util/* 默认贴图(noise/white/black)+ 真实 flags
+    private lazy var loader = MTKTextureLoader(device: device)
+
+    /// 全屏 quad(triangle strip):NDC 位置 + uv(v 翻转,纹理 v=0 在顶)。
+    private static let quadVerts: [Float] = [
+        -1, -1, 0,  0, 1,
+         1, -1, 0,  1, 1,
+        -1,  1, 0,  0, 0,
+         1,  1, 0,  1, 0,
+    ]
+
+    init?(device: MTLDevice) {
+        self.device = device
+        // 4 个采样器:{clamp,repeat} × {linear,nearest},由纹理真实 flags 选(见 samplerFor）。
+        func makeSampler(_ wrap: MTLSamplerAddressMode, _ filter: MTLSamplerMinMagFilter) -> MTLSamplerState? {
+            let d = MTLSamplerDescriptor()
+            d.minFilter = filter; d.magFilter = filter
+            d.sAddressMode = wrap; d.tAddressMode = wrap
+            return device.makeSamplerState(descriptor: d)
+        }
+        guard let smp = makeSampler(.clampToEdge, .linear),
+              let smpR = makeSampler(.repeat, .linear),
+              let smpN = makeSampler(.clampToEdge, .nearest),
+              let smpRN = makeSampler(.repeat, .nearest),
+              let qb = device.makeBuffer(bytes: Self.quadVerts,
+                                         length: MemoryLayout<Float>.stride * Self.quadVerts.count,
+                                         options: .storageModeShared) else { return nil }
+        self.sampler = smp; self.samplerRepeat = smpR
+        self.samplerNearest = smpN; self.samplerRepeatNearest = smpRN; self.quadBuf = qb
+        let wd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: 1, height: 1, mipmapped: false)
+        wd.usage = [.shaderRead]; wd.storageMode = .shared
+        guard let wt = device.makeTexture(descriptor: wd) else { return nil }
+        var wpx: [UInt8] = [255, 255, 255, 255]
+        wt.replace(region: MTLRegionMake2D(0, 0, 1, 1), mipmapLevel: 0, withBytes: &wpx, bytesPerRow: 4)
+        self.whiteTex = wt
+
+        // manifest:优先 app bundle,回退到开发目录 Tools/generated。
+        let candidates = [
+            Bundle.main.resourceURL?.appendingPathComponent("WEEffects.json"),   // bundle: 与 we_effects/ 同级
+            URL(fileURLWithPath: NSString(string: "~/Developer/LiveWallpaper/Tools/generated/WEEffects.json").expandingTildeInPath)
+        ].compactMap { $0 }
+        guard let mfURL = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }),
+              let data = try? Data(contentsOf: mfURL),
+              let m = try? JSONDecoder().decode([String: EffectDef].self, from: data) else {
+            Log.write("WEEffectChain: manifest 未找到/解析失败"); return nil
+        }
+        self.manifest = m
+        self.mslDir = mfURL.deletingLastPathComponent().appendingPathComponent("we_effects")
+        // bundle 布局:WEEffects.json 与 we_effects/ 同级 or 内部?生成时 .metal 在 we_effects/ 子目录,
+        // json 在 generated/ 根。开发路径:
+        Log.write("WEEffectChain: loaded \(m.count) effects from \(mfURL.path)")
+    }
+
+    var availableEffects: Set<String> { Set(manifest.keys) }
+    func has(_ effect: String) -> Bool { manifest[effect] != nil }
+
+    /// 该 effect 是否有采样器默认绑定 WE 渲染目标(_rt_*,如 frame_builder 的 _rt_FullFrameBuffer)。
+    /// 命中则引擎需提供「该层之下已合成场景」底图喂 run(frameBuffer:),否则该槽退白 → 冲白。
+    func needsFrameBuffer(_ effect: String) -> Bool {
+        guard let e = manifest[effect] else { return false }
+        for v in e.variants {
+            for p in v.passes {
+                for (_, m) in p.uniformMeta {
+                    if let d = m.default?.value as? String, d.hasPrefix("_rt_") { return true }
+                }
+            }
+        }
+        return false
+    }
+
+    /// 该 effect 是否声明了 g_AudioSpectrum* 数组(直接用系统音频频谱画可视化,如 audioline / 简单的音频响应)。
+    /// 这类特效无 AUDIOPROCESSING combo 也要触发音频采集——否则频谱 uniform 恒 0、曲线/条静止(条高 0 = 完全不绘制 = 看似没识别出音频条)。
+    /// ⚠ 真值在 frag/vert 的 **StageDef.uniforms**(g_AudioSpectrum32Left/Right 在那里),**不在 uniformMeta**
+    /// (uniformMeta 只含有 material/combo 标注的常量)。旧版只扫 uniformMeta → 对全库 g_AudioSpectrum 系
+    /// shader(2846660316 SHAPE 系、audioline、各 Simple_Audio_Bars)恒返回 false → 不采集音频 → 条恒 0 不绘制。
+    /// 这是「很多壁纸音频条根本不出现」的系统性真因(对照 lwe:CPass 对每个 pass 无条件绑 g_AudioSpectrum)。
+    func usesAudioSpectrum(_ effect: String) -> Bool {
+        guard let e = manifest[effect] else { return false }
+        for v in e.variants {
+            for p in v.passes {
+                for (name, _) in p.uniformMeta where name.hasPrefix("g_AudioSpectrum") { return true }
+                if let fu = p.frag?.uniforms, fu.contains(where: { $0.name.hasPrefix("g_AudioSpectrum") }) { return true }
+                if let vu = p.vert?.uniforms, vu.contains(where: { $0.name.hasPrefix("g_AudioSpectrum") }) { return true }
+            }
+        }
+        return false
+    }
+
+    // MARK: - 基础材质渲染路径(genericimage2/3/4 的 combo 变体)
+
+    // 单位 quad(layer 空间 [-0.5,0.5]),由 g_ModelViewProjectionMatrix=layer.mvp 变换到屏幕。
+    // 布局同 pipeline() 的顶点描述符:pos.xyz(@0)+ uv.xy(@12),stride 20,index 1。
+    private static let materialQuadVerts: [Float] = [
+        -0.5, -0.5, 0,  0, 1,
+         0.5, -0.5, 0,  1, 1,
+        -0.5,  0.5, 0,  0, 0,
+         0.5,  0.5, 0,  1, 0,
+    ]
+    private lazy var materialQuadBuf: MTLBuffer = device.makeBuffer(
+        bytes: Self.materialQuadVerts,
+        length: MemoryLayout<Float>.stride * Self.materialQuadVerts.count, options: [])!
+
+    // 「有意义」的材质 combo(任一开启即需走转译材质路径;否则 plain 层走轻量 scene_fragment,零回归)。
+    static let meaningfulMaterialCombos = ["NORMALMAP", "REFLECTION", "REFLECTION_MAP", "LIGHTING",
+                                           "EMISSIVE_MAP", "METALLIC_MAP", "ROUGHNESS_MAP", "PBRMASKS", "FOG"]
+
+    /// 该图层是否需要用转译的 material/<shader> 变体渲染(有意义 combo);WP_MATERIAL_ALL 强制所有
+    /// 有材质 shader 的层都走此路径(供 base 变体自验证:base = tex×color,应与 scene_fragment 一致)。
+    func materialNeedsTranspiledPath(shader: String?, combos: [String: String]) -> Bool {
+        guard let sh = shader, manifest["material/\(sh)"] != nil else { return false }
+        if ProcessInfo.processInfo.environment["WP_MATERIAL_ALL"] != nil { return true }
+        return Self.meaningfulMaterialCombos.contains { (Int(combos[$0] ?? "0") ?? 0) != 0 }
+    }
+
+    private static func mat4Floats(_ m: simd_float4x4) -> [Float] {
+        let c = m.columns
+        return [c.0.x, c.0.y, c.0.z, c.0.w, c.1.x, c.1.y, c.1.z, c.1.w,
+                c.2.x, c.2.y, c.2.z, c.2.w, c.3.x, c.3.y, c.3.z, c.3.w]
+    }
+
+    /// 选 combos 最匹配的变体(variant.combos 必须是 layer combos 的子集,取最具体者;退 base)。
+    private func bestMaterialVariant(_ eff: EffectDef, _ combos: [String: String]) -> Variant? {
+        var best: Variant? = nil; var bestN = -1
+        for v in eff.variants where v.combos.allSatisfy({ combos[$0.key] == $0.value }) {
+            if v.combos.count > bestN { best = v; bestN = v.combos.count }
+        }
+        return best ?? eff.variants.first
+    }
+
+    /// 为 genericimage stage 构造 _Globals(base 用 mvp/model/color;combo 的 PBR 量暂用 WE 默认,
+    /// 环境光给真实 ambient——后续接 material constants/光源)。
+    private func buildMaterialUniforms(_ stage: StageDef, meta: [String: UniformMeta],
+                                       mvp: simd_float4x4, model: simd_float4x4,
+                                       color: SIMD4<Float>, ambient: SIMD3<Float>,
+                                       constants: [String: [Float]], audio16: [Float] = []) -> [UInt8] {
+        // 数组 uniform(如 g_AudioSpectrum16/32/64Left/Right)要把 offset+元素数×步长 算进上界,否则越界。
+        var size = 16
+        for u in stage.uniforms {
+            let span = (u.array != nil) ? u.array! * (u.arrayStride ?? 16) : 64
+            size = max(size, u.offset + span)
+        }
+        var bytes = [UInt8](repeating: 0, count: (size + 15) / 16 * 16)
+        let mvpF = Self.mat4Floats(mvp), modelF = Self.mat4Floats(model)
+        bytes.withUnsafeMutableBytes { raw in
+            let base = raw.baseAddress!
+            for u in stage.uniforms {
+                // 音频频谱数组:基础材质 shader(genericimage 带 AUDIOPROCESSING combo)也会声明
+                // g_AudioSpectrum16/32/64Left/Right。此前材质路径漏喂 → 这类音频可视化壁纸恒静止(无条)。
+                // 与 effect 路径(buildUniforms)同口径:按数组声明 count 重采样本帧频谱,左右同源。
+                if let count = u.array, count > 0 {
+                    if u.name.hasPrefix("g_AudioSpectrum"), u.name.hasSuffix("Left") || u.name.hasSuffix("Right") {
+                        let resampled = Self.resampleSpectrum(audio16, to: count)
+                        Self.writeArray(resampled, count: count, stride: u.arrayStride ?? 16, into: base, offset: u.offset)
+                    }
+                    continue
+                }
+                var vals: [Float] = []
+                switch u.name {
+                case "g_ModelViewProjectionMatrix", "g_EffectModelViewProjectionMatrix": vals = mvpF
+                case "g_ModelMatrix", "g_LayerModelMatrix": vals = modelF
+                case "g_ViewProjectionMatrix": vals = mvpF
+                case "g_Color4", "g_Color", "g_CompositeColor": vals = [color.x, color.y, color.z, color.w]
+                case "g_Texture0Rotation": vals = [1, 0, 0, 1]
+                case "g_Texture0Translation": vals = [0, 0]
+                case "g_EyePosition": vals = [0, 0, 0]
+                case "g_Brightness", "g_Alpha", "g_UserAlpha": vals = [1]
+                case "g_LightAmbientColor": vals = [ambient.x, ambient.y, ambient.z]
+                default:
+                    // 材质常量驱动(g_Roughness/Metallic/SpecularTint/EmissiveColor/g_Overbright/...):
+                    // meta.material → 材质 constantshadervalues 真值,缺则退 WE shader 注解默认,再缺留 0。
+                    if let mk = meta[u.name]?.material, let cv = constants[mk] { vals = cv }
+                    else if let def = meta[u.name]?.default?.value { vals = Self.parseFloats(def) }
+                    else { vals = [] }
+                }
+                if !vals.isEmpty { Self.write(vals, type: u.type, into: base, offset: u.offset) }
+            }
+        }
+        return bytes
+    }
+
+    /// 用转译的 material/<shader> 变体渲染一个图层 quad。base 变体 = albedo×color(同 scene_fragment);
+    /// combo 变体(NORMALMAP/REFLECTION/LIGHTING/...)按真 WE genericimage shader 计算。成功返回 true。
+    func encodeMaterialLayer(_ enc: MTLRenderCommandEncoder, shader: String, combos: [String: String],
+                             mvp: simd_float4x4, model: simd_float4x4, color: SIMD4<Float>,
+                             albedo: MTLTexture, albedoFlags: TexFlags?, aux: [Int: MTLTexture],
+                             ambient: SIMD3<Float>, constants: [String: [Float]], sceneFB: MTLTexture?,
+                             audio16: [Float] = []) -> Bool {
+        guard let eff = manifest["material/\(shader)"],
+              let variant = bestMaterialVariant(eff, combos),
+              let p = variant.passes.first, let ps = pipeline(p) else { return false }
+        enc.setRenderPipelineState(ps)
+        enc.setVertexBuffer(materialQuadBuf, offset: 0, index: 1)
+        if let v = p.vert {
+            var vb = buildMaterialUniforms(v, meta: p.uniformMeta, mvp: mvp, model: model,
+                                           color: color, ambient: ambient, constants: constants, audio16: audio16)
+            enc.setVertexBytes(&vb, length: vb.count, index: v.ubuf)
+        }
+        guard let f = p.frag else { return false }
+        var fb = buildMaterialUniforms(f, meta: p.uniformMeta, mvp: mvp, model: model,
+                                       color: color, ambient: ambient, constants: constants, audio16: audio16)
+        enc.setFragmentBytes(&fb, length: fb.count, index: f.ubuf)
+        for s in f.samplers {
+            let tex: MTLTexture
+            switch s.name {
+            case "g_Texture0": tex = albedo
+            case "g_Texture1": tex = aux[1] ?? whiteTex
+            case "g_Texture2": tex = aux[2] ?? whiteTex
+            case "g_Texture3": tex = aux[3] ?? whiteTex
+            default:
+                tex = (s.name.contains("FullFrameBuffer") || s.name.lowercased().contains("reflect"))
+                    ? (sceneFB ?? whiteTex) : whiteTex
+            }
+            enc.setFragmentTexture(tex, index: s.texIndex)
+            enc.setFragmentSamplerState(s.name == "g_Texture0" ? samplerFor(albedoFlags) : samplerFor(nil),
+                                        index: s.sampIndex)
+        }
+        enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        return true
+    }
+
+    // MARK: - Library / pipeline
+
+    private func library(_ metalFile: String) -> MTLLibrary? {
+        if let l = libCache[metalFile] { return l }
+        let url = mslDir.appendingPathComponent(metalFile)
+        guard let src = try? String(contentsOf: url, encoding: .utf8),
+              let lib = try? device.makeLibrary(source: src, options: nil) else {
+            Log.write("WEEffectChain: compile fail \(metalFile)"); return nil
+        }
+        libCache[metalFile] = lib; return lib
+    }
+
+    private func pipeline(_ p: PassDef) -> MTLRenderPipelineState? {
+        // 关键:按**变体的 MSL 文件名**缓存,不能只按 p.shader。同一 shader 的不同 combo 变体
+        // (如 depthparallax 的 QUALITY-1 vs MASK-1_QUALITY-1)采样器布局/数量不同 → MSL 不同;
+        // 若只按 shader 名缓存,先编译的变体会被另一变体复用 → 贴图索引错位(g_Texture0 取到白色
+        // 兜底槽)→ 整层洗白(实测 3440483127 的 ripple720p 水层)。
+        let key = "\(p.vert?.metal ?? "?")|\(p.frag?.metal ?? "?")"
+        if let ps = pipeCache[key] { return ps }
+        if pipeFailed.contains(key) { return nil }   // 已知建不成:别每帧重试/刷屏
+        guard let v = p.vert, let f = p.frag,
+              let vlib = library(v.metal), let flib = library(f.metal),
+              let vfn = vlib.makeFunction(name: v.entry), let ffn = flib.makeFunction(name: f.entry)
+        else { pipeFailed.insert(key); return nil }
+        let d = MTLRenderPipelineDescriptor()
+        d.vertexFunction = vfn; d.fragmentFunction = ffn
+        d.colorAttachments[0].pixelFormat = .bgra8Unorm
+        // 顶点布局:a_Position(float3 @0)+ a_TexCoord(float2 @12),stride 20,buffer index 1。
+        let vd = MTLVertexDescriptor()
+        vd.attributes[0].format = .float3; vd.attributes[0].offset = 0;  vd.attributes[0].bufferIndex = 1
+        vd.attributes[1].format = .float2; vd.attributes[1].offset = 12; vd.attributes[1].bufferIndex = 1
+        vd.layouts[1].stride = 20
+        d.vertexDescriptor = vd
+        guard let ps = try? device.makeRenderPipelineState(descriptor: d) else {
+            pipeFailed.insert(key)   // 负缓存:只记一次,不再每帧重试/刷日志
+            Log.write("WEEffectChain: pipeline fail \(key)"); return nil
+        }
+        pipeCache[key] = ps; return ps
+    }
+
+    private func makeTarget(width: Int, height: Int) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+                                                            width: width, height: height, mipmapped: false)
+        desc.usage = [.renderTarget, .shaderRead]; desc.storageMode = .private
+        return device.makeTexture(descriptor: desc)
+    }
+    // 命名中间 FBO(_rt_*):跨链/跨图层复用(同 cmd buffer 内按序执行,消费完才被覆盖)。
+
+    /// 加载 WE 内置默认贴图(如 "util/noise"/"util/white"/"util/black")+ 其真实纹理 flags。缺失退白。
+    /// flags 决定采样器:可平铺噪声(util/noise 等)在 .tex 头本就无 ClampUVs flag → repeat 环绕;
+    /// 精灵/white/black 带 ClampUVs → clamp。取代旧的按名字猜 isTilingRef。
+    private func utilTexture(_ ref: String) -> (tex: MTLTexture, flags: TexFlags?) {
+        if let t = utilCache[ref] { return t }
+        var result = whiteTex
+        var flags: TexFlags? = nil
+        if let blob = BuiltinAssets.shared.textureData(forReference: ref),
+           let decoded = TexDecoder.decodeFirstMipWithFlags(blob) {
+            flags = decoded.flags
+            switch decoded.tex {
+            case .encoded(let data):
+                if let t = try? loader.newTexture(data: data, options: [.SRGB: false]) { result = t }
+            case .rgba8(let px, let w, let h):
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: w, height: h, mipmapped: false)
+                d.usage = [.shaderRead]
+                if let t = device.makeTexture(descriptor: d) {
+                    px.withUnsafeBytes { t.replace(region: MTLRegionMake2D(0,0,w,h), mipmapLevel: 0, withBytes: $0.baseAddress!, bytesPerRow: w*4) }
+                    result = t
+                }
+            case .video: break
+            }
+        }
+        let entry = (tex: result, flags: flags)
+        utilCache[ref] = entry; return entry
+    }
+
+    private func renderTarget(_ name: String, width: Int, height: Int) -> MTLTexture? {
+        let key = "\(name)@\(width)x\(height)"
+        if let t = rtPool[key] { return t }
+        let t = makeTarget(width: width, height: height); rtPool[key] = t; return t
+    }
+
+    // MARK: - Uniform 装填
+
+    /// 把一个值(标量 / "x y z" 字符串 / 数组)写进 buffer 的 offset,按类型决定写几个 float。
+    private static func write(_ value: [Float], type: String, into buf: UnsafeMutableRawPointer, offset: Int) {
+        let n: Int
+        switch type {
+        case "float": n = 1
+        case "vec2": n = 2
+        case "vec3": n = 3
+        case "vec4": n = 4
+        case "mat4": n = 16
+        case "mat3": n = 12   // std140: 3 列各 vec4 对齐 → 用 16,这里近似
+        default: n = min(value.count, 4)
+        }
+        let p = buf.advanced(by: offset).assumingMemoryBound(to: Float.self)
+        for i in 0..<n { p[i] = i < value.count ? value[i] : 0 }
+    }
+
+    /// 写 std140 数组 uniform:N 个标量,每个落在 offset + i*stride 处的第一个 float(.x);
+    /// 步长之间的 padding 保持 0(spirv-cross 把 float[N] 表示成 float4[N],只用 .x)。
+    private static func writeArray(_ value: [Float], count: Int, stride: Int,
+                                   into buf: UnsafeMutableRawPointer, offset: Int) {
+        for i in 0..<count {
+            let p = buf.advanced(by: offset + i * stride).assumingMemoryBound(to: Float.self)
+            p[0] = i < value.count ? value[i] : 0
+        }
+    }
+
+    /// 把任意长度的频谱重采样到 n 段(与 AudioCapture 的对数分桶同向:第 i 段覆盖 src 的 [lo,hi) 取均值)。
+    /// 下采样(src≥n,如 64→32/16)= 区间平均;上采样(src<n)= 同一区间被多段复用(近邻),不造假数据。
+    /// src 空 → 全 0(无声)。
+    private static func resampleSpectrum(_ src: [Float], to n: Int) -> [Float] {
+        guard n > 0 else { return [] }
+        if src.count == n { return src }
+        var out = [Float](repeating: 0, count: n)
+        guard !src.isEmpty else { return out }
+        for i in 0..<n {
+            let lo = Int(Float(i) / Float(n) * Float(src.count))
+            let hi = max(lo + 1, Int(Float(i + 1) / Float(n) * Float(src.count)))
+            var sum: Float = 0; var c = 0
+            var k = lo
+            while k < min(hi, src.count) { sum += src[k]; c += 1; k += 1 }
+            out[i] = c > 0 ? sum / Float(c) : (lo < src.count ? src[lo] : 0)
+        }
+        return out
+    }
+
+    private static func parseFloats(_ any: Any?) -> [Float] {
+        if let n = any as? NSNumber { return [n.floatValue] }
+        if let s = any as? String {
+            // WE 向量常量用「空格」或「逗号」分隔(如 u_BarBounds="0.0, 1.0"、u_AASmoothness="0.02, 0.02")。
+            // 只按空格分会把 "0.0," 解析失败丢掉 → vec2 只剩一个分量、错位(实测:身体音频条 barHeight 反转)。
+            return s.split(whereSeparator: { $0 == " " || $0 == "," || $0 == "\t" }).compactMap { Float($0) }
+        }
+        if let a = any as? [Any] { return a.compactMap { ($0 as? NSNumber)?.floatValue } }
+        return []
+    }
+
+    /// 为某 stage 构造 _Globals 字节。pkgParams = pkg 的 constantshadervalues(material-key→值)。
+    /// cursor = 光标归一化位置 [0,1](y 向上);WE 交互特效(xray/depthparallax)的 pointer 量。
+    /// audio16 = 16 段频谱 [0,1](AudioCapture.shared.spectrum16);喂 pulse 等音频特效的
+    /// g_AudioSpectrum16Left/Right 数组。空数组 → 音频 uniform 退 0(无声)。
+    private func buildUniforms(_ stage: StageDef, meta: [String: UniformMeta],
+                               pkgParams: [String: Any], time: Float, cursor: SIMD2<Float>,
+                               texW: Int, texH: Int, audio16: [Float]) -> [UInt8] {
+        // 数组 uniform 要把 offset+元素数×步长 都算进上界(否则数组尾巴越界)。
+        var size = 16
+        for u in stage.uniforms {
+            let span = (u.array != nil) ? u.array! * (u.arrayStride ?? 16) : 64
+            size = max(size, u.offset + span)
+        }
+        var bytes = [UInt8](repeating: 0, count: (size + 15) / 16 * 16)
+        bytes.withUnsafeMutableBytes { raw in
+            let base = raw.baseAddress!
+            for u in stage.uniforms {
+                // 数组 uniform:WE 的音频频谱(L/R),按 std140 16B 步长写每元素的 .x。
+                // WE 的可视化 shader 按 RESOLUTION combo 选 16/32/64 段数组(Simple_Audio_Bars 默认 32;
+                // pulse 用 16)。audio16 是本帧可用频谱(audio-bars 路喂满 64 段 bands;pulse 路喂 16);
+                // 按目标数组**声明的 count** 重采样到 N(64→32/16 取均值,16→32 线性插值),与 AudioCapture
+                // 的对数分桶同向。左右声道同源(系统音频单声道混合)。漏填某分辨率 → 该 RESOLUTION 变体的
+                // 频谱全 0 → 条恒为 0(实测:只填 16 段时 RESOLUTION=32 的 Simple_Audio_Bars 不出条)。
+                if let count = u.array, count > 0 {
+                    if u.name.hasPrefix("g_AudioSpectrum"), u.name.hasSuffix("Left") || u.name.hasSuffix("Right") {
+                        let resampled = Self.resampleSpectrum(audio16, to: count)
+                        Self.writeArray(resampled, count: count, stride: u.arrayStride ?? 16, into: base, offset: u.offset)
+                    }
+                    // 其它数组 uniform 暂无来源 → 留 0(归零已是默认)。
+                    continue
+                }
+                var vals: [Float] = []
+                if u.name == "g_ModelViewProjectionMatrix"
+                    || u.name == "g_EffectTextureProjectionMatrix"
+                    || u.name == "g_EffectTextureProjectionMatrixInverse"
+                    || u.name == "g_LayerModelMatrix"
+                    || u.name == "g_EffectModelViewProjectionMatrix" {
+                    // 全屏轴对齐 quad:MVP / 纹理投影 / 图层模型 / 特效 MVP 皆为 identity。
+                    // 关键:depthparallax/xray vert 用 g_EffectTextureProjectionMatrixInverse 做
+                    // CAST3X3 旋转 + normalize;若留 0 → normalize(vec2(0))=NaN → 整层采样炸成白。
+                    // frame_builder vert 用 g_LayerModelMatrix 取 scale(length(row))、g_EffectModelViewProjectionMatrix
+                    // 算 v_ScreenCoord;留 0 → scale=0 → v_Size 塌成「整面都是边框」→ 整层冲白。
+                    // 平面满画布层的正确值就是 identity(无投影倾斜/单位缩放),非兜底。
+                    vals = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]
+                } else if u.name == "g_PointerPosition" || u.name == "g_ParallaxPosition" {
+                    // WE 交互 pointer / 视差位置,归一化 [0,1]。静止居中 = (0.5,0.5)(中性,无偏移)。
+                    vals = [cursor.x, cursor.y]
+                } else if u.name == "g_Time" {
+                    vals = [time]
+                } else if u.name == "g_TexelSize" {
+                    // 1/纹理尺寸(WE blur 等用它算每像素步长)。须用实际绑定纹理的尺寸。
+                    vals = [1.0 / Float(max(1, texW)), 1.0 / Float(max(1, texH))]
+                } else if u.name == "g_TexelSizeHalf" {
+                    vals = [0.5 / Float(max(1, texW)), 0.5 / Float(max(1, texH))]
+                } else if u.name.hasSuffix("Resolution") {
+                    vals = [Float(texW), Float(texH), Float(texW), Float(texH)]
+                } else if u.name == "g_Screen" {
+                    // 屏幕尺寸 vec3(w,h,aspect);depthparallax vert 声明但未用,给真实值无害。
+                    vals = [Float(texW), Float(texH), Float(texW) / Float(max(1, texH))]
+                } else if let mk = meta[u.name]?.material, let pv = pkgParams[mk] {
+                    vals = Self.parseFloats(pv)                       // pkg 用户设的真实值
+                } else if let def = meta[u.name]?.default?.value {
+                    vals = Self.parseFloats(def)                      // WE 默认值
+                } else if u.name == "g_Brightness" || u.name == "g_Alpha" || u.name == "g_UserAlpha" {
+                    vals = [1]   // 引擎提供的亮度/透明,默认全开;留 0 会让引用它的 workshop shader 全黑/全透明
+                } else if u.name == "g_Color" || u.name == "g_CompositeColor" {
+                    vals = [1, 1, 1]
+                } else if u.name == "g_Color4" {
+                    vals = [1, 1, 1, 1]
+                } else if u.name == "g_Daytime" {
+                    // 严格对齐 lwe(WallpaperApplication.cpp:866):g_Daytime = (hour*60+min)/(24*60),
+                    // 真实本地时钟(0=午夜、0.5=正午)。原硬编码 0.5 = 恒正午 = 自加偏离,昼夜染色壁纸不随时间变。
+                    let c = Calendar.current.dateComponents([.hour, .minute], from: Date())
+                    vals = [Float((c.hour ?? 12) * 60 + (c.minute ?? 0)) / 1440.0]
+                }
+                Self.write(vals, type: u.type, into: base, offset: u.offset)
+            }
+        }
+        return bytes
+    }
+
+    // MARK: - 运行一条 effect 链
+
+    /// 选与场景 combos 最匹配的变体(精确匹配优先,否则 base)。
+    private func selectVariant(_ def: EffectDef, combos: [String: Any]) -> Variant? {
+        let want = combos.mapValues { v -> String in
+            if let n = v as? NSNumber { return n.intValue == Int(n.doubleValue) ? "\(n.intValue)" : "\(n.floatValue)" }
+            return "\(v)"
+        }
+        // 精确匹配(变体 combos == 请求 combos 的交集)。
+        var best: Variant? = nil; var bestScore = -1
+        for v in def.variants {
+            if v.combos.isEmpty { if bestScore < 0 { best = v; bestScore = 0 }; continue }
+            // 变体的每个 combo 都被请求满足才算命中,命中数越多越好。
+            let ok = v.combos.allSatisfy { want[$0.key] == $0.value }
+            if ok && v.combos.count > bestScore { best = v; bestScore = v.combos.count }
+        }
+        return best ?? def.variants.first
+    }
+
+    // 审计修复 #2:把 run() 的 combos([String:Any])归一成「combo名→整数值」,供 bind.conditions 判定。
+    // combos 值可能是 NSNumber/String;按 selectVariant 同样的整数语义取值(LIGHTING/RENDERING 都是整数 combo)。
+    private static func comboInts(_ combos: [String: Any]) -> [String: Int] {
+        var out: [String: Int] = [:]
+        for (k, v) in combos {
+            if let n = v as? NSNumber { out[k] = n.intValue }
+            else if let s = v as? String, let i = Int(s) ?? Float(s).map({ Int($0) }) { out[k] = i }
+        }
+        return out
+    }
+
+    // 审计修复 #2:判定一个 bind 的 conditions 是否被当前 combos 满足。
+    // conditions 为「条件组」列表,**所有组**都需满足(AND);组内 combo名→期望值全部相等才算该组满足。
+    // 缺失的 combo 视为 0(WE 未定义 combo 即 0);conditions 为 nil/空 → 恒为 true(无条件绑定,旧行为)。
+    private static func conditionsMet(_ conditions: [[String: Int]]?, comboInts: [String: Int]) -> Bool {
+        guard let conds = conditions, !conds.isEmpty else { return true }
+        for group in conds {
+            for (name, want) in group {
+                if (comboInts[name] ?? 0) != want { return false }
+            }
+        }
+        return true
+    }
+
+    /// 在 input 上跑 effect 的全部 pass,返回结果纹理。combos/pkgParams 来自 pkg 图层 effect pass。
+    /// paramsPerPass(可选)= 逐 pass 的真实参数;多 pass effect(如 bloom 各 pass strength/Tint 不同)
+    /// 时按 pass 索引取;为空或越界则回退合并版 pkgParams。
+    /// maskTexture(可选)= 该 effect 的不透明遮罩(WE opacitymask)。绑定到 uniformMeta 里
+    /// combo=="MASK" 的那个采样器(shake 是 g_Texture3,waterwaves/foliagesway/tint/opacity 等是
+    /// g_Texture1)——按 manifest 自动定位,不硬编码槽名。
+    /// texFlags(可选)= 按采样器名(g_TextureN)给出的真实 WE 纹理 flags,选采样器(repeat/clamp、linear/nearest）。
+    ///   "g_Texture0" = 主输入(图层贴图)的 flags;其余键对应 auxTextures 同名槽。缺省 → clamp+linear(保守,不破坏现有渲染)。
+    ///   中间 FBO(命名 bind / previous)始终用 clamp+linear:它们是引擎渲出的全屏纹理、UV∈[0,1],非 WE 资源 flags 适用对象。
+    func run(effect: String, input: MTLTexture, pkgParams: [String: Any],
+             combos: [String: Any] = [:], auxTextures: [String: MTLTexture] = [:],
+             maskTexture: MTLTexture? = nil,
+             texFlags: [String: TexFlags] = [:],
+             paramsPerPass: [[String: Any]] = [], time: Float,
+             cursor: SIMD2<Float> = SIMD2(0.5, 0.5),
+             audio16: [Float] = [],
+             frameBuffer: MTLTexture? = nil,
+             commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
+        guard let edef = manifest[effect], let def = selectVariant(edef, combos: combos) else { return nil }
+        let w = input.width, h = input.height
+        // 审计修复 #2:把本次 run 的 combos 归一成整数,供 bind.conditions 判定(在 pass 循环外算一次)。
+        let comboInts = Self.comboInts(combos)
+        // 审计修复 #3:同名 FBO 在「一次 run 内」必须用**一致**的尺寸键,否则跨帧反馈(乒乓/swap)断链。
+        // 此前预填与 renderTarget 各自按所在 pass 的 targetScale 重算 "name@WxH":若同名 FBO 在不同 scale
+        // 的 pass 间出现(或预填用 A 的 scale、渲染用 B 的 scale),会取到不同的纹理块,反馈数据丢失。
+        // 修法:为每个 FBO 名预解析一个**唯一**尺寸 —— 取该名**首次**作为 target 出现时的 targetScale 算出的
+        // 尺寸,后续所有引用(预填 / 渲染 / swap)都用它。单 scale 特效里每个名只一种尺寸 → 与旧行为完全一致。
+        var nameSize: [String: (w: Int, h: Int)] = [:]
+        for p in def.passes {
+            guard let tname = p.target, nameSize[tname] == nil else { continue }
+            let s = max(1, p.targetScale ?? 1)
+            nameSize[tname] = (max(1, w / s), max(1, h / s))
+        }
+        // 本 run 内按 FBO 名拿目标纹理(用一致尺寸键),供 swap / 渲染共用,避免重算 scale 取错块。
+        func targetForName(_ name: String) -> MTLTexture? {
+            let sz = nameSize[name] ?? (w, h)
+            return renderTarget(name, width: sz.w, height: sz.h)
+        }
+        // "previous" = 特效的**输入图**(恒定;如 godrays/bloom apply 要把光束/辉光叠回原图),不是滚动的上一 pass 输出。
+        var named: [String: MTLTexture] = ["previous": input]
+        // 跨帧累积预填(motionblur 等):named 每次 run() 重置,但持久(unique)FBO 的内容已留在跨帧
+        // 存活的 rtPool 里。把本 effect 各 pass 的命名 target 从 rtPool 预填进 named(尺寸用上面解析的
+        // 一致尺寸键),让首 pass 读到上一帧累积。仅预填已存在(跑过≥1帧)的;首帧没有 → pass0 的历史槽退白,1~2 帧收敛。
+        for (tname, sz) in nameSize {
+            let key = "\(tname)@\(sz.w)x\(sz.h)"
+            if let t = rtPool[key] { named[tname] = t }
+        }
+        var lastOut: MTLTexture = input
+
+        for (pi, p) in def.passes.enumerated() {
+            // 命令 pass(无 vert/frag):copy = 把累积结果拷进持久缓冲供下一帧(motionblur pass1)。
+            // 必须在 pipeline guard 之前处理,否则会被 `guard let vstage` 跳过、命令永不执行。
+            if p.command != nil || p.copy == true {
+                if (p.command == "copy" || p.copy == true),
+                   let srcName = p.source, let dstName = p.target, let src = named[srcName],
+                   let dst = renderTarget(dstName, width: src.width, height: src.height),
+                   let blit = cmd.makeBlitCommandEncoder() {
+                    blit.copy(from: src, sourceSlice: 0, sourceLevel: 0,
+                              sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
+                              sourceSize: MTLSize(width: src.width, height: src.height, depth: 1),
+                              to: dst, destinationSlice: 0, destinationLevel: 0,
+                              destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+                    blit.endEncoding()
+                    named[dstName] = dst
+                }
+                // 审计修复 #1:实现 swap 命令(此前被静默跳过)。fluidsimulation 末尾用
+                // {"command":"swap","source":"_rt_SmokeVelocity1","target":"_rt_SmokeVelocity2"} 交换两个
+                // 乒乓 FBO,使下一帧的「读/写角色」对调(本帧写 2,swap 后 1↔2,下帧再写、上帧结果在另一块)。
+                // 命令参数来源:manifest 的 swap pass 带 source/target 两个 FBO 名(见 we_build_effects.py 的
+                // command pass 记录)。交换 = 把两个命名块在 named 与持久 rtPool 里的引用对调,这样:
+                //   ① 同一 run 内后续 pass 经 named 取到对调后的块;
+                //   ② 跨帧靠 rtPool 持久,下一帧的预填(按一致尺寸键)取到对调后的内容,反馈链不断。
+                // 用一致尺寸键(targetForName,审计修复 #3)取/建两块,绝不重算 scale 取错块。
+                else if p.command == "swap",
+                        let aName = p.source, let bName = p.target {
+                    // 乒乓对的两块尺寸恒相同。但 swap 的 source(如 _rt_SmokeDye1)可能只作 swap 源、从不作渲染
+                    // target → 不在 nameSize 里;此时用对端(target,如 _rt_SmokeDye2,有渲染 pass 记过尺寸)的
+                    // 尺寸推断,避免源退成全分辨率与对端(半分辨率)错配。两端都缺则退输入全分辨率。
+                    let bSz = nameSize[bName] ?? nameSize[aName] ?? (w, h)
+                    let aSz = nameSize[aName] ?? bSz
+                    if let aTex = named[aName] ?? renderTarget(aName, width: aSz.w, height: aSz.h),
+                       let bTex = named[bName] ?? renderTarget(bName, width: bSz.w, height: bSz.h) {
+                        // named 引用对调(同 run 内后续 pass 取到对调后的块)。
+                        named[aName] = bTex
+                        named[bName] = aTex
+                        // 持久 rtPool 引用对调(用与 renderTarget 完全一致的尺寸键,保证跨帧预填命中)。
+                        rtPool["\(aName)@\(aSz.w)x\(aSz.h)"] = bTex
+                        rtPool["\(bName)@\(bSz.w)x\(bSz.h)"] = aTex
+                    }
+                }
+                continue
+            }
+            guard let ps = pipeline(p), let vstage = p.vert, let fstage = p.frag else { continue }
+            // 有 target → 命名 FBO(按**本 run 内一致**的尺寸键复用,审计修复 #3:用 targetForName 取该名
+            // 首次出现时解析的尺寸,而非每 pass 重算 scale,避免同名 FBO 在不同 scale 间取错块、断反馈链);
+            // 无 target(最终输出)→ 每次新建,避免多图层共享被覆盖。
+            let out: MTLTexture
+            if let target = p.target {
+                guard let t = targetForName(target) else { continue }
+                out = t
+            } else {
+                guard let t = makeTarget(width: w, height: h) else { continue }   // 最终输出恒全分辨率
+                out = t
+            }
+
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = out
+            pass.colorAttachments[0].loadAction = .clear
+            pass.colorAttachments[0].storeAction = .store
+            pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+            guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { continue }
+            enc.setRenderPipelineState(ps)
+            enc.setVertexBuffer(quadBuf, offset: 0, index: 1)
+
+            // 该 pass 的主输入(g_Texture0 绑定的纹理)。分辨率 uniform(g_TexelSize/g_Texture0Resolution)
+            // 必须反映**实际绑定的**纹理尺寸,而非恒定的输入尺寸 —— blur 采样 1/4 图,步长才对。
+            let primaryName = p.bind.first(where: { $0.index == 0 })?.name ?? "previous"
+            let primary = named[primaryName] ?? input
+            let resW = primary.width, resH = primary.height
+
+            // 逐 pass 参数优先(bloom 各 pass strength 可不同);否则合并版。
+            let params: [String: Any] = (pi < paramsPerPass.count) ? paramsPerPass[pi] : pkgParams
+            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, audio16: audio16)
+            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, audio16: audio16)
+            enc.setVertexBytes(&vu, length: vu.count, index: vstage.ubuf)
+            enc.setFragmentBytes(&fu, length: fu.count, index: fstage.ubuf)
+
+            // 输入纹理:g_Texture0 = 主输入;g_TextureN(N>0)= 命名 bind(如 apply 的 g_Texture2=previous)
+            // 或 auxTextures(mask 等);缺省 util 默认贴图,再缺省退白(效果全开)。
+            for s in fstage.samplers {
+                let tex: MTLTexture
+                var flags: TexFlags? = nil    // 真实 WE 纹理 flags → samplerFor 选采样器;nil = clamp+linear(保守)
+                let isMaskSampler = (p.uniformMeta[s.name]?.combo == "MASK")
+                if s.name == "g_Texture0" { tex = primary; flags = texFlags[s.name] }
+                // 审计修复 #2:绑定命名 FBO 前先校验该 bind 的 conditions(如 fluidsimulation 的
+                // {'index':2,'conditions':[{'LIGHTING':1}]} / {'index':4,'conditions':[{'RENDERING':3}]})。
+                // 仅当当前 combo 满足 conditions 才绑该块;否则跳过此 bind,让槽落到后续兜底(util/白)分支
+                // —— 与 WE 一致(条件不满足时该采样源不参与,而非绑错块导致 lighting/rendering 分支取脏数据)。
+                else if let b = p.bind.first(where: { "g_Texture\($0.index)" == s.name
+                        && Self.conditionsMet($0.conditions, comboInts: comboInts) }),
+                        let t = named[b.name] { tex = t }
+                    // 命名 FBO / previous:引擎渲出的全屏纹理,UV∈[0,1],flags 保持 nil(clamp+linear)。
+                else if isMaskSampler, let mask = maskTexture { tex = mask; flags = texFlags[s.name] }   // opacitymask → 据 manifest 定位的 MASK 槽
+                else if let aux = auxTextures[s.name] { tex = aux; flags = texFlags[s.name] }
+                else if let def = p.uniformMeta[s.name]?.default?.value as? String, def.hasPrefix("_rt_"), let fb = frameBuffer {
+                    // WE 渲染目标(如 frame_builder 的 g_Texture3 = backgroundTexture 默认 _rt_FullFrameBuffer
+                    // = 整帧合成缓冲)。喂引擎合成好的「该层之下场景」底图(屏幕UV采样),否则退白 → 边框外全白。
+                    tex = fb
+                }
+                else if let def = p.uniformMeta[s.name]?.default?.value as? String, def.contains("/") {
+                    // 采样器默认贴图:WE 内置 ref(util/noise|white|black、particle/halo_6 等)。
+                    // 关键:不限 util/——xray 的 sprite 默认是 particle/halo_6,缺它则 g_Texture2 退白
+                    //   → blend 不再被 halo 限定 → 揭示作用于整图(而非光标处一圈)。
+                    //   utilTexture 经 BuiltinAssets 解析 materials/<ref>.tex,缺失自身退白,安全。
+                    let u = utilTexture(def)
+                    tex = u.tex
+                    // 采样器按贴图**真实 flags** 选(取代旧 isTilingRef 名字猜):可平铺噪声(util/noise 等)
+                    // 的 .tex 头本就无 ClampUVs → repeat 环绕(filmgrain 按 g_NoiseScale 放大采样不出网格黑线);
+                    // 精灵/white/black 带 ClampUVs → clamp。
+                    flags = u.flags
+                }
+                else { tex = whiteTex }           // 兜底(缺省 mask)→ 白(效果全开)
+                enc.setFragmentTexture(tex, index: s.texIndex)
+                enc.setFragmentSamplerState(samplerFor(flags), index: s.sampIndex)
+            }
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            enc.endEncoding()
+
+            if let target = p.target { named[target] = out }   // 命名 FBO 供后续 pass bind;"previous" 恒=输入图
+            lastOut = out
+        }
+        return lastOut
+    }
+}
+
+/// 极简 AnyCodable(只为读 manifest 里的 default 值:数字或字符串)。
+struct AnyCodable: Codable {
+    let value: Any?
+    init(from decoder: Decoder) throws {
+        let c = try decoder.singleValueContainer()
+        if let d = try? c.decode(Double.self) { value = d }
+        else if let s = try? c.decode(String.self) { value = s }
+        else if let b = try? c.decode(Bool.self) { value = b }
+        else { value = nil }
+    }
+    func encode(to encoder: Encoder) throws {
+        var c = encoder.singleValueContainer()
+        if let d = value as? Double { try c.encode(d) }
+        else if let s = value as? String { try c.encode(s) }
+        else { try c.encodeNil() }
+    }
+}
