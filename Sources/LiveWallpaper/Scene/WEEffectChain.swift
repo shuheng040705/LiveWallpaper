@@ -535,6 +535,7 @@ final class WEEffectChain {
     /// sceneW/sceneH = 全帧(场景)尺寸 → g_TexelSize/g_TexelSizeHalf 用它(对齐 lwe CPass.cpp:783,恒定全场景 texel)。
     private func buildUniforms(_ stage: StageDef, meta: [String: UniformMeta],
                                pkgParams: [String: Any], time: Float, cursor: SIMD2<Float>,
+                               cursorLast: SIMD2<Float>,
                                texW: Int, texH: Int, sceneW: Int, sceneH: Int,
                                audio: AudioSpectrum) -> [UInt8] {
         // 数组 uniform 要把 offset+元素数×步长 都算进上界(否则数组尾巴越界)。
@@ -572,8 +573,12 @@ final class WEEffectChain {
                     // 平面满画布层的正确值就是 identity(无投影倾斜/单位缩放),非兜底。
                     vals = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]
                 } else if u.name == "g_PointerPosition" || u.name == "g_ParallaxPosition" {
-                    // WE 交互 pointer / 视差位置,归一化 [0,1]。静止居中 = (0.5,0.5)(中性,无偏移)。
+                    // WE 交互 pointer / 视差位置,归一化 [0,1]。lwe CPass.cpp:779 g_PointerPosition=scene.getMousePosition()。
+                    // (g_ParallaxPosition lwe CPass 未设;此处用同一光标作中性兜底,无 lwe 取值可依不另发明。)
                     vals = [cursor.x, cursor.y]
+                } else if u.name == "g_PointerPositionLast" {
+                    // lwe CPass.cpp:780 g_PointerPositionLast=scene.getMousePositionLast()(上一帧光标,供运动型 pointer 特效算速度)。
+                    vals = [cursorLast.x, cursorLast.y]
                 } else if u.name == "g_Time" {
                     vals = [time]
                 } else if u.name == "g_TexelSize" {
@@ -674,6 +679,7 @@ final class WEEffectChain {
              texFlags: [String: TexFlags] = [:],
              paramsPerPass: [[String: Any]] = [], time: Float,
              cursor: SIMD2<Float> = SIMD2(0.5, 0.5),
+             cursorLast: SIMD2<Float> = SIMD2(0.5, 0.5),
              audio: AudioSpectrum = AudioSpectrum(),
              frameBuffer: MTLTexture? = nil,
              sceneFootprint: (mvp: simd_float4x4, outW: Int, outH: Int)? = nil,
@@ -807,8 +813,8 @@ final class WEEffectChain {
 
             // 逐 pass 参数优先(bloom 各 pass strength 可不同);否则合并版。
             let params: [String: Any] = (pi < paramsPerPass.count) ? paramsPerPass[pi] : pkgParams
-            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio)
-            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio)
+            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, cursorLast: cursorLast, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio)
+            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, cursorLast: cursorLast, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio)
             enc.setVertexBytes(&vu, length: vu.count, index: vstage.ubuf)
             enc.setFragmentBytes(&fu, length: fu.count, index: fstage.ubuf)
 

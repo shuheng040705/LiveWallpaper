@@ -922,6 +922,7 @@ final class SceneRenderEngine {
     /// g_PointerPosition / g_ParallaxPosition(xray 透视揭示、depthparallax 视差)。
     /// 静止(鼠标居中)= (0.5,0.5);WE 约定 0.5 为中性(无偏移)。
     private var cursorUV = SIMD2<Float>(0.5, 0.5)
+    private var cursorUVLast = SIMD2<Float>(0.5, 0.5)   // 上一帧光标 UV(喂 g_PointerPositionLast,lwe CPass.cpp:780)
     /// 相机视差总开关(场景 general.cameraparallax)。关时不做视差/漂移。
     private var cameraParallax = true
     // WE 相机真实参数:视差幅度/鼠标影响/平滑延迟(照 lwe CScene.cpp:394-406 + CImage.cpp:1097-1106)。
@@ -1241,6 +1242,7 @@ final class SceneRenderEngine {
                              min(1, max(0, (mouseNorm.y / ndcScale.y + 1) * 0.5)))
         let cursorCanvas = SIMD2(mouseUVc.x * canvas.x, mouseUVc.y * canvas.y)
         // 光标归一化 UV [0,1](y 向上)。喂 WE 交互特效(xray/depthparallax/樱花轨迹)的 pointer 量。
+        cursorUVLast = cursorUV   // 存上一帧光标(g_PointerPositionLast)再更新本帧
         cursorUV = mouseUVc
 
         // 鼠标划过水波:把光标 UV [0,1](y 向上=屏幕)喂给流体模拟。模拟步进在 render() 里做。
@@ -1750,7 +1752,7 @@ final class SceneRenderEngine {
                                     auxTextures: auxTextures,
                                     texFlags: flagsMap,
                                     paramsPerPass: eff.weParamsPerPass.map { $0 as [String: Any] },
-                                    time: currentTime, cursor: cursorUV,
+                                    time: currentTime, cursor: cursorUV, cursorLast: cursorUVLast,
                                     audio: currentAudio, frameBuffer: fb,
                                     sceneFootprint: footprint, commandBuffer: cmd)
                 if let out = runOut {
@@ -1953,7 +1955,7 @@ final class SceneRenderEngine {
                                 pkgParams: eff.weParams as [String: Any],
                                 combos: eff.weCombos as [String: Any],
                                 paramsPerPass: eff.weParamsPerPass.map { $0 as [String: Any] },
-                                time: currentTime, cursor: cursorUV,
+                                time: currentTime, cursor: cursorUV, cursorLast: cursorUVLast,
                                 audio: currentAudio, commandBuffer: cmd) {
                 current = out
             }
