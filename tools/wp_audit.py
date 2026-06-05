@@ -82,9 +82,9 @@ def audit_object(ob, F):
         elif has_pulse:
             rows.append(('OK','composelayer(pulse/打雷)','frameBufferInput → 按 pkg 区域 + 画布UV 采样(已修)'))
         elif not effs:
-            rows.append(('GAP','composelayer(无特效容器)','疑为透明变换容器(如时钟父层)→ 当前跳过绘制;子层可能丢父变换 → 位置偏'))
+            rows.append(('OK','composelayer(无特效容器)','透明变换容器(如时钟父层)→ 容器本身不画(faithful);子层经 resolveTransform 拿到父变换(已实现父链),位置对'))
         else:
-            rows.append(('GAP','composelayer(_rt_FullFrameBuffer)',f'effects={[e.get("file","") for e in effs]} —— ⚠️ 区域性合成层渲染未实现 → 跳过'))
+            rows.append(('OK','composelayer(_rt_FullFrameBuffer)',f'effects={[e.get("file","") for e in effs]} —— per-Image FBO 合成已实现(footprint copy 采场景进层 [0,1] FBO + 特效链 + 末 pass blend,= lwe composelayer)'))
 
     # 特效逐个
     for e in ob.get('effects', []):
@@ -94,7 +94,7 @@ def audit_object(ob, F):
         is_audio_name = ('audio' in efl and ('bar' in efl or 'spectrum' in efl))
         is_audio_content = any(('栏的条数' in k or '栏的间距' in k or 'bar count' in k.lower() or 'spectrum' in k.lower()) for k in csv.keys())
         if is_audio_content and not is_audio_name:
-            rows.append(('GAP','effect(音频条·改名/汉化)',f'{ef} —— ⚠️ 文件名不含 audio/bar,parseAudioBars 按文件名认不出(content 识别曾试但 composelayer 底图渲成暗框已回退)'))
+            rows.append(('OK','effect(音频条·改名/汉化)',f'{ef} —— 文件名不含 audio/bar,但走 per-Image FBO composelayer + usesAudioSpectrum(扫 frag/vert.uniforms 的 g_AudioSpectrum)检测,真 shader 渲染(不再靠文件名 parseAudioBars)'))
         elif 'cursorripple' in efl:
             rows.append(('OK','effect:cursorripple','走 CursorRippleSim(鼠标水波)'))
         else:
@@ -120,16 +120,18 @@ def audit_object(ob, F):
     return typ, rows
 
 KNOWN_GAPS = """
-已知引擎缺口清单(审查时对照;实测积累):
-  ⚠️ cropoffset:解析存下但未应用(SceneModel TODO)——贴图裁剪重定位,影响 puppet 部件/面具/发饰对位。
-  ⚠️ puppet 骨骼蒙皮:已实现(MDLS0004/MDLA0006),但 inter-puppet attachment(头挂身体颈骨)数据不在文件→多部件错位;离体UV岛(眼睛)需精确落位,精度待校。
+已知引擎缺口清单(审查时对照;实测积累。⚠️=真缺口 / ✅=已修(2026-06) / ⏭️=lwe同样不做):
+  ✅ composelayer 区域性(_rt_FullFrameBuffer 非 pulse/非音频条):**已实现 per-Image FBO 合成**(footprint copy 采场景进层 [0,1] FBO=lwe composelayer 首 copy pass,CImage.cpp:785-853;FBO 用未缩放 raw size CImage.cpp:239)。
+  ✅ 音频条 effect 改名/汉化:走 per-Image FBO + usesAudioSpectrum(扫 frag/vert.uniforms)检测,不再靠文件名。
+  ✅ 音频条 composelayer FBO 比例:用未缩放 size(非 size×scale),修各向异性 scale 把条压扁(下音条)。
   ⚠️ 图层遮挡:头发等不透明层按渲染序盖在脸上(faithful),眼睛靠贴图 alpha 缝隙+puppet warp 精确对位才露出。
-  ⚠️ composelayer 区域性(_rt_FullFrameBuffer 非 pulse/非音频条):区域合成渲染未实现→跳过。
-  ⚠️ 音频条:渲染对,但靠 ScreenCaptureKit 系统音频驱动;采集守护进程坏(callback 不触发)→ 重启 Mac;壁纸自带音乐默认静音(isMuted)。
-  ⚠️ 音频条 effect 改名/汉化(文件名不含 audio/bar):parseAudioBars 按文件名认不出(content 识别因 composelayer 暗框回退)。
-  ⚠️ remapvalue+fbmnoise(Gouttes 玻璃水珠):只实现 velocity+simplex,缺 speed+fbm(lwe 本身也没 remapvalue)。
+  ⚠️ 音频条:渲染对,但靠 ScreenCaptureKit 系统音频驱动;采集守护进程坏(callback 不触发)→ 重启 Mac;壁纸自带音乐默认静音(isMuted,lwe 默认播——未改)。
+  ⚠️ 关键帧动画贝塞尔手柄:WEKeyframeAnimation 线性插值,缺 front/back 切线手柄(头发/发饰摇摆缓动机械)。lwe 不实现关键帧,需照 WE 数据补。
+  ⚠️ cropoffset:解析存下但未应用——贴图裁剪重定位,影响 puppet 部件/面具/发饰对位。lwe 无 cropoffset,需照 WE 补。
+  ⚠️ remapvalue+fbmnoise(Gouttes 玻璃水珠):只实现 velocity+simplex,缺 speed+fbm(lwe 本身也没 remapvalue,需照 WE 补)。
   ⚠️ 多个 oscillateposition(雪的双摆):单字段只留最后一个。
-  ⚠️ 3D 透视相机 eye≠0:未应用(lwe 也基本只用正交)。
+  ⚠️ 3D 透视相机 eye≠0:未应用(lwe Camera.cpp:50 有透视 eye;正交等价已对,透视待补)。
+  ⚠️ puppet inter-puppet attachment(头挂身体颈骨):数据不在文件→多部件错位;离体UV岛(眼睛)精度待校。lwe 不做 puppet 动画。
   ⏭️ VolumeLight/light/shape、camerashake:跳过(lwe 同样未实现,非我方独缺)。
   ⏭️ visible=false / instanced 占位 / projectlayer 容器:合法跳过(faithful)。
 """
