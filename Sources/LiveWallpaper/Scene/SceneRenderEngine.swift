@@ -85,6 +85,7 @@ private struct GPULayer {
     var origin: SIMD2<Float>
     var parallax: SIMD2<Float>   // parallaxDepth:视差响应强度
     var sizePx: SIMD2<Float>
+    var rawSizePx: SIMD2<Float> = SIMD2(1, 1)   // **未缩放**原始 size(lwe CImage.cpp:239 m_size);composelayer 自有 FBO 用它(:278-283),scale 只作用于 quad 几何。sizePx=size×scale 仅用于 quad/mvp。
     var video: VideoTexture? = nil   // 视频纹理(动态贴图);非 nil 时每帧刷新 texture
     var effects: [LayerEffect] = []  // 图层后处理效果链
     var text: TextLayerState? = nil  // 文本图层(时钟/日期);非 nil 时按秒刷新纹理
@@ -652,6 +653,7 @@ final class SceneRenderEngine {
                 origin: SIMD2(layer.originPx.x, layer.originPx.y),
                 parallax: layer.parallax,
                 sizePx: effSize,
+                rawSizePx: size,   // 未缩放(lwe m_size);composelayer footprint FBO 用它,不用 effSize(=size×scale)
                 video: videoTex,
                 effects: effs,
                 text: textState,
@@ -1702,8 +1704,11 @@ final class SceneRenderEngine {
             if layers[i].frameBufferInput {
                 let scene = sceneInput ?? compositeSceneBelow(upTo: i, commandBuffer: cmd) ?? current
                 current = scene
-                // 层尺寸 = effect FBO 尺寸(lwe CImage.cpp:278-283 = size×size = 层自有 FBO 尺寸)。
-                let sp = layers[i].sizePx
+                // 层自有 FBO 尺寸 = **未缩放原始 size**(lwe CImage.cpp:239 m_size + :278-283 FBO={size.x,size.y})。
+                // scale 只作用于 quad/mvp 几何(把 FBO 拉伸贴到屏幕),**不进 FBO 像素尺寸**。此前误用 sizePx(=size×scale)
+                // → 各向异性 scale 把 FBO 拉扁 → g_Texture0Resolution 错 → Simple_Audio_Bars 的 i_DCorrectingFactor 错
+                // → 条宽被压扁(下音条 scale=3.91 → 条挤成细栅栏)。改用 rawSizePx 严格对齐 lwe。
+                let sp = layers[i].rawSizePx
                 footprint = (mvp: layers[i].mvp, outW: max(1, Int(sp.x.rounded())), outH: max(1, Int(sp.y.rounded())))
             }
             let auxes = layers[i].effectAux
