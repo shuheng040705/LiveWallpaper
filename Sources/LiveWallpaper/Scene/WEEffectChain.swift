@@ -170,6 +170,29 @@ final class WEEffectChain {
         return out
     }
 
+    /// 把整画布纹理 src(场景 / 全画布 opacitymask)按层屏幕投影 footprint 采进层尺寸 [0,1] FBO
+    /// (= lwe composelayer 首 copy pass)。供 run() 的场景输入 **与** SceneRenderEngine 的全画布遮罩**共用
+    /// 同一 footprint(同一 mvp)→ 两者在层 [0,1] 空间精确对齐(身体影子落在 footprint 内的 body 上)。
+    /// 此前 per-Image FBO 端口只对场景做了 footprint copy、遗漏遮罩(遮罩按 [0,1] 绑 → 整画布影子压扁进层 = 错位)。
+    func footprintSample(_ src: MTLTexture, mvp: simd_float4x4, outW: Int, outH: Int, commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
+        guard let cp = copyPipeline, let dst = makeTarget(width: max(1, outW), height: max(1, outH)) else { return nil }
+        let verts = makeFootprintVerts(mvp: mvp)
+        guard let vbuf = device.makeBuffer(bytes: verts, length: MemoryLayout<Float>.stride * verts.count, options: []) else { return nil }
+        let cpass = MTLRenderPassDescriptor()
+        cpass.colorAttachments[0].texture = dst
+        cpass.colorAttachments[0].loadAction = .clear
+        cpass.colorAttachments[0].storeAction = .store
+        cpass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+        guard let cenc = cmd.makeRenderCommandEncoder(descriptor: cpass) else { return nil }
+        cenc.setRenderPipelineState(cp)
+        cenc.setVertexBuffer(vbuf, offset: 0, index: 1)
+        cenc.setFragmentTexture(src, index: 0)
+        cenc.setFragmentSamplerState(sampler, index: 0)
+        cenc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+        cenc.endEncoding()
+        return dst
+    }
+
     init?(device: MTLDevice) {
         self.device = device
         // 4 个采样器:{clamp,repeat} × {linear,nearest},由纹理真实 flags 选(见 samplerFor）。
@@ -691,24 +714,9 @@ final class WEEffectChain {
         // g_TexelSize 恒用**完整场景**尺寸(lwe CPass.cpp:783 = 1/scene.getWidth);copy 后 input 变层尺寸,
         // 故先记下场景原始尺寸供 buildUniforms 的 sceneW/sceneH。footprint=nil 时 = input 尺寸(行为不变)。
         let sceneW = input.width, sceneH = input.height
-        if let fp = sceneFootprint, let cp = copyPipeline,
-           let layerTex = makeTarget(width: max(1, fp.outW), height: max(1, fp.outH)) {
-            let verts = makeFootprintVerts(mvp: fp.mvp)
-            let vbuf = device.makeBuffer(bytes: verts, length: MemoryLayout<Float>.stride * verts.count, options: [])
-            let cpass = MTLRenderPassDescriptor()
-            cpass.colorAttachments[0].texture = layerTex
-            cpass.colorAttachments[0].loadAction = .clear
-            cpass.colorAttachments[0].storeAction = .store
-            cpass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-            if let v = vbuf, let cenc = cmd.makeRenderCommandEncoder(descriptor: cpass) {
-                cenc.setRenderPipelineState(cp)
-                cenc.setVertexBuffer(v, offset: 0, index: 1)
-                cenc.setFragmentTexture(input, index: 0)
-                cenc.setFragmentSamplerState(sampler, index: 0)   // 场景 FBO 全屏纹理,clamp+linear(UV∈[0,1])
-                cenc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-                cenc.endEncoding()
-                input = layerTex
-            }
+        if let fp = sceneFootprint,
+           let layerTex = footprintSample(input, mvp: fp.mvp, outW: fp.outW, outH: fp.outH, commandBuffer: cmd) {
+            input = layerTex   // 场景按层 footprint 采进层 [0,1] FBO(全画布遮罩在 SceneRenderEngine 用同一 footprintSample 对齐)
         }
         let w = input.width, h = input.height
         // 审计修复 #2:把本次 run 的 combos 归一成整数,供 bind.conditions 判定(在 pass 循环外算一次)。

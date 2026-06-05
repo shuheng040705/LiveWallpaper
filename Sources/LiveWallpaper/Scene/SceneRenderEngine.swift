@@ -1726,13 +1726,30 @@ final class SceneRenderEngine {
                 if Self.fxSkip.contains(eff.weName) { continue }   // 诊断:WP_SKIP_FX 跳过
                 // 逐特效辅助贴图:weAux 的 slot → g_Texture<slot>(WE pass.textures[N] → 采样器 g_TextureN)。
                 // 这统一了 opacitymask/法线/相位/流向等所有辅助槽,取代旧的单一 maskTexture 机制。
-                // 辅助贴图(opacitymask/法线/流向等)按其 [0,1] UV 直接绑 g_Texture<slot> —— lwe 里 effect frag
-                // 用与 g_Texture0 同一 v_TexCoord(层 [0,1])采样它们(CPass setupUniforms 无区域裁剪),故不裁。
-                // (此前 regionFit 把全画布遮罩裁到 region = 配合自创裁场景路径,lwe 无此步,已随 region-fit 一并删。)
+                // **全画布 opacitymask(如身体影子 4096×2296)按与场景同一 footprint 采进层 [0,1]**:effect frag 在层
+                // [0,1](v_TexCoord)采遮罩,而场景已经过 footprint copy 进层 [0,1];整画布遮罩(身体剪影按画布坐标画)
+                // 必须用**同一 footprint** 采,才能落在 footprint 内的 body 上对齐。per-Image FBO 端口只对场景做了 footprint、
+                // 漏了遮罩(直接 [0,1] 绑 → 整画布影子压扁进层 = 身体音频条错位/眼睛肉块/多余阴影)。层尺寸遮罩或非
+                // footprint 层 → 按 [0,1] 直接绑(行为不变)。
                 var auxTextures: [String: MTLTexture] = [:]
                 if ei < auxes.count {
                     for (slot, tex) in auxes[ei] {
-                        auxTextures["g_Texture\(slot)"] = tex
+                        var t = tex
+                        if ProcessInfo.processInfo.environment["WP_DBG_MASK"] != nil {
+                            Log.write("MASK id=\(layers[i].id) eff=\(eff.weName) slot=\(slot) tex=\(tex.width)x\(tex.height) canvas=\(Int(canvas.x))x\(Int(canvas.y)) footprint=\(footprint != nil ? "\(footprint!.outW)x\(footprint!.outH)" : "nil")")
+                        }
+                        // 全画布遮罩(身体影子 4096×2296,按画布坐标画)→ 用**该层自己的 mvp footprint** 采进层尺寸 [0,1]
+                        // FBO,使遮罩 [0,1] = 该层在画布的 footprint(身体那块)→ 与层 [0,1] 渲的音频条对齐。
+                        // 不依赖 frameBufferInput(opacity 不读场景但层有位置);层尺寸遮罩(tex≠canvas)不动。
+                        if tex.width == Int(canvas.x), tex.height == Int(canvas.y) {
+                            let sp = layers[i].sizePx
+                            if let sampled = we.footprintSample(tex, mvp: layers[i].mvp,
+                                                                outW: max(1, Int(sp.x.rounded())), outH: max(1, Int(sp.y.rounded())),
+                                                                commandBuffer: cmd) {
+                                t = sampled
+                            }
+                        }
+                        auxTextures["g_Texture\(slot)"] = t
                     }
                 }
                 // 真实 flags → 采样器:g_Texture0 = 图层贴图(仅首个特效跑时);辅助槽 = 各自 .tex 的 flags。
