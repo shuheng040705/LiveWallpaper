@@ -294,10 +294,10 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         // 取最后 fftLength 个样本,清掉旧的。
         let samples = Array(sampleAccum.suffix(fftLength))
         sampleAccum.removeAll(keepingCapacity: true)
-        // **严格对齐 lwe**:lwe(PulseAudioPlaybackRecorder.cpp:238-242)把归一化样本**直接**喂 kiss_fftr,
-        // **无任何窗函数**。我们之前自加了 Hann 窗(=偏离 lwe 的自调行为,削峰)→ 去掉,喂裸样本。
-        // (注:WE 的「录音音量」全局增益 pkg/lwe 都没有,故不实现——音频条强度全由 pkg 的 u_BarBounds 等决定。)
-        var input = samples
+        // Hann 窗(用户确认:此原始版本的音频条强度是对的)。2026-06 曾以「对齐 lwe 无窗」为由去掉,
+        // 但用户(对照真 WE 的 ground truth)反馈改后强度不对 → 撤回原始 Hann 窗版本。
+        var windowed = [Float](repeating: 0, count: fftLength)
+        vDSP_vmul(samples, 1, window, 1, &windowed, 1, vDSP_Length(fftLength))
 
         var real = [Float](repeating: 0, count: fftLength / 2)
         var imag = [Float](repeating: 0, count: fftLength / 2)
@@ -305,7 +305,7 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         real.withUnsafeMutableBufferPointer { rp in
             imag.withUnsafeMutableBufferPointer { ip in
                 var split = DSPSplitComplex(realp: rp.baseAddress!, imagp: ip.baseAddress!)
-                input.withUnsafeBytes { raw in
+                windowed.withUnsafeBytes { raw in
                     raw.bindMemory(to: DSPComplex.self).baseAddress.map {
                         vDSP_ctoz($0, 2, &split, 1, vDSP_Length(fftLength / 2))
                     }
@@ -328,10 +328,9 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
 
         for band in 0..<64 {
             let index = band * 2                          // 线性单 bin(含 DC);band=63 → index=126 < bins(512)
-            // **严格对齐 lwe**:vDSP_fft_zrip 的 re²+im² 实测 = 标准 DFT 的 **4 倍**(2× 打包,平方→4×;
-            //   /tmp/vdsptest 测得 vDSP/标准=4.0)。lwe 用 kiss_fftr=标准未归一 DFT,其 f2=re²+im²。故 ×0.25
-            //   把 vDSP 幅度校正到与 kiss_fftr 数值相同 → 同一 0.35*log10(f2) 公式产出与 lwe 完全一致的值。
-            let mag = (index < bins ? mags[index] : 0) * 0.25
+            // 直接用 vDSP 的 re²+im²(原始版本,用户确认强度正确)。2026-06 曾加 ×0.25「校正到 kiss_fftr 尺度」,
+            // 但那改变了 0.35*log10(mag) 的绝对强度 → 用户反馈不对 → 撤回。强度尺度回到原始已验证良好状态。
+            let mag = index < bins ? mags[index] : 0
 
             var f1: Float = 0
             if mag > 0 { f1 = 0.35 * log10(mag) }
