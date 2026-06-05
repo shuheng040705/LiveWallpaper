@@ -40,6 +40,18 @@ struct DownloadRow: View {
                             .font(.system(size: 14)).foregroundStyle(.secondary)
                     }
                     .buttonStyle(.plain).help("取消下载")
+                } else if isFailedOrCancelled {
+                    // 失败/取消:重新下载 + 删除
+                    Button { WorkshopDownloader.shared.retry(id: job.id) } label: {
+                        Image(systemName: "arrow.clockwise.circle.fill")
+                            .font(.system(size: 14)).foregroundStyle(accent)
+                    }
+                    .buttonStyle(.plain).help("重新下载")
+                    Button { WorkshopDownloader.shared.remove(id: job.id) } label: {
+                        Image(systemName: "trash.circle.fill")
+                            .font(.system(size: 14)).foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain).help("从列表删除")
                 }
             }
             GeometryReader { geo in
@@ -141,5 +153,8 @@ struct DownloadRow: View {
 
     private var isActive: Bool {
         switch job.state { case .queued, .connecting, .downloading: return true; default: return false }
+    }
+    private var isFailedOrCancelled: Bool {
+        switch job.state { case .failed, .cancelled: return true; default: return false }
     }
 }

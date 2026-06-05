@@ -97,7 +97,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onMainScreenOnlyChanged: { [weak self] on in self?.desktop.setMainScreenOnly(on) },
             onDesktopIconsChanged: { on in DesktopIcons.setVisible(on) },
             onDelete: { [weak self] item in self?.deleteWallpaper(item) },
-            onApplySettings: { [weak self] item in self?.scheduleSettingsReload(item) }
+            onApplySettings: { [weak self] item in self?.scheduleSettingsReload(item) },
+            onUnsubscribe: { [weak self] item in
+                // 先取消 Steam 订阅(网页会话),无论成功与否都删除本地壁纸。
+                SteamSubscription.unsubscribe(id: item.id) { ok, msg in
+                    Log.write("Unsubscribe \(item.id): \(ok ? "OK" : "fail") — \(msg)")
+                }
+                self?.deleteWallpaper(item)
+            }
         )
     }
 

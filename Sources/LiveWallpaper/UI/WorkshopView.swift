@@ -166,8 +166,31 @@ struct WorkshopView: View {
 
 /// 持有一个**长期存活**的 WKWebView 并观察其状态。单例 + 持久实例:切换分类导致
 /// WorkshopView 重建时,复用同一个 WebController/WKWebView → 保留浏览位置(不每次回首页)。
-final class WebController: NSObject, ObservableObject, WKNavigationDelegate {
+final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
     static let shared = WebController()
+
+    /// 注入页面的 JS:拦截「订阅」的网络请求(/sharedfiles/subscribe)本身,从 body 取 workshop id
+    /// 通过消息桥发回 app → 触发下载。与页面结构无关 —— 详情页按钮、浏览网格悬停的绿色订阅按钮、合集订阅
+    /// 都走同一个端点,所以都能捕获;取消订阅走 /unsubscribe(天然区分,不会误触发下载)。
+    /// 在 documentStart 注入,确保在页面脚本发起请求前已包好 XHR/fetch。
+    private static let subscribeHookJS = """
+    (function(){
+      if (window.__wpSubHook) return; window.__wpSubHook = true;
+      function post(id){ try { if (id && window.webkit && webkit.messageHandlers && webkit.messageHandlers.wpSubscribe) webkit.messageHandlers.wpSubscribe.postMessage(String(id)); } catch(_){} }
+      function idFrom(b){ var m = (typeof b === 'string') ? b.match(/(?:^|&)id=(\\d+)/) : null; return m ? m[1] : null; }
+      function isSub(u){ u = u || ''; return /\\/sharedfiles\\/subscribe(\\?|$|\\b)/.test(u) && !/unsubscribe/.test(u); }
+      var O = XMLHttpRequest.prototype.open, S = XMLHttpRequest.prototype.send;
+      XMLHttpRequest.prototype.open = function(m, u){ this.__wu = u; return O.apply(this, arguments); };
+      XMLHttpRequest.prototype.send = function(b){ if (isSub(this.__wu)) { var id = idFrom(b); if (id) post(id); } return S.apply(this, arguments); };
+      if (window.fetch){
+        var F = window.fetch;
+        window.fetch = function(i, init){
+          try { var u = (typeof i === 'string') ? i : (i && i.url) || ''; if (isSub(u)) { var id = idFrom(init && init.body); if (id) post(id); } } catch(_){}
+          return F.apply(this, arguments);
+        };
+      }
+    })();
+    """
 
     @Published var canGoBack = false
     @Published var canGoForward = false
@@ -182,10 +205,30 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate {
     override init() {
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .default()   // 保留 Steam 登录态
+        let ucc = WKUserContentController()
+        ucc.addUserScript(WKUserScript(source: Self.subscribeHookJS, injectionTime: .atDocumentStart, forMainFrameOnly: false))
+        cfg.userContentController = ucc
         wkWebView = WKWebView(frame: .zero, configuration: cfg)
         super.init()
+        ucc.add(self, name: "wpSubscribe")   // 接收 JS 发回的订阅事件
         wkWebView.navigationDelegate = self
         wkWebView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
+    }
+
+    /// 收到网页「订阅」事件 → 同步用 SteamCMD 下载该壁纸(已在库则跳过)。
+    /// 详情页订阅:用页面标题 + 抓文件大小;浏览网格订阅:用 id 当标题(抓不到大小,进度走块数不受影响)。
+    func userContentController(_ ucc: WKUserContentController, didReceive message: WKScriptMessage) {
+        guard message.name == "wpSubscribe", let id = message.body as? String,
+              id.allSatisfy(\.isNumber), id.count >= 6 else { return }
+        let dest = PreferencesStore.shared.libraryRoot.appendingPathComponent(id)
+        if FileManager.default.fileExists(atPath: dest.path) { return }   // 已在库,不重复下
+        let onDetail = currentURL?.absoluteString.contains("id=\(id)") ?? false
+        if onDetail {
+            let title = pageTitle.isEmpty ? id : pageTitle
+            fetchFileSize { bytes in WorkshopDownloader.shared.enqueue(id: id, title: title, sizeBytes: bytes) }
+        } else {
+            WorkshopDownloader.shared.enqueue(id: id, title: "创意工坊 #\(id)", sizeBytes: 0)
+        }
     }
 
     /// 仅首次加载首页;之后切走再切回保留当前页面。

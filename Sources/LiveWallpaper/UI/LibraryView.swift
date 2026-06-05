@@ -144,7 +144,12 @@ struct LibraryView: View {
                 WallpaperSettingsPanel(
                     item: item,
                     onApply: { actions.onApplySettings(item) },
-                    onClose: { withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil } }
+                    onClose: { withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil } },
+                    onUnsubscribe: item.id.allSatisfy(\.isNumber) ? {
+                        actions.onUnsubscribe(item)
+                        favVersion += 1
+                        withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil }
+                    } : nil
                 )
                 .frame(width: 320)
                 .transition(.move(edge: .trailing).combined(with: .opacity))
@@ -219,7 +224,11 @@ struct LibraryView: View {
     private func navRow(_ s: Section, count: Int?) -> some View {
         let selected = section == s
         return Button {
-            withAnimation(.easeOut(duration: 0.15)) { section = s }
+            withAnimation(.easeOut(duration: 0.15)) {
+                section = s
+                // 切到创意工坊/设置时关闭右侧壁纸属性栏(避免「全部」里选的壁纸属性栏残留)。
+                if s == .workshop || s == .settings { settingsItem = nil }
+            }
         } label: {
             HStack(spacing: 13) {
                 Image(systemName: s.icon)

@@ -5,10 +5,13 @@ struct DownloadsView: View {
     @ObservedObject private var downloader = WorkshopDownloader.shared
     private let accent = Color(red: 0.92, green: 0.36, blue: 0.62)
 
+    @State private var showLogin = false
+
     var body: some View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.4)
+            if downloader.loginExpired { loginExpiredBanner }
             if downloader.jobs.isEmpty {
                 emptyState
             } else {
@@ -22,6 +25,30 @@ struct DownloadsView: View {
         }
         .frame(minWidth: 480, minHeight: 440)
         .background(VisualEffectView(material: .underWindowBackground).ignoresSafeArea())
+        .sheet(isPresented: $showLogin) {
+            SteamLoginSheet(onDone: { downloader.loginExpired = false })
+        }
+    }
+
+    /// 账号登录失效提醒:点「重新登录」弹 Steam 登录,登录后即可重试下载。
+    private var loginExpiredBanner: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "person.crop.circle.badge.exclamationmark.fill")
+                .font(.system(size: 16)).foregroundStyle(.orange)
+            VStack(alignment: .leading, spacing: 1) {
+                Text("Steam 账号登录已失效").font(.system(size: 12.5, weight: .semibold))
+                Text("缓存的登录令牌过期了,重新登录后即可继续下载").font(.system(size: 11)).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Button { showLogin = true } label: {
+                Text("重新登录").font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
+                    .padding(.horizontal, 12).padding(.vertical, 6)
+                    .background(Capsule().fill(accent))
+            }
+            .buttonStyle(.plain)
+        }
+        .padding(.horizontal, 16).padding(.vertical, 11)
+        .background(Color.orange.opacity(0.12))
     }
 
     private var header: some View {

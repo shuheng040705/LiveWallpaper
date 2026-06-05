@@ -69,6 +69,7 @@ final class WorkshopDownloader: ObservableObject {
     }
 
     @Published private(set) var jobs: [Job] = []
+    @Published var loginExpired = false   // 检测到账号登录失效 → UI 弹「重新登录」提醒
 
     private let loginQueue = DispatchQueue(label: "workshop.login", qos: .utility)
     private let lock = NSLock()
@@ -195,15 +196,29 @@ final class WorkshopDownloader: ObservableObject {
 
         guard ok else {
             if isCancelled(id) { finish(id, .cancelled); return }   // 取消:保留 tmp,UI 决定保留/删除
-            let needLogin = lastOut.contains("No Connection") && PreferencesStore.shared.steamAccount == nil
+            let out = lastOut
+            // steamcmd 登录失败的真实文案不止 "FAILED login":缓存过期是 "ERROR (Invalid Password)",
+            // 还有 "Login Failure"/"Rate Limit Exceeded"/Steam Guard 等。统一识别,避免误报成"网络问题"。
+            let rateLimited = out.contains("Rate Limit")
+            let loginIssue = out.contains("Invalid Password") || out.contains("FAILED login") ||
+                             out.contains("Login Failure") || out.contains("Steam Guard") ||
+                             out.contains("two-factor") || out.contains("Two-factor") || rateLimited
+            let hasAccount = PreferencesStore.shared.steamAccount != nil
             let reason: String
-            if lastOut.contains("File Not Found") { reason = "工坊条目不存在或已下架" }
-            else if lastOut.contains("FAILED login") || lastOut.contains("Steam Guard") || lastOut.contains("two-factor") {
-                reason = "Steam 登录需要验证,请在设置里重新登录"
+            if out.contains("File Not Found") {
+                reason = "工坊条目不存在或已下架"
+            } else if rateLimited {
+                reason = "Steam 登录请求过于频繁,请稍等几分钟后重试"
+            } else if loginIssue && hasAccount {
+                reason = "Steam 账号登录已失效,请重新登录后重试"
+                DispatchQueue.main.async { self.loginExpired = true }   // 触发 UI 重新登录提醒
+            } else if !hasAccount {
+                reason = "未登录 Steam,新壁纸需先登录账号"
+                DispatchQueue.main.async { self.loginExpired = true }
+            } else {
+                reason = "下载失败(已重试),请检查网络后再试"
             }
-            else if needLogin { reason = "新发布壁纸匿名下不了,请在设置里登录 Steam 账号" }
-            else { reason = "下载失败(已重试),请检查网络后再试" }
-            Log.write("WorkshopDownloader \(id): \(reason)\n\(lastOut.suffix(300))")
+            Log.write("WorkshopDownloader \(id): \(reason)\n\(out.suffix(300))")
             finish(id, .failed(reason)); return
         }
 
@@ -242,7 +257,7 @@ final class WorkshopDownloader: ObservableObject {
             let success = out.contains("Waiting for user info...OK") || out.contains("Logged in OK")
             let needGuard = out.contains("Steam Guard") || out.contains("two-factor") || out.contains("Two-factor")
             DispatchQueue.main.async {
-                if success { PreferencesStore.shared.steamAccount = account }
+                if success { PreferencesStore.shared.steamAccount = account; self.loginExpired = false }
                 let msg = success ? "登录成功" : (needGuard ? "需要 Steam 令牌验证码" : "登录失败,请检查账号密码")
                 completion(success, needGuard, msg)
             }
@@ -322,6 +337,34 @@ final class WorkshopDownloader: ObservableObject {
                 switch $0.state { case .done, .failed, .cancelled: return true; default: return false }
             }
         }
+    }
+
+    /// 重新下载一个失败/取消的任务:清掉进度与状态,重新排队。
+    func retry(id: String) {
+        DispatchQueue.main.async {
+            guard let i = self.jobs.firstIndex(where: { $0.id == id }) else { return }
+            var j = self.jobs[i]
+            j.state = .queued; j.startTime = nil; j.elapsed = 0
+            j.committedChunks = 0; j.totalChunks = 0
+            j.downloadedBytes = 0; j.logTotal = 0
+            j.liveSpeedMBps = 0; j.lastSpeedBytes = -1; j.lastSpeedTime = nil
+            j.lastSampleBytes = nil; j.lastSampleTime = nil
+            self.jobs[i] = j
+            self.lock.lock(); self.cancelledSet.remove(id); self.lock.unlock()
+            self.pump()
+        }
+    }
+
+    /// 从列表移除一个任务(失败/取消/完成的;若正在下则先杀进程)+ 清临时目录。
+    func remove(id: String) {
+        lock.lock(); cancelledSet.insert(id); let p = processes[id]; lock.unlock()
+        p?.terminate()
+        DispatchQueue.main.async {
+            self.jobs.removeAll { $0.id == id }
+            self.clearTracking(id)
+            self.pump()
+        }
+        loginQueue.async { try? FileManager.default.removeItem(atPath: NSTemporaryDirectory() + "lw_dl_\(id)") }
     }
 
     // MARK: - 真实下载进度

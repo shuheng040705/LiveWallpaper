@@ -21,4 +21,5 @@ struct LibraryActions {
     var onDesktopIconsChanged: (Bool) -> Void      // 桌面图标显示
     var onDelete: (WallpaperItem) -> Void          // 删除壁纸(移到废纸篓)
     var onApplySettings: (WallpaperItem) -> Void   // 壁纸属性改了 → 若正在播放则重载使其生效
+    var onUnsubscribe: (WallpaperItem) -> Void     // 取消 Steam 订阅 + 删除本地壁纸
 }

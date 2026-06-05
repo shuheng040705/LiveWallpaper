@@ -6,6 +6,7 @@ struct WallpaperSettingsPanel: View {
     let item: WallpaperItem
     var onApply: () -> Void
     var onClose: () -> Void
+    var onUnsubscribe: (() -> Void)? = nil   // 取消订阅 + 删除本地(创意工坊条目才有)
 
     @State private var version = 0   // 改动后递增,触发条件重算 + 控件刷新
     @ObservedObject private var store = WallpaperPropertyStore.shared
@@ -46,6 +47,11 @@ struct WallpaperSettingsPanel: View {
                 }
                 Divider().opacity(0.4)
                 resetBar
+            }
+            // 取消订阅栏(始终在底部,即使无可调属性也可用)。
+            if onUnsubscribe != nil {
+                Divider().opacity(0.4)
+                unsubscribeBar
             }
         }
         .frame(maxHeight: .infinity)
@@ -91,6 +97,32 @@ struct WallpaperSettingsPanel: View {
                 .multilineTextAlignment(.center)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity).padding(20)
+    }
+
+    private var unsubscribeBar: some View {
+        Button(action: confirmUnsubscribe) {
+            HStack(spacing: 7) {
+                Image(systemName: "xmark.bin").font(.system(size: 12))
+                Text("取消订阅并删除壁纸").font(.system(size: 12, weight: .medium))
+                Spacer()
+            }
+            .foregroundStyle(.red)
+            .padding(.horizontal, 16).padding(.vertical, 12)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .help("取消该壁纸的创意工坊订阅,并把壁纸文件夹移到废纸篓")
+    }
+
+    /// 确认后:取消订阅 + 删除本地壁纸(回调里完成,并关闭本面板)。
+    private func confirmUnsubscribe() {
+        let a = NSAlert()
+        a.messageText = "取消订阅「\(item.title)」?"
+        a.informativeText = "将取消该壁纸的创意工坊订阅,并把壁纸文件夹移到废纸篓(可在废纸篓恢复)。"
+        a.alertStyle = .warning
+        a.addButton(withTitle: "取消订阅并删除")
+        a.addButton(withTitle: "取消")
+        if a.runModal() == .alertFirstButtonReturn { onUnsubscribe?() }
     }
 }
 
