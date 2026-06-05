@@ -59,10 +59,12 @@ enum WEEffectTest {
         guard let cmd = queue.makeCommandBuffer() else { exit(1) }
         // 音频反应特效(pulse 等)直测:用 AudioCapture.spectrum16(尊重 WP_TEST_BANDS=loud|silent
         // 注入态),无需真实捕获即可确定性验证音频 uniform → shader 链路。
-        let audio16 = AudioCapture.shared.spectrum16
+        let audio = WEEffectChain.AudioSpectrum(s16: AudioCapture.shared.spectrum16,
+                                                s32: AudioCapture.shared.spectrum32,
+                                                s64: AudioCapture.shared.bands)
         guard let result = chain.run(effect: effect, input: input, pkgParams: params,
                                      combos: combos, auxTextures: [:], time: time,
-                                     audio16: audio16, commandBuffer: cmd) else {
+                                     audio: audio, commandBuffer: cmd) else {
             print("run returned nil"); exit(1)
         }
         // 结果在 .private,需 blit 到 .shared 才能读回。

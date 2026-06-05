@@ -989,7 +989,7 @@ final class SceneRenderEngine {
     private var hasAudioBars = false
     private var hasAudioReactiveFX = false   // 任一图层/后处理特效请求 AUDIOPROCESSING(pulse 等)
     private var hasAudioReactiveScript = false  // 任一 origin/scale/angle 脚本用音频(registerAudioBuffers)
-    private var currentAudio16: [Float] = []  // 本帧 16 段频谱(供 WEEffectChain 的音频 uniform)
+    private var currentAudio = WEEffectChain.AudioSpectrum()  // 本帧三套原生频谱(16/32/64),供 WEEffectChain 的音频 uniform
     /// 壁纸自带音频播放(BGM/雨声);与系统声采集(usesAudio,音频条用)无关。默认随 isMuted 静音。
     private let audioPlayback = AudioPlayback()
 
@@ -1068,11 +1068,15 @@ final class SceneRenderEngine {
                 if vb.length >= bytes { skinned.withUnsafeBytes { vb.contents().copyMemory(from: $0.baseAddress!, byteCount: bytes) } }
             }
         }
-        // 本帧音频频谱。供 runLayerEffects/runPostChain 喂给 WE 的 g_AudioSpectrum16/32/64Left/Right
-        // (WEEffectChain 按各数组声明的段数重采样)。喂**完整 64 段**(AudioCapture.bands),让
-        // Simple_Audio_Bars 的 RESOLUTION=32 与 pulse 的 16 段都从同一高分辨率源取真值,不丢细节。
+        // 本帧音频频谱。供 runLayerEffects/runPostChain 喂给 WE 的 g_AudioSpectrum16/32/64Left/Right。
+        // lwe(CPass.cpp:785-790)绑三套**原生**频谱 audio16/32/64(各分辨率在 AudioCapture 里独立分桶,
+        // 非由 64 段重采样);shader 按 RESOLUTION combo 声明的段数取对应那套。
         // 音频条层(hasAudioBars)和音频反应特效(hasAudioReactiveFX,如 pulse)都要;两者皆无则不取(省锁)。
-        currentAudio16 = (hasAudioReactiveFX || hasAudioBars) ? AudioCapture.shared.bands : []
+        currentAudio = (hasAudioReactiveFX || hasAudioBars)
+            ? WEEffectChain.AudioSpectrum(s16: AudioCapture.shared.spectrum16,
+                                          s32: AudioCapture.shared.spectrum32,
+                                          s64: AudioCapture.shared.bands)
+            : WEEffectChain.AudioSpectrum()
         // WE 相机视差(照 lwe CScene.cpp:394-406):每帧朝目标 (mouseUV-0.5)×amount×influence 平滑逼近。
         // mouseNorm∈[-1,1](y 上) → mouseUV∈[0,1] → centered = mouseUV-0.5 = mouseNorm×0.5。
         // 平滑系数 k = clamp(cameraparallaxdelay × dt秒, 0, 1),displacement += (target-displacement)×k。
@@ -1459,7 +1463,7 @@ final class SceneRenderEngine {
                                           albedo: baseTex, albedoFlags: layer.texFlags, aux: [:],
                                           ambient: ambientColor,
                                           constants: layer.materialConstants, sceneFB: nil,
-                                          audio16: currentAudio16) {   // 基础材质 AUDIOPROCESSING combo 频谱
+                                          audio: currentAudio) {   // 基础材质 AUDIOPROCESSING combo 频谱
                     continue
                 }
             }
@@ -1779,7 +1783,7 @@ final class SceneRenderEngine {
                                     texFlags: flagsMap,
                                     paramsPerPass: eff.weParamsPerPass.map { $0 as [String: Any] },
                                     time: currentTime, cursor: cursorUV,
-                                    audio16: currentAudio16, frameBuffer: fb, commandBuffer: cmd)
+                                    audio: currentAudio, frameBuffer: fb, commandBuffer: cmd)
                 if let out = runOut {
                     current = out
                     primaryFlags = nil   // 后续特效的输入是上一特效的全屏输出 → clamp+linear
@@ -1980,7 +1984,7 @@ final class SceneRenderEngine {
                                 combos: eff.weCombos as [String: Any],
                                 paramsPerPass: eff.weParamsPerPass.map { $0 as [String: Any] },
                                 time: currentTime, cursor: cursorUV,
-                                audio16: currentAudio16, commandBuffer: cmd) {
+                                audio: currentAudio, commandBuffer: cmd) {
                 current = out
             }
         }

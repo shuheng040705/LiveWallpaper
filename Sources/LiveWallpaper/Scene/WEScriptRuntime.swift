@@ -31,11 +31,9 @@ final class WEScript {
 
     /// 脚本里有无 init():首帧跑一次(WE 生命周期)。
     private let initFn: JSValue?
-    /// 该脚本实例的起始时刻(steady clock):engine.runtime = now - start(对标 WE sStartTime)。
+    /// 墙钟兜底起点:仅当上层未传引擎 sim time 时,engine.runtime 回退 now - startTime。
+    /// 正常路径 runtime = 引擎全局 sim time(lwe g_Time,所有脚本共享),见 tickFrame。
     private let startTime = Date()
-    /// 审计修复(#1):若上层传入 sim time,则以首帧 sim time 为起点算 runtime(sim 域),
-    ///   保证脚本动画与引擎 sim-time 同步、无头渲染确定。nil = 尚未用过 sim time(走墙钟回退)。
-    private var startSimTime: Double? = nil
     /// 上次 run 的 runtime 秒,用来算 engine.frametime(帧间隔)。
     private var lastRuntime: Double = 0
     /// init() 是否已调过(首帧调一次)。
@@ -339,26 +337,22 @@ final class WEScript {
     ///   - frametime:本帧 sim dt(秒,对标 lwe `g_Time - g_TimeLast`)。优先直接用它当 engine.frametime
     ///     (音频平滑 `value += delta*min(1,frametime*smoothing)` 等脚本依赖真实帧间隔);未提供时回退 runtime 差近似。
     private func tickFrame(initArg: Any, simTime: Double? = nil, frametime: Double? = nil) {
-        // 1) runtime/frametime/timeOfDay。runtime = 实例存活秒数(对标 sStartTime)。
-        //    审计修复(#1):优先用 sim time(simTime - startSimTime);未提供时回退墙钟 Date()(默认/旧行为)。
-        let runtime: Double
-        if let st = simTime {
-            if startSimTime == nil { startSimTime = st }
-            runtime = max(0, st - (startSimTime ?? st))
-        } else {
-            runtime = Date().timeIntervalSince(startTime)
-        }
-        // frametime:优先用引擎传入的本帧真实 dt(对标 lwe g_Time - g_TimeLast);否则用 runtime 差近似。
+        // 1) runtime/frametime/timeOfDay。
+        //    lwe(EngineObject.cpp:27):engine.runtime = 全局 g_Time(引擎启动以来总时间),**所有脚本共享同一时钟**,
+        //    不是各自从 0 起(之前的 simTime - startSimTime 偏移是自创,会让多脚本相位不同步、与 effect 链 g_Time 不同源)。
+        //    故 runtime 直接 = 传入的引擎 sim time;未提供 sim time 时回退墙钟(仅兜底)。
+        let runtime: Double = simTime ?? Date().timeIntervalSince(startTime)
+        // frametime:优先用引擎传入的本帧真实 dt(对标 lwe g_Time - g_TimeLast,EngineObject.cpp:23);否则用 runtime 差近似。
         let frame = max(0, frametime ?? (runtime - lastRuntime))
         lastRuntime = runtime
         if let engine = context.objectForKeyedSubscript("engine"), engine.isObject {
             engine.setObject(runtime, forKeyedSubscript: "runtime" as NSString)
             engine.setObject(frame, forKeyedSubscript: "frametime" as NSString)
-            // timeOfDay:当地一天内的归一化进度 [0,1)(WE: secondsOfDay / 86400)。
-            let cal = Calendar.current
-            let c = cal.dateComponents([.hour, .minute, .second], from: Date())
-            let secs = Double((c.hour ?? 0) * 3600 + (c.minute ?? 0) * 60 + (c.second ?? 0))
-            engine.setObject(secs / 86400.0, forKeyedSubscript: "timeOfDay" as NSString)
+            // timeOfDay:lwe(EngineObject.cpp:31)= g_Daytime;WallpaperApplication.cpp:870 g_Daytime = (tm_hour*60 + tm_min)/(24*60)
+            // —— **分钟粒度、不含秒**,且与 effect 链的 g_Daytime 同公式。之前含秒的 /86400 是自创偏差。
+            let c = Calendar.current.dateComponents([.hour, .minute], from: Date())
+            let dayMinutes = Double((c.hour ?? 0) * 60 + (c.minute ?? 0))
+            engine.setObject(dayMinutes / 1440.0, forKeyedSubscript: "timeOfDay" as NSString)
         }
         // 2) 首帧 init(value)(WE 生命周期:layer 首次 tick 前调 _init 一次,传入当前属性值)。
         //    传当前值是关键:scale 脚本(如「主三角」音频缩放)init(value){ initialValue = value.x }——

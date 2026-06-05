@@ -383,17 +383,17 @@ struct SceneDocument {
     var cameraParallaxDelay: Float = 0
     var cameraShake: Bool = false
     var cameraShakeAmplitude: Float = 0
-    var cameraShakeRoughness: Float = 1
-    var cameraShakeSpeed: Float = 1
+    var cameraShakeRoughness: Float = 0   // lwe WallpaperParser.cpp:63 缺省 0
+    var cameraShakeSpeed: Float = 0       // lwe WallpaperParser.cpp:64 缺省 0
     // 后处理(fullscreenlayer 上的 bloom/filmgrain/localcontrast 等):真 WE 转译特效链,
     // 按 scene 顺序、仅可见者。在最终合成帧上依次跑 WEEffectChain(替代旧的手写假 bloom)。
     var postChain: [LayerEffect] = []
     // —— 后处理回退字段(postChain 非空时不用):bloom 已是 lwe 真 4-pass 移植(见 PostProcess)。——
     // 触发条件:相机级 general.bloom=true(WE 相机内建,无 effects/bloom 文件夹故进不了 manifest/postChain),
-    // 或 fullscreenlayer 上 file 含 "bloom" 的特效未被转译覆盖。默认值取 WE 真 shader 注解(threshold 0.65/strength 2)。
+    // 或 fullscreenlayer 上 file 含 "bloom" 的特效未被转译覆盖。lwe(WallpaperParser.cpp:51-52)缺省 strength/threshold 全 0。
     var postBloom = false
-    var postBloomThreshold: Float = 0.65
-    var postBloomStrength: Float = 2.0
+    var postBloomThreshold: Float = 0   // lwe WallpaperParser.cpp:52 缺省 0
+    var postBloomStrength: Float = 0    // lwe WallpaperParser.cpp:51 缺省 0
     var postBloomTint: SIMD3<Float> = SIMD3(1, 1, 1)
     var postLocalContrast = false
     var postLocalContrastStrength: Float = 0.2
@@ -439,7 +439,9 @@ struct SceneDocument {
         camera.fade    = (VecParse.unwrap(general["camerafade"]) as? Bool) ?? false
         // 审计修复(#7):camerapreview 与相邻 camerafade 一致走 unwrap(可能被 user/脚本属性包装)。
         camera.preview = (VecParse.unwrap(general["camerapreview"]) as? Bool) ?? false
-        let clear = VecParse.f4(general["clearcolor"], default: SIMD4(0, 0, 0, 1))
+        // lwe(WallpaperParser.cpp:44):clearcolor 缺省 = 白 vec3(1.0);CScene.cpp:91 glClearColor 永远 alpha=1.0,只用 RGB。
+        var clear = VecParse.f4(general["clearcolor"], default: SIMD4(1, 1, 1, 1))
+        clear.w = 1
         // 相机视差总开关(general.cameraparallax,可被脚本属性包装)。关时全场景无视差/漂移。
         let cameraParallax = (VecParse.unwrap(general["cameraparallax"]) as? Bool) ?? true
         func gf(_ k: String, _ d: Float) -> Float { (VecParse.unwrap(general[k]) as? NSNumber)?.floatValue ?? d }
@@ -448,8 +450,8 @@ struct SceneDocument {
         let cameraParallaxDelay = gf("cameraparallaxdelay", 0)
         let cameraShake = (VecParse.unwrap(general["camerashake"]) as? Bool) ?? false
         let cameraShakeAmplitude = gf("camerashakeamplitude", 0)
-        let cameraShakeRoughness = gf("camerashakeroughness", 1)
-        let cameraShakeSpeed = gf("camerashakespeed", 1)
+        let cameraShakeRoughness = gf("camerashakeroughness", 0)  // lwe WallpaperParser.cpp:63 缺省 0
+        let cameraShakeSpeed = gf("camerashakespeed", 0)          // lwe WallpaperParser.cpp:64 缺省 0
 
         let objects = scene["objects"] as? [[String: Any]] ?? []
 
@@ -594,11 +596,10 @@ struct SceneDocument {
         var rippleMaskPath: String? = nil
         var postChain: [LayerEffect] = []
         var postBloom = false, postLC = false
-        // 辉光参数取 pkg 真实 general(bloomstrength/threshold/tint);缺省值用 WE 真 shader 注解
-        // (downsample_quarter_bloom.frag:strength 默认 2、threshold 默认 0.65、tint 默认 "1 1 1"),
-        // 不再用凭感觉的弱默认(0.9/0.8)。每张壁纸读各自真值,数据驱动。
-        var postBloomTh: Float = (VecParse.unwrap(general["bloomthreshold"]) as? NSNumber)?.floatValue ?? 0.65
-        var postBloomStr: Float = (VecParse.unwrap(general["bloomstrength"]) as? NSNumber)?.floatValue ?? 2.0
+        // 辉光参数取 pkg 真实 general(bloomstrength/threshold/tint)。lwe(WallpaperParser.cpp:51-52)缺省全 0
+        // (bloom:true 但未写 strength/threshold 时 → 无辉光,与 lwe 一致;不再用自创注解默认 0.65/2.0)。
+        var postBloomTh: Float = (VecParse.unwrap(general["bloomthreshold"]) as? NSNumber)?.floatValue ?? 0
+        var postBloomStr: Float = (VecParse.unwrap(general["bloomstrength"]) as? NSNumber)?.floatValue ?? 0
         let postBloomTint = VecParse.f3(general["bloomtint"], default: SIMD3(1, 1, 1))
         // 相机级 bloom:WE 的 general.bloom 是相机内建后处理(无 effects/bloom 文件夹 → 不进 manifest/postChain),
         // 之前只看 fullscreenlayer 的 bloom 特效 → 相机级 bloom 被静默丢弃。这里直接据 general.bloom 触发回退真 bloom。

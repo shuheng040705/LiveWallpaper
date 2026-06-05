@@ -226,12 +226,29 @@ final class WEEffectChain {
         return best ?? eff.variants.first
     }
 
+    /// 三套原生音频频谱(对齐 lwe recorder.audio16/32/64,CPass.cpp:785-790;各分辨率在 AudioCapture 里独立分桶,
+    /// 非由 64 段重采样)。shader 按 RESOLUTION combo 声明 16/32/64 段数组,按声明 count 选对应原生那套。
+    struct AudioSpectrum {
+        var s16: [Float] = []
+        var s32: [Float] = []
+        var s64: [Float] = []
+        /// 按 shader 声明的数组段数选原生频谱。lwe 只绑 16/32/64;其它段数 lwe 无对应 uniform → 空(=静默 0)。
+        func pick(_ count: Int) -> [Float] {
+            switch count {
+            case 16: return s16
+            case 32: return s32
+            case 64: return s64
+            default: return []
+            }
+        }
+    }
+
     /// 为 genericimage stage 构造 _Globals(base 用 mvp/model/color;combo 的 PBR 量暂用 WE 默认,
     /// 环境光给真实 ambient——后续接 material constants/光源)。
     private func buildMaterialUniforms(_ stage: StageDef, meta: [String: UniformMeta],
                                        mvp: simd_float4x4, model: simd_float4x4,
                                        color: SIMD4<Float>, ambient: SIMD3<Float>,
-                                       constants: [String: [Float]], audio16: [Float] = []) -> [UInt8] {
+                                       constants: [String: [Float]], audio: AudioSpectrum = AudioSpectrum()) -> [UInt8] {
         // 数组 uniform(如 g_AudioSpectrum16/32/64Left/Right)要把 offset+元素数×步长 算进上界,否则越界。
         var size = 16
         for u in stage.uniforms {
@@ -245,11 +262,10 @@ final class WEEffectChain {
             for u in stage.uniforms {
                 // 音频频谱数组:基础材质 shader(genericimage 带 AUDIOPROCESSING combo)也会声明
                 // g_AudioSpectrum16/32/64Left/Right。此前材质路径漏喂 → 这类音频可视化壁纸恒静止(无条)。
-                // 与 effect 路径(buildUniforms)同口径:按数组声明 count 重采样本帧频谱,左右同源。
+                // lwe(CPass.cpp:785-790):按声明段数绑对应原生频谱 audio16/32/64,左右同源(单声道镜像)。
                 if let count = u.array, count > 0 {
                     if u.name.hasPrefix("g_AudioSpectrum"), u.name.hasSuffix("Left") || u.name.hasSuffix("Right") {
-                        let resampled = Self.resampleSpectrum(audio16, to: count)
-                        Self.writeArray(resampled, count: count, stride: u.arrayStride ?? 16, into: base, offset: u.offset)
+                        Self.writeArray(audio.pick(count), count: count, stride: u.arrayStride ?? 16, into: base, offset: u.offset)
                     }
                     continue
                 }
@@ -283,7 +299,7 @@ final class WEEffectChain {
                              mvp: simd_float4x4, model: simd_float4x4, color: SIMD4<Float>,
                              albedo: MTLTexture, albedoFlags: TexFlags?, aux: [Int: MTLTexture],
                              ambient: SIMD3<Float>, constants: [String: [Float]], sceneFB: MTLTexture?,
-                             audio16: [Float] = []) -> Bool {
+                             audio: AudioSpectrum = AudioSpectrum()) -> Bool {
         guard let eff = manifest["material/\(shader)"],
               let variant = bestMaterialVariant(eff, combos),
               let p = variant.passes.first, let ps = pipeline(p) else { return false }
@@ -291,12 +307,12 @@ final class WEEffectChain {
         enc.setVertexBuffer(materialQuadBuf, offset: 0, index: 1)
         if let v = p.vert {
             var vb = buildMaterialUniforms(v, meta: p.uniformMeta, mvp: mvp, model: model,
-                                           color: color, ambient: ambient, constants: constants, audio16: audio16)
+                                           color: color, ambient: ambient, constants: constants, audio: audio)
             enc.setVertexBytes(&vb, length: vb.count, index: v.ubuf)
         }
         guard let f = p.frag else { return false }
         var fb = buildMaterialUniforms(f, meta: p.uniformMeta, mvp: mvp, model: model,
-                                       color: color, ambient: ambient, constants: constants, audio16: audio16)
+                                       color: color, ambient: ambient, constants: constants, audio: audio)
         enc.setFragmentBytes(&fb, length: fb.count, index: f.ubuf)
         for s in f.samplers {
             let tex: MTLTexture
@@ -426,25 +442,6 @@ final class WEEffectChain {
         }
     }
 
-    /// 把任意长度的频谱重采样到 n 段(与 AudioCapture 的对数分桶同向:第 i 段覆盖 src 的 [lo,hi) 取均值)。
-    /// 下采样(src≥n,如 64→32/16)= 区间平均;上采样(src<n)= 同一区间被多段复用(近邻),不造假数据。
-    /// src 空 → 全 0(无声)。
-    private static func resampleSpectrum(_ src: [Float], to n: Int) -> [Float] {
-        guard n > 0 else { return [] }
-        if src.count == n { return src }
-        var out = [Float](repeating: 0, count: n)
-        guard !src.isEmpty else { return out }
-        for i in 0..<n {
-            let lo = Int(Float(i) / Float(n) * Float(src.count))
-            let hi = max(lo + 1, Int(Float(i + 1) / Float(n) * Float(src.count)))
-            var sum: Float = 0; var c = 0
-            var k = lo
-            while k < min(hi, src.count) { sum += src[k]; c += 1; k += 1 }
-            out[i] = c > 0 ? sum / Float(c) : (lo < src.count ? src[lo] : 0)
-        }
-        return out
-    }
-
     private static func parseFloats(_ any: Any?) -> [Float] {
         if let n = any as? NSNumber { return [n.floatValue] }
         if let s = any as? String {
@@ -460,9 +457,12 @@ final class WEEffectChain {
     /// cursor = 光标归一化位置 [0,1](y 向上);WE 交互特效(xray/depthparallax)的 pointer 量。
     /// audio16 = 16 段频谱 [0,1](AudioCapture.shared.spectrum16);喂 pulse 等音频特效的
     /// g_AudioSpectrum16Left/Right 数组。空数组 → 音频 uniform 退 0(无声)。
+    /// texW/texH = 该 pass 实际绑定的主纹理尺寸(可能被 targetScale 降采样)→ g_TextureNResolution/g_Screen 用它。
+    /// sceneW/sceneH = 全帧(场景)尺寸 → g_TexelSize/g_TexelSizeHalf 用它(对齐 lwe CPass.cpp:783,恒定全场景 texel)。
     private func buildUniforms(_ stage: StageDef, meta: [String: UniformMeta],
                                pkgParams: [String: Any], time: Float, cursor: SIMD2<Float>,
-                               texW: Int, texH: Int, audio16: [Float]) -> [UInt8] {
+                               texW: Int, texH: Int, sceneW: Int, sceneH: Int,
+                               audio: AudioSpectrum) -> [UInt8] {
         // 数组 uniform 要把 offset+元素数×步长 都算进上界(否则数组尾巴越界)。
         var size = 16
         for u in stage.uniforms {
@@ -474,15 +474,12 @@ final class WEEffectChain {
             let base = raw.baseAddress!
             for u in stage.uniforms {
                 // 数组 uniform:WE 的音频频谱(L/R),按 std140 16B 步长写每元素的 .x。
-                // WE 的可视化 shader 按 RESOLUTION combo 选 16/32/64 段数组(Simple_Audio_Bars 默认 32;
-                // pulse 用 16)。audio16 是本帧可用频谱(audio-bars 路喂满 64 段 bands;pulse 路喂 16);
-                // 按目标数组**声明的 count** 重采样到 N(64→32/16 取均值,16→32 线性插值),与 AudioCapture
-                // 的对数分桶同向。左右声道同源(系统音频单声道混合)。漏填某分辨率 → 该 RESOLUTION 变体的
-                // 频谱全 0 → 条恒为 0(实测:只填 16 段时 RESOLUTION=32 的 Simple_Audio_Bars 不出条)。
+                // WE 的可视化 shader 按 RESOLUTION combo 选 16/32/64 段数组(Simple_Audio_Bars 默认 32;pulse 用 16)。
+                // lwe(CPass.cpp:785-790):按声明段数绑对应**原生**频谱 recorder.audio16/32/64(各分辨率在
+                // AudioCapture 里独立分桶,非重采样),左右声道同源(单声道镜像)。漏填某分辨率 → 频谱全 0 → 条恒为 0。
                 if let count = u.array, count > 0 {
                     if u.name.hasPrefix("g_AudioSpectrum"), u.name.hasSuffix("Left") || u.name.hasSuffix("Right") {
-                        let resampled = Self.resampleSpectrum(audio16, to: count)
-                        Self.writeArray(resampled, count: count, stride: u.arrayStride ?? 16, into: base, offset: u.offset)
+                        Self.writeArray(audio.pick(count), count: count, stride: u.arrayStride ?? 16, into: base, offset: u.offset)
                     }
                     // 其它数组 uniform 暂无来源 → 留 0(归零已是默认)。
                     continue
@@ -506,10 +503,11 @@ final class WEEffectChain {
                 } else if u.name == "g_Time" {
                     vals = [time]
                 } else if u.name == "g_TexelSize" {
-                    // 1/纹理尺寸(WE blur 等用它算每像素步长)。须用实际绑定纹理的尺寸。
-                    vals = [1.0 / Float(max(1, texW)), 1.0 / Float(max(1, texH))]
+                    // lwe(CPass.cpp:783):g_TexelSize = 1/**场景**尺寸(恒定全帧 texel,所有 pass 一致),
+                    // 不是该 pass 降采样纹理的 texel —— per-pass 纹理尺寸由 g_TextureNResolution 另行暴露。
+                    vals = [1.0 / Float(max(1, sceneW)), 1.0 / Float(max(1, sceneH))]
                 } else if u.name == "g_TexelSizeHalf" {
-                    vals = [0.5 / Float(max(1, texW)), 0.5 / Float(max(1, texH))]
+                    vals = [0.5 / Float(max(1, sceneW)), 0.5 / Float(max(1, sceneH))]
                 } else if u.name.hasSuffix("Resolution") {
                     vals = [Float(texW), Float(texH), Float(texW), Float(texH)]
                 } else if u.name == "g_Screen" {
@@ -595,7 +593,7 @@ final class WEEffectChain {
              texFlags: [String: TexFlags] = [:],
              paramsPerPass: [[String: Any]] = [], time: Float,
              cursor: SIMD2<Float> = SIMD2(0.5, 0.5),
-             audio16: [Float] = [],
+             audio: AudioSpectrum = AudioSpectrum(),
              frameBuffer: MTLTexture? = nil,
              commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
         guard let edef = manifest[effect], let def = selectVariant(edef, combos: combos) else { return nil }
@@ -702,8 +700,8 @@ final class WEEffectChain {
 
             // 逐 pass 参数优先(bloom 各 pass strength 可不同);否则合并版。
             let params: [String: Any] = (pi < paramsPerPass.count) ? paramsPerPass[pi] : pkgParams
-            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, audio16: audio16)
-            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, audio16: audio16)
+            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: w, sceneH: h, audio: audio)
+            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: w, sceneH: h, audio: audio)
             enc.setVertexBytes(&vu, length: vu.count, index: vstage.ubuf)
             enc.setFragmentBytes(&fu, length: fu.count, index: fstage.ubuf)
 
