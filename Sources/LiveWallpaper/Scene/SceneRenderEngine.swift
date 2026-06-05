@@ -1087,7 +1087,9 @@ final class SceneRenderEngine {
         let dispBefore = parallaxDisplacement   // 按需渲染:记下视差更新前位移,末尾判定本帧是否变化
         if cameraParallax {
             let userStrength = Float(PreferencesStore.shared.parallaxStrength)
-            let centered = SIMD2(mouseNorm.x * 0.5, mouseNorm.y * 0.5)
+            // centeredMouse = 画布 UV - 0.5(lwe CScene.cpp:313)。同 cursor:屏幕 NDC 要先 /ndcScale 扣 cover 裁切,
+            // 否则非同比例屏上视差量也随距离偏。mouseUV = (mouseNorm/ndcScale + 1)/2 → centered = mouseUV - 0.5。
+            let centered = SIMD2(mouseNorm.x / ndcScale.x * 0.5, mouseNorm.y / ndcScale.y * 0.5)
             let target = centered * cameraParallaxAmount * cameraParallaxMouseInfluence * userStrength
             let k = max(0, min(1, cameraParallaxDelay * Float(dt)))
             parallaxDisplacement += (target - parallaxDisplacement) * k
@@ -1229,17 +1231,21 @@ final class SceneRenderEngine {
             }
         }
 
-        // 鼠标在画布像素中的位置。matOrtho 把 [0,W]→[-1,1],故场景坐标是 0..W(原点在角)。
-        // mouseNorm [-1,1] y向上 → 画布 [0,W]/[0,H]:  c = (norm+1)/2 * size。
-        let cursorCanvas = SIMD2((mouseNorm.x + 1) * 0.5 * canvas.x,
-                                 (mouseNorm.y + 1) * 0.5 * canvas.y)
-        // 光标归一化 UV [0,1](y 向上)。喂 WE 交互特效(xray/depthparallax)的 pointer 量。
-        cursorUV = SIMD2((mouseNorm.x + 1) * 0.5, (mouseNorm.y + 1) * 0.5)
+        // 鼠标 → 画布 UV。**关键(修光标特效随距离偏移)**:画面是 cover/aspect-fill 裁切显示
+        // (顶点 `position.xy *= ndcScale`),屏幕 NDC `s` 对应的画布点是 `p = s / ndcScale`(裁掉的边
+        // 在屏幕上不可达)。此前直接 `(mouseNorm+1)/2` 把屏幕归一化当画布 UV,漏了 /ndcScale →
+        // 光标特效在屏幕上落到 `s×ndcScale`,离中心越远偏得越外(用户实测:鼠标越往右、樱花特效越偏右)。
+        // lwe(CScene.cpp:371-383)同样把鼠标先到 viewport [0,1] 再按可见 UV 范围(=扣裁切)映射到场景 UV。
+        // ndcScale 由上一帧 render() 算(只随 resize 变);单 NDC 校正同时用于 pointer / 粒子 followsCursor / 水波。
+        let mouseUVc = SIMD2(min(1, max(0, (mouseNorm.x / ndcScale.x + 1) * 0.5)),
+                             min(1, max(0, (mouseNorm.y / ndcScale.y + 1) * 0.5)))
+        let cursorCanvas = SIMD2(mouseUVc.x * canvas.x, mouseUVc.y * canvas.y)
+        // 光标归一化 UV [0,1](y 向上)。喂 WE 交互特效(xray/depthparallax/樱花轨迹)的 pointer 量。
+        cursorUV = mouseUVc
 
         // 鼠标划过水波:把光标 UV [0,1](y 向上=屏幕)喂给流体模拟。模拟步进在 render() 里做。
         if hasCursorRipple, let sim = rippleSim {
-            let uv = SIMD2((mouseNorm.x + 1) * 0.5, (mouseNorm.y + 1) * 0.5)
-            sim.setPointer(uv)
+            sim.setPointer(mouseUVc)
         }
 
         // 粒子:按真实 dt 推进。关键(修「粒子太快」):

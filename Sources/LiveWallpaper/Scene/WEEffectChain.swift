@@ -418,6 +418,20 @@ final class WEEffectChain {
 
     /// 把一个值(标量 / "x y z" 字符串 / 数组)写进 buffer 的 offset,按类型决定写几个 float。
     private static func write(_ value: [Float], type: String, into buf: UnsafeMutableRawPointer, offset: Int) {
+        let p = buf.advanced(by: offset).assumingMemoryBound(to: Float.self)
+        // mat3:std140 下 3 列、每列 vec3 但各占一个 vec4 槽(16B),列数据落在字节 0/16/32(=float 下标 0/4/8),
+        // 共 48B。value 是 9 个 float(列主序 3×3)。逐列写 vec3、跨 4-float 步长,padding 留 0。
+        // (此前连续写 12 个 float 会把第 2、3 列各错位 4B/8B → 法线矩阵散架。对照 lwe glUniformMatrix3fv 由
+        //  驱动按 std140 自动列对齐。)
+        if type == "mat3" {
+            for col in 0..<3 {
+                for row in 0..<3 {
+                    let idx = col * 3 + row
+                    p[col * 4 + row] = idx < value.count ? value[idx] : 0
+                }
+            }
+            return
+        }
         let n: Int
         switch type {
         case "float": n = 1
@@ -425,10 +439,8 @@ final class WEEffectChain {
         case "vec3": n = 3
         case "vec4": n = 4
         case "mat4": n = 16
-        case "mat3": n = 12   // std140: 3 列各 vec4 对齐 → 用 16,这里近似
         default: n = min(value.count, 4)
         }
-        let p = buf.advanced(by: offset).assumingMemoryBound(to: Float.self)
         for i in 0..<n { p[i] = i < value.count ? value[i] : 0 }
     }
 

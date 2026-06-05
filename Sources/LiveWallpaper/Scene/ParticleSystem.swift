@@ -200,24 +200,24 @@ struct ParticleEmitterDesc {
     // 每帧 textureRatio = (uvSc.y/uvSc.x)·trailTextureRatio(精灵表逐帧像素高宽比,CParticle.cpp:1936)。
     var trailTextureRatio: Float = 1
     // rope/ropetrail 渲染器(genericropeparticle):把按生成序连成链的粒子用 Catmull-Rom 样条插值
-    // 成一条带状网格(而非散点精灵)。对照 CParticle.cpp:2109 renderRope + genericropeparticle.geom。
+    // 成一条带状网格(而非散点精灵)。对照 CParticle.cpp:2098-2323 renderRope + genericropeparticle.geom。
     // subdivision = 每段细分数(默认 4,CParticle.h:240);uvScale 沿长度的 UV 重复;
     // uvScrolling = UV 随时间沿绳滚动;uvSmoothing = 按弧长分配 UV(需均匀寿命且不滚动)。
+    // isRope 对应 lwe m_useRopeRenderer,**rope 与 ropetrail 都置位**(CParticle.cpp:36-48)。
     var isRope: Bool = false
     var ropeSubdivision: Int = 4
     var ropeUVScale: Float = 1
     var ropeUVScrolling: Bool = false
     var ropeUVSmoothing: Bool = true
-    // ropetrail(renderer.name=="ropetrail")与 rope 的本质区别(CParticle.h:241 注释
-    // "ropetrail: historical position snapshots per particle"):ropetrail 是**每粒子各自一条拖尾带**——
-    // 每个粒子用它自己的「历史位置快照」(沿运动轨迹的 segments 个采样点,跨 length 秒)单独连成 Catmull-Rom 带,
-    // 粒子之间**互不相连**;rope 才是把全部活粒子按生成序连成**一条**链(鼠标拖尾:粒子从单点依次喷出=天然一条带)。
-    // 参考引擎 linux-wallpaperengine 的 renderRope() 只实现了「连全部」一种(对 rope 鼠标拖尾恰好成立,
-    // 但对 ropetrail+boxrandom(Jinx 雨)会把 N 个散点连成贯穿全屏的网),且读了 m_ropeSegments 却没用 —— 是其未竟实现。
-    // 这里按其 .h 注释的真实意图 + 真 WE 行为补上 ropetrail 的逐粒子历史轨迹。
+    // ropetrail(renderer.name=="ropetrail")在 lwe 里与 rope **走完全相同的 renderRope 路径**——
+    // 都把全部活粒子按生成序连成**一条**链(CParticle.cpp:36-48 m_useRopeRenderer 对两者都 true、
+    // :182-186/:203-207 render 同调 renderRope)。lwe **没有**「逐粒子历史轨迹」这种实现:
+    // m_ropeSegments 在 :47 赋值后全文再未被读取(grep 确认),m_trailLength 只作 renderVar0 透传(:1912)。
+    // 故 isRopeTrail 仅是解析出的标记(给诊断用),**对删除/保序/渲染/UV 全部当 isRope 处理**;
+    // ropeSegments / ropeTrailLength 同步仅作无害透传(对齐 lwe:不影响几何)。
     var isRopeTrail: Bool = false
-    var ropeSegments: Int = 4        // ropetrail 每粒子历史快照数(renderer.segments,默认 4,min 2)
-    var ropeTrailLength: Float = 2   // ropetrail 历史跨度(秒,renderer.length)
+    var ropeSegments: Int = 4        // lwe m_ropeSegments(:47 写入后未读取)— 仅透传,不影响几何
+    var ropeTrailLength: Float = 2   // lwe m_trailLength(renderer.length;仅 renderVar0 透传 :1912)— 不影响几何
     // 折射粒子(combos.REFRACT=1,如玻璃上的雨滴):WE 里 albedo×屏幕底图,我们近似为
     // 低透明柔和扰动,不叠加 overbright(否则糊成白块)。
     var isRefract: Bool = false
@@ -249,10 +249,6 @@ private struct Particle {
     var oscAFreq: Float = 0, oscAPhase: Float = 0
     var oscSFreq: Float = 0, oscSPhase: Float = 0
     var oscPFreq: SIMD3<Float> = .zero, oscPScale: SIMD3<Float> = .zero, oscPPhase: SIMD3<Float> = .zero
-    // ropetrail 逐粒子历史位置快照(层局部坐标 p.pos.xy,新点 append 到尾;index 0=最老)。
-    // 渲染时各点过同一世界变换(visualState 的 scale→rotate→base,与 size/color 无关)连成自己的带。
-    var trail: [SIMD2<Float>] = []
-    var trailTimer: Float = 0   // 距上次采样的累计时间;到采样间隔(length/(segments-1))就推一个新快照
 }
 
 /// CPU 粒子模拟器:发射 + 更新 + 输出渲染实例。
@@ -353,9 +349,12 @@ final class ParticleSimulator {
 
         // 更新已有粒子
         // 【审计修复】到寿删除从 O(n²) 的中部 remove(at:) 改为 O(1) 的 swap-remove(与末尾交换再 removeLast)。
-        // 但 rope(非 ropetrail)按「生成序连成一条链」依赖粒子顺序,swap-remove 会打乱链序 → 该类发射器
-        // 仍走原有有序删除;其余发射器(散点精灵 / ropetrail 各自独立成带)与顺序无关,用 swap-remove。
-        let preserveOrder = desc.isRope && !desc.isRopeTrail
+        // 但 rope/ropetrail 渲染按「生成序连成一条链」依赖粒子顺序(lwe update() 对所有 rope 渲染器都做
+        // 保序压缩,renderRope 注释 CParticle.cpp:2103「Array is already in spawn order」),swap-remove
+        // 会打乱链序 → 该类发射器走有序删除;其余散点精灵与顺序无关,用 swap-remove。
+        // lwe rope 与 ropetrail 走同一条 renderRope 路径(CParticle.cpp:36-48/182-186/203-207,
+        // m_useRopeRenderer 对两者都 true),故二者删除策略一致:desc.isRope(=ropetrail 也置位)即判据。
+        let preserveOrder = desc.isRope
         var i = 0
         while i < particles.count {
             particles[i].age += d
@@ -481,47 +480,10 @@ final class ParticleSimulator {
                 particles[i].angVel += desc.angularForceZ * d * desc.ioSpeed
                 if desc.angularDragZ != 0 { particles[i].angVel *= max(0, 1 - desc.angularDragZ * d) }
             }
-            // ropetrail:按固定间隔记录历史位置快照,形成该粒子的拖尾轨迹(层局部坐标)。
-            // 采样间隔 = length/(segments-1),保留最近 segments 个点(超出丢最老)。
-            if desc.isRopeTrail {
-                let segs = max(2, desc.ropeSegments)
-                // 采样间隔收紧到 ≤0.02s:让快照够密,下面的几何长度钳制才能精确截到目标长度
-                //(否则一段就跨 0.13s×速度=半屏,钳制按整点丢弃降不下去)。
-                let interval = desc.ropeTrailLength > 0 ? min(desc.ropeTrailLength / Float(segs - 1), 0.02) : 0
-                let cur = SIMD2(particles[i].pos.x, particles[i].pos.y)
-                if particles[i].trail.isEmpty {
-                    particles[i].trail = [cur]   // 首帧:轨迹仅含诞生点(带宽塌缩,无网)
-                } else {
-                    particles[i].trailTimer += d
-                    if interval <= 0 || particles[i].trailTimer >= interval {
-                        particles[i].trailTimer = 0
-                        particles[i].trail.append(cur)
-                        if particles[i].trail.count > segs { particles[i].trail.removeFirst() }
-                    } else {
-                        // 间隔内:实时更新最新点为当前位置(头部跟住粒子,尾部留历史)。
-                        particles[i].trail[particles[i].trail.count - 1] = cur
-                    }
-                }
-                // 【审计修复】ropetrail 拖尾几何长度钳制(HIGH,雨丝问题):原实现里 length 形同空操作 →
-                // 拖尾 = 整条生命轨迹,高速粒子被拉成半屏。这里按「最近 maxTrailSeconds 秒的运动」封顶几何长度:
-                // trail 点与 vel 在同一坐标空间(都是 sim/局部域),所以上限直接取 速度×秒数,无需层缩放换算
-                //(之前那版用 size/layerScale 换算,对本张壁纸阈值过大、零效果)。拖尾长随速度自适应但有上限。
-                // maxTrailSeconds 是没有 WE 精确语义下的保守值(高速雨≈十几% 屏高);待对齐 WE 再校准。
-                let maxTrailSeconds: Float = 0.1
-                let speed = simd_length(SIMD2(particles[i].vel.x, particles[i].vel.y))
-                let maxLen = speed * maxTrailSeconds
-                if maxLen > 0 && particles[i].trail.count > 2 {
-                    var acc: Float = 0
-                    var keepFrom = 0   // 保留从该下标到末尾(末尾=最新头部)的点
-                    var j = particles[i].trail.count - 1
-                    while j > 0 {
-                        acc += simd_distance(particles[i].trail[j], particles[i].trail[j - 1])
-                        if acc > maxLen { keepFrom = j - 1; break }   // 含跨越上限的那一段端点,保证连续
-                        j -= 1
-                    }
-                    if keepFrom > 0 { particles[i].trail.removeFirst(keepFrom) }
-                }
-            }
+            // (ropetrail 不维护逐粒子历史轨迹:lwe 对 rope 与 ropetrail 走同一条 renderRope 路径
+            //  —— 把全部活粒子按生成序连成一条链,m_ropeSegments 写入后全文未再读取
+            //  CParticle.cpp:47/grep 确认,m_trailLength 仅作 renderVar0 透传 CParticle.cpp:1912。
+            //  原先的逐粒子快照/采样间隔/几何长度钳制是无 lwe 依据的自创结构,已删除。)
             i += 1
         }
 
@@ -801,56 +763,27 @@ final class ParticleSimulator {
         return (world, s, col * desc.overbright, a)
     }
 
-    /// 把粒子的**层局部坐标**(p.pos.xy 或其历史快照)变换到画布像素世界系。
-    /// 与 visualState 的位置变换严格同源(逐轴 scale → 绕层原点旋转 +layerAngleZ → 加 base),
-    /// 仅与位置有关(不依赖 age/size/color),故 ropetrail 的历史点可直接复用。
-    private func worldOf(local: SIMD2<Float>, base: SIMD2<Float>) -> SIMD2<Float> {
-        let posScale = desc.layerScale
-        var off = SIMD2(local.x * posScale.x, local.y * posScale.y)
-        if desc.layerAngleZ != 0 {
-            let ca = cos(desc.layerAngleZ), sa = sin(desc.layerAngleZ)
-            off = SIMD2(off.x * ca - off.y * sa, off.x * sa + off.y * ca)
-        }
-        return SIMD2(base.x + off.x, base.y + off.y)
-    }
-
-    /// rope/ropetrail 带状网格(照 CParticle.cpp:2109 renderRope + genericropeparticle.geom)。返回三角形列表
-    /// (每子段 6 顶点),坐标已在画布像素世界系。两条路径(关键区分,见 ParticleEmitterDesc.isRopeTrail 注释):
-    ///  · ropetrail:**每粒子各自**用它的历史位置快照(p.trail)连成一条独立带,粒子间互不相连
-    ///    (Jinx「Rope Based Rain」= N 条独立下落雨条,而非把 N 个散点连成贯穿全屏的网)。
-    ///  · rope:把全部活粒子按生成序(index 0=最老)连成**一条**链(鼠标拖尾/紧致发射器的连续带)。
-    /// 二者都走 appendRibbon:Catmull-Rom 细分 + 每子段两端 right=normalize(rot90(central-diff 切向))×size
+    /// rope/ropetrail 带状网格(照 CParticle.cpp:2098-2323 renderRope + genericropeparticle.geom)。
+    /// 返回三角形列表(每子段 6 顶点),坐标已在画布像素世界系。
+    /// lwe 对 **rope 与 ropetrail 走同一条 renderRope 路径**(CParticle.cpp:36-48 m_useRopeRenderer
+    /// 对两者都 true、:182-186/:203-207 render dispatch 同调 renderRope):把**全部活粒子按生成序**
+    /// (index 0=最老,update() 保序压缩,见 :2103-2105)连成**一条**链——并没有「逐粒子历史轨迹」
+    /// 这种东西(m_ropeSegments 写入后全文未再读取 :47/grep 确认,m_trailLength 仅 renderVar0 透传 :1912)。
+    /// 走 appendRibbon:Catmull-Rom 细分 + 每子段两端 right=normalize(rot90(central-diff 切向))×size
     /// 居中展带(geometry-shader 真路径 start/end±trailRight)。切向退化(节点重合)时 right=0,带塌成零面积(无 NaN)。
     func ropeVertices() -> [RopeVertex] {
-        guard !particles.isEmpty else { return [] }
+        // 把全部活粒子按生成序连成一条链(rope 与 ropetrail 同路,CParticle.cpp:2105/2120/2139-2160)。
+        guard particles.count >= 2 else { return [] }
         var out: [RopeVertex] = []
-        if desc.isRopeTrail {
-            // ropetrail:每个粒子用它自己的历史快照(层局部)→ 世界系 → 单独一条带;粒子互不相连。
-            // size/color 取该粒子当前可见状态(整条短拖尾共用,与单粒子外观一致)。带状缓冲一次性预留。
-            out.reserveCapacity(particles.count * max(1, desc.ropeSubdivision) * 6)
-            for p in particles {
-                guard p.trail.count >= 2 else { continue }   // 历史不足 2 点→无带(无网,无 NaN)
-                let vs = visualState(p)
-                let base = desc.followsCursor ? p.spawnOrigin : desc.layerOrigin
-                let nodePos = p.trail.map { worldOf(local: $0, base: base) }
-                let col = SIMD4(vs.col, vs.alpha)
-                let nodeSize = [Float](repeating: vs.size, count: nodePos.count)
-                let nodeCol = [SIMD4<Float>](repeating: col, count: nodePos.count)
-                appendRibbon(into: &out, nodePos: nodePos, nodeSize: nodeSize, nodeCol: nodeCol)
-            }
-        } else {
-            // rope(鼠标拖尾):把全部活粒子按生成序连成一条链(CParticle.cpp:2109 renderRope)。
-            guard particles.count >= 2 else { return [] }
-            let n = particles.count
-            var nodePos = [SIMD2<Float>](repeating: .zero, count: n)
-            var nodeSize = [Float](repeating: 0, count: n)
-            var nodeCol = [SIMD4<Float>](repeating: .zero, count: n)
-            for i in 0..<n {
-                let vs = visualState(particles[i])
-                nodePos[i] = vs.world; nodeSize[i] = vs.size; nodeCol[i] = SIMD4(vs.col, vs.alpha)
-            }
-            appendRibbon(into: &out, nodePos: nodePos, nodeSize: nodeSize, nodeCol: nodeCol)
+        let n = particles.count
+        var nodePos = [SIMD2<Float>](repeating: .zero, count: n)
+        var nodeSize = [Float](repeating: 0, count: n)
+        var nodeCol = [SIMD4<Float>](repeating: .zero, count: n)
+        for i in 0..<n {
+            let vs = visualState(particles[i])
+            nodePos[i] = vs.world; nodeSize[i] = vs.size; nodeCol[i] = SIMD4(vs.col, vs.alpha)
         }
+        appendRibbon(into: &out, nodePos: nodePos, nodeSize: nodeSize, nodeCol: nodeCol)
         return out
     }
 
@@ -1400,7 +1333,8 @@ enum ParticleParser {
             d.ropeUVScale = num(r["uvscale"], 1)
             d.ropeUVScrolling = ((r["uvscrolling"] as? NSNumber)?.boolValue) ?? false
             d.ropeUVSmoothing = ((r["uvsmoothing"] as? NSNumber)?.boolValue) ?? true
-            // ropetrail:逐粒子历史轨迹(CParticle.cpp:69-73 / CParticle.h:241)。segments min 2、length 秒。
+            // ropetrail:在 lwe 里与 rope 走同一条 renderRope(CParticle.cpp:36-48 m_useRopeRenderer 都 true)。
+            // 仅记录标记 + 透传 segments/length(均不影响几何,见 ParticleEmitterDesc.isRopeTrail 注释)。
             if (r["name"] as? String) == "ropetrail" {
                 d.isRopeTrail = true
                 d.ropeSegments = max(2, (r["segments"] as? NSNumber)?.intValue ?? 4)

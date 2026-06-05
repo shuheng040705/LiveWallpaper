@@ -27,40 +27,47 @@ enum VecParse {
     static func unwrap(_ v: Any?) -> Any? {
         guard let dict = v as? [String: Any] else { return v }
         // 长形「条件属性」:{"user":{"name":<属性key>,"condition":<串>}, "value":default}。
-        // WE 语义(UserSettingParser.cpp:31-44 解析 + DynamicValue.cpp:244-256/274-284 求值):
-        //   condition 与 name 都是字符串;字段最终值 = (属性当前值的字符串 == condition 串) ? 1 : 0。
-        //   注意:WE 只做**纯字符串相等**(`==`),没有 `!=`/数值比较 —— 条件触发仅发生在属性以
-        //   String 更新时,boolValue = (m_condition.condition == newValue)。所以这里把 override 当前值
-        //   转成与 WE getString() 等价的字符串再比较;命中→true(1),否则→false(0)。
-        //   这让 visible:{user:{name,condition}} 的图层/特效显隐正确(此前全走默认回退)。
+        // WE 语义(UserSettingParser.cpp:24-47 解析 attachCondition + connect;
+        //          DynamicValue.cpp:203-225 update(other) / :166-188 update(string) 求值):
+        //   condition 触发是**类型相关**的,不是无条件字符串比较。连接属性把当前值传给字段时走
+        //   update(const DynamicValue& other)(DynamicValue.cpp:203);其中条件分支只在
+        //   `other.getType() == UnderlyingType::String` 时才执行(DynamicValue.cpp:213):
+        //       boolValue = (m_condition.condition == other.getString())。
+        //   对 **非 String 类型**(Boolean / Float / Int / Vec / Color),update(other) 直接逐字段拷贝
+        //   原始值(DynamicValue.cpp:204-211),**condition 被完全忽略** —— 字段 = 属性的原始 bool/数值。
+        //   而属性的底层类型由 PropertyParser.cpp 决定:combo→String(:65/:78 std::to_string(int) 或串)、
+        //   text/textinput→String、bool→Boolean(:98)、slider→Float(:113)、color→Vec4。
+        //   因此:condition 字符串相等**只对 combo/text(String 类型)属性生效**;bool 属性返回其原始
+        //   bool(等价 getBool,DynamicValue.cpp:209),slider/number 属性返回其原始数值(condition 不参与)。
+        //   这让 visible/alpha 等字段对 combo 走条件相等(天气/时段开关,行为零变化),对 bool/slider
+        //   返回真实值,修掉「把 bool/数字转串再 == condition」的伪缺口(R2:背景污染/残留覆盖残留面)。
         if let userObj = dict["user"] as? [String: Any],
            let name = userObj["name"] as? String,
            let condition = userObj["condition"] as? String {
-            // 取该属性的当前(覆盖)值;无覆盖时落到 "value" 默认(下方短形之后的 fallthrough 处理)。
+            // 取该属性的当前(覆盖)值;无覆盖时落到 "value" 默认(见下方 fallthrough 处理)。
             if let ov = overrides[name] {
-                let cur: String
                 switch ov {
-                case .bool(let b): cur = b ? "1" : "0"   // bool 属性的串形(WE 条件常写 condition:"1"/"0")
-                case .number(let n):
-                    // 整数值去掉 .0 后缀,匹配 combo/scene 里的整数串(如 "2");非整数保留小数。
-                    cur = (n == n.rounded()) ? String(Int(n)) : String(n)
-                case .string(let s): cur = s            // combo 选项值本就是串(WallpaperProperties 存 "\(v)")
-                case .color(let c): cur = String(format: "%.6f %.6f %.6f", c.x, c.y, c.z)
+                // String 类型(combo/text):走条件字符串相等(DynamicValue.cpp:213-221)。
+                // combo 选项值本就是串(WallpaperProperties 存 "\(v)"),此分支与改前完全一致 → combo 零变化。
+                case .string(let s): return (s == condition)
+                // Boolean 类型:condition 被忽略,返回原始 bool(getBool,DynamicValue.cpp:209)。
+                case .bool(let b): return b
+                // Float/Int 类型(slider):condition 被忽略,返回原始数值(≠0 即真;DynamicValue.cpp:206-209)。
+                case .number(let n): return NSNumber(value: n)
+                // Vec4(color):combo 不会是 color;按 lwe 非 String,condition 不参与,返回原始色串(与短形一致)。
+                case .color(let c): return String(format: "%.6f %.6f %.6f", c.x, c.y, c.z)
                 }
-                return (cur == condition)
             }
-            // 无覆盖:用属性的「默认值」即 scene 里同字段的 "value" 当当前值,按同样语义比较。
-            // value 多为裸串/数字;统一转串后比 condition。这样未被用户改动的条件属性也能正确求值。
+            // 无覆盖回退:用字段自身 "value" 字面默认,按其**原始字面类型**返回(对齐 DynamicValueParser.cpp:26-64
+            // 仅按 value 字面类型初始化、无连接时 condition 不参与)。String 默认仍走 condition 相等(让未被
+            // 用户改动的 combo/text 条件属性正确求值);bool→bool、数字→数值,不再转串与 condition 比。
             if let dv = dict["value"] {
-                let cur: String
-                if let b = dv as? Bool { cur = b ? "1" : "0" }
-                else if let n = dv as? NSNumber {
-                    cur = (n.doubleValue == n.doubleValue.rounded()) ? String(n.intValue) : "\(n)"
-                } else if let s = dv as? String { cur = s }
-                else { cur = "\(dv)" }
-                return (cur == condition)
+                if let b = dv as? Bool { return b }                        // bool 字面:原始 bool
+                if let n = dv as? NSNumber { return n }                    // 数字字面:原始数值(≠0 即真)
+                if let s = dv as? String { return (s == condition) }       // 串字面:走 condition 相等(combo/text)
+                return false
             }
-            return false   // 既无覆盖也无默认:WE 下属性未连接→条件不成立。
+            return false   // 既无覆盖也无默认:WE 下属性未连接→条件不成立(DynamicValue.cpp:227-237 Null→false)。
         }
         // 用户可控属性(短形):{"user":"key","value":default}。查覆盖。
         if let userKey = dict["user"] as? String, let ov = overrides[userKey] {
