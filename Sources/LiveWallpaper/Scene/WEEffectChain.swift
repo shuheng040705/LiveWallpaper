@@ -108,91 +108,6 @@ final class WEEffectChain {
          1,  1, 0,  1, 0,
     ]
 
-    // composelayer 复制 pass(忠实移植 assets/shaders/composelayer.vert+.frag):把场景主 FBO
-    // (_rt_FullFrameBuffer)按**该层屏幕投影位置**采样进该层自有 [0,1] FBO,等价 lwe CImage 的首 copy pass
-    // (CImage.cpp:330-348 passthrough 几何 + 391-392 m_modelViewProjectionCopy=screen mvp;
-    //  composelayer.frag:texCoord=v_ScreenCoord.xy/v_ScreenCoord.z*0.5+0.5 采样 g_Texture0)。
-    // 几何:gl_Position 用单位 quad 顶点(a_TexCoord*2-1,填满 FBO),采样 UV = 该层 quad 顶点经 layer mvp
-    // 投到屏幕的归一化坐标(下方 makeFootprintVerts 预算好,作 a_TexCoord 传入)。
-    private static let copyShaderSrc = """
-    #include <metal_stdlib>
-    using namespace metal;
-    struct VIn  { float3 pos [[attribute(0)]]; float2 uv [[attribute(1)]]; };
-    struct VOut { float4 position [[position]]; float2 uv; };
-    vertex VOut copy_vertex(VIn in [[stage_in]]) {
-        VOut o; o.position = float4(in.pos, 1.0); o.uv = in.uv; return o;
-    }
-    fragment float4 copy_fragment(VOut in [[stage_in]],
-                                  texture2d<float> g_Texture0 [[texture(0)]],
-                                  sampler smp [[sampler(0)]]) {
-        return g_Texture0.sample(smp, in.uv);
-    }
-    """
-    private lazy var copyPipeline: MTLRenderPipelineState? = {
-        guard let lib = try? device.makeLibrary(source: Self.copyShaderSrc, options: nil),
-              let vfn = lib.makeFunction(name: "copy_vertex"),
-              let ffn = lib.makeFunction(name: "copy_fragment") else { return nil }
-        let d = MTLRenderPipelineDescriptor()
-        d.vertexFunction = vfn; d.fragmentFunction = ffn
-        d.colorAttachments[0].pixelFormat = .bgra8Unorm
-        let vd = MTLVertexDescriptor()
-        vd.attributes[0].format = .float3; vd.attributes[0].offset = 0;  vd.attributes[0].bufferIndex = 1
-        vd.attributes[1].format = .float2; vd.attributes[1].offset = 12; vd.attributes[1].bufferIndex = 1
-        vd.layouts[1].stride = 20
-        d.vertexDescriptor = vd
-        return try? device.makeRenderPipelineState(descriptor: d)
-    }()
-
-    /// 该层屏幕投影 footprint 的复制 quad 顶点(pos.xyz 单位 NDC[-1,1] 填满 FBO + uv=屏幕投影 UV)。
-    /// 顶点序/UV 与 quadVerts 一致(triangle strip 4 顶点),pos 不变;uv 由单位 quad 角点经 mvp 投到屏幕得到。
-    /// 单位 quad 角点取自 quadVerts 的 uv:uv(u,v) ↔ 单位 quad 位置 (u-0.5, 0.5-v),与 encode 末 pass
-    /// (SceneRenderEngine quadBuffer 同样 uv(0,0)↔pos(-0.5,0.5))1:1 对齐 → 复制区与贴回区精确重合。
-    /// 屏幕 UV:ndc=clip.xy/clip.w;u=ndc.x*0.5+0.5,v=ndc.y*(-0.5)+0.5(场景 FBO 纹理 v=0 在顶,与 lwe
-    /// composelayer.frag 的 *vec2(0.5,0.5)+0.5 在 y 翻转后等价)。
-    private func makeFootprintVerts(mvp: simd_float4x4) -> [Float] {
-        // (pos.x, pos.y, fboUV.u, fboUV.v) 四角,顺序同 quadVerts。
-        let corners: [(Float, Float, Float, Float)] = [
-            (-1, -1, 0, 1),   // 单位 quad (-0.5,-0.5)
-            ( 1, -1, 1, 1),   // (0.5,-0.5)
-            (-1,  1, 0, 0),   // (-0.5,0.5)
-            ( 1,  1, 1, 0),   // (0.5,0.5)
-        ]
-        var out: [Float] = []
-        out.reserveCapacity(20)
-        for (px, py, u, v) in corners {
-            let qx = u - 0.5, qy = 0.5 - v
-            let clip = mvp * SIMD4<Float>(qx, qy, 0, 1)
-            let ndcX = clip.x / clip.w, ndcY = clip.y / clip.w
-            let su = ndcX * 0.5 + 0.5
-            let sv = ndcY * (-0.5) + 0.5
-            out.append(contentsOf: [px, py, 0, su, sv])
-        }
-        return out
-    }
-
-    /// 把整画布纹理 src(场景 / 全画布 opacitymask)按层屏幕投影 footprint 采进层尺寸 [0,1] FBO
-    /// (= lwe composelayer 首 copy pass)。供 run() 的场景输入 **与** SceneRenderEngine 的全画布遮罩**共用
-    /// 同一 footprint(同一 mvp)→ 两者在层 [0,1] 空间精确对齐(身体影子落在 footprint 内的 body 上)。
-    /// 此前 per-Image FBO 端口只对场景做了 footprint copy、遗漏遮罩(遮罩按 [0,1] 绑 → 整画布影子压扁进层 = 错位)。
-    func footprintSample(_ src: MTLTexture, mvp: simd_float4x4, outW: Int, outH: Int, commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
-        guard let cp = copyPipeline, let dst = makeTarget(width: max(1, outW), height: max(1, outH)) else { return nil }
-        let verts = makeFootprintVerts(mvp: mvp)
-        guard let vbuf = device.makeBuffer(bytes: verts, length: MemoryLayout<Float>.stride * verts.count, options: []) else { return nil }
-        let cpass = MTLRenderPassDescriptor()
-        cpass.colorAttachments[0].texture = dst
-        cpass.colorAttachments[0].loadAction = .clear
-        cpass.colorAttachments[0].storeAction = .store
-        cpass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
-        guard let cenc = cmd.makeRenderCommandEncoder(descriptor: cpass) else { return nil }
-        cenc.setRenderPipelineState(cp)
-        cenc.setVertexBuffer(vbuf, offset: 0, index: 1)
-        cenc.setFragmentTexture(src, index: 0)
-        cenc.setFragmentSamplerState(sampler, index: 0)
-        cenc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
-        cenc.endEncoding()
-        return dst
-    }
-
     init?(device: MTLDevice) {
         self.device = device
         // 4 个采样器:{clamp,repeat} × {linear,nearest},由纹理真实 flags 选(见 samplerFor）。
@@ -558,7 +473,6 @@ final class WEEffectChain {
     /// sceneW/sceneH = 全帧(场景)尺寸 → g_TexelSize/g_TexelSizeHalf 用它(对齐 lwe CPass.cpp:783,恒定全场景 texel)。
     private func buildUniforms(_ stage: StageDef, meta: [String: UniformMeta],
                                pkgParams: [String: Any], time: Float, cursor: SIMD2<Float>,
-                               cursorLast: SIMD2<Float>,
                                texW: Int, texH: Int, sceneW: Int, sceneH: Int,
                                audio: AudioSpectrum) -> [UInt8] {
         // 数组 uniform 要把 offset+元素数×步长 都算进上界(否则数组尾巴越界)。
@@ -596,12 +510,8 @@ final class WEEffectChain {
                     // 平面满画布层的正确值就是 identity(无投影倾斜/单位缩放),非兜底。
                     vals = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]
                 } else if u.name == "g_PointerPosition" || u.name == "g_ParallaxPosition" {
-                    // WE 交互 pointer / 视差位置,归一化 [0,1]。lwe CPass.cpp:779 g_PointerPosition=scene.getMousePosition()。
-                    // (g_ParallaxPosition lwe CPass 未设;此处用同一光标作中性兜底,无 lwe 取值可依不另发明。)
+                    // WE 交互 pointer / 视差位置,归一化 [0,1]。静止居中 = (0.5,0.5)(中性,无偏移)。
                     vals = [cursor.x, cursor.y]
-                } else if u.name == "g_PointerPositionLast" {
-                    // lwe CPass.cpp:780 g_PointerPositionLast=scene.getMousePositionLast()(上一帧光标,供运动型 pointer 特效算速度)。
-                    vals = [cursorLast.x, cursorLast.y]
                 } else if u.name == "g_Time" {
                     vals = [time]
                 } else if u.name == "g_TexelSize" {
@@ -689,35 +599,16 @@ final class WEEffectChain {
     /// texFlags(可选)= 按采样器名(g_TextureN)给出的真实 WE 纹理 flags,选采样器(repeat/clamp、linear/nearest）。
     ///   "g_Texture0" = 主输入(图层贴图)的 flags;其余键对应 auxTextures 同名槽。缺省 → clamp+linear(保守,不破坏现有渲染)。
     ///   中间 FBO(命名 bind / previous)始终用 clamp+linear:它们是引擎渲出的全屏纹理、UV∈[0,1],非 WE 资源 flags 适用对象。
-    /// sceneFootprint(可选)= frameBufferInput composelayer 专用。非 nil 时:`input` 视为**完整场景主 FBO**
-    /// (_rt_FullFrameBuffer),先按 lwe composelayer 首 copy pass(makeFootprintVerts + copyPipeline)把场景
-    /// 按该层屏幕投影位置采样进**该层尺寸**(outW×outH)的 [0,1] FBO,再以它为输入跑特效链(对齐 CImage.cpp:
-    /// 785-853:copy 首 pass → effect 各 pass 在层自有乒乓 FBO 全屏跑)。位移特效(cloudmotion/shake 的
-    /// uvs+=offset)由此读到的是「该层 region 内的场景」邻域(与 lwe 一致;层边界外不存在,非裁场景小图)。
-    /// 末 pass 渲层 quad 采样结果由 SceneRenderEngine.encode 按 layer.mvp 完成(= lwe 末 pass)。
-    /// nil(普通特效层 / 后处理链)→ 行为与改动前完全一致(input 即特效输入,FBO=input 尺寸,首 pass 全 [0,1])。
     func run(effect: String, input: MTLTexture, pkgParams: [String: Any],
              combos: [String: Any] = [:], auxTextures: [String: MTLTexture] = [:],
              maskTexture: MTLTexture? = nil,
              texFlags: [String: TexFlags] = [:],
              paramsPerPass: [[String: Any]] = [], time: Float,
              cursor: SIMD2<Float> = SIMD2(0.5, 0.5),
-             cursorLast: SIMD2<Float> = SIMD2(0.5, 0.5),
              audio: AudioSpectrum = AudioSpectrum(),
              frameBuffer: MTLTexture? = nil,
-             sceneFootprint: (mvp: simd_float4x4, outW: Int, outH: Int)? = nil,
              commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
         guard let edef = manifest[effect], let def = selectVariant(edef, combos: combos) else { return nil }
-        // 特效链的工作输入 + 尺寸。frameBufferInput composelayer:先跑 composelayer copy pass(忠实 lwe 首
-        // copy pass),把完整场景按该层 footprint 采样进层尺寸 FBO,作为后续特效链输入(named["previous"] 即它)。
-        var input = input
-        // g_TexelSize 恒用**完整场景**尺寸(lwe CPass.cpp:783 = 1/scene.getWidth);copy 后 input 变层尺寸,
-        // 故先记下场景原始尺寸供 buildUniforms 的 sceneW/sceneH。footprint=nil 时 = input 尺寸(行为不变)。
-        let sceneW = input.width, sceneH = input.height
-        if let fp = sceneFootprint,
-           let layerTex = footprintSample(input, mvp: fp.mvp, outW: fp.outW, outH: fp.outH, commandBuffer: cmd) {
-            input = layerTex   // 场景按层 footprint 采进层 [0,1] FBO(全画布遮罩在 SceneRenderEngine 用同一 footprintSample 对齐)
-        }
         let w = input.width, h = input.height
         // 审计修复 #2:把本次 run 的 combos 归一成整数,供 bind.conditions 判定(在 pass 循环外算一次)。
         let comboInts = Self.comboInts(combos)
@@ -821,8 +712,8 @@ final class WEEffectChain {
 
             // 逐 pass 参数优先(bloom 各 pass strength 可不同);否则合并版。
             let params: [String: Any] = (pi < paramsPerPass.count) ? paramsPerPass[pi] : pkgParams
-            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, cursorLast: cursorLast, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio)
-            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, cursorLast: cursorLast, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio)
+            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: w, sceneH: h, audio: audio)
+            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: w, sceneH: h, audio: audio)
             enc.setVertexBytes(&vu, length: vu.count, index: vstage.ubuf)
             enc.setFragmentBytes(&fu, length: fu.count, index: fstage.ubuf)
 

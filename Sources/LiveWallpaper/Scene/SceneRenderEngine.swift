@@ -169,7 +169,7 @@ private func matTranslate(_ x: Float, _ y: Float) -> simd_float4x4 {
     ))
 }
 
-private struct VertexUniforms { var mvp: simd_float4x4; var color: SIMD4<Float> }
+private struct VertexUniforms { var mvp: simd_float4x4; var color: SIMD4<Float>; var fb: SIMD4<Int32> = SIMD4(0, 0, 0, 0) }
 
 /// 一组粒子(一个发射器):模拟器 + 纹理 + 实例缓冲。
 private final class ParticleGroup {
@@ -922,7 +922,6 @@ final class SceneRenderEngine {
     /// g_PointerPosition / g_ParallaxPosition(xray 透视揭示、depthparallax 视差)。
     /// 静止(鼠标居中)= (0.5,0.5);WE 约定 0.5 为中性(无偏移)。
     private var cursorUV = SIMD2<Float>(0.5, 0.5)
-    private var cursorUVLast = SIMD2<Float>(0.5, 0.5)   // 上一帧光标 UV(喂 g_PointerPositionLast,lwe CPass.cpp:780)
     /// 相机视差总开关(场景 general.cameraparallax)。关时不做视差/漂移。
     private var cameraParallax = true
     // WE 相机真实参数:视差幅度/鼠标影响/平滑延迟(照 lwe CScene.cpp:394-406 + CImage.cpp:1097-1106)。
@@ -1242,7 +1241,6 @@ final class SceneRenderEngine {
                              min(1, max(0, (mouseNorm.y / ndcScale.y + 1) * 0.5)))
         let cursorCanvas = SIMD2(mouseUVc.x * canvas.x, mouseUVc.y * canvas.y)
         // 光标归一化 UV [0,1](y 向上)。喂 WE 交互特效(xray/depthparallax/樱花轨迹)的 pointer 量。
-        cursorUVLast = cursorUV   // 存上一帧光标(g_PointerPositionLast)再更新本帧
         cursorUV = mouseUVc
 
         // 鼠标划过水波:把光标 UV [0,1](y 向上=屏幕)喂给流体模拟。模拟步进在 render() 里做。
@@ -1456,10 +1454,8 @@ final class SceneRenderEngine {
                     encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
                 }
             }
-            // fb 恒 0:frameBufferInput 层的 effectedTexture 现在已是**层 [0,1] 空间**结果(WEEffectChain.run 的
-            // composelayer copy pass 把场景按 footprint 采进层 FBO,= lwe 首 copy pass),故按普通 quad UV(v.zw)
-            // 渲层 quad 采样贴回 = lwe 末 pass(screen mvp 渲层 quad 采样特效结果)。不再有「整帧画布底图 + 画布 UV」自创路径。
-            var u = VertexUniforms(mvp: layer.mvp, color: layer.color)
+            var u = VertexUniforms(mvp: layer.mvp, color: layer.color,
+                                   fb: SIMD4((layer.frameBufferInput && !layer.regionFit) ? 1 : 0, 0, 0, 0))
             encoder.setVertexBytes(&u, length: MemoryLayout<VertexUniforms>.stride, index: 1)
             let baseTex = layer.effectedTexture ?? layer.texture
             // 基础材质 combo 路径:有意义 combo(NORMALMAP/REFLECTION/LIGHTING/EMISSIVE/PBR/...)的图层
@@ -1633,8 +1629,8 @@ final class SceneRenderEngine {
         enc.setFragmentBytes(&blankFx, length: MemoryLayout<EffectUniforms>.stride, index: 0)
         for j in 0..<min(upTo, layers.count) where layers[j].visible {
             let layer = layers[j]
-            // fb 恒 0:effectedTexture 现为层 [0,1] 空间,普通 quad UV 贴(见 encode 处说明)。
-            var u = VertexUniforms(mvp: layer.mvp, color: layer.color)
+            var u = VertexUniforms(mvp: layer.mvp, color: layer.color,
+                                   fb: SIMD4((layer.frameBufferInput && !layer.regionFit) ? 1 : 0, 0, 0, 0))
             enc.setVertexBytes(&u, length: MemoryLayout<VertexUniforms>.stride, index: 1)
             let tex = layer.effectedTexture ?? layer.texture
             switch layer.blend {
@@ -1651,9 +1647,48 @@ final class SceneRenderEngine {
         return target
     }
 
-    // (已删除自创 region-fit:regionTexPool / regionPixelRect / cropToRegion。
-    //  composelayer 特效现忠实走 lwe composelayer copy pass(WEEffectChain.run sceneFootprint),
-    //  在层自有 [0,1] FBO 内跑,不再裁场景/遮罩到 region。)
+    // 区域性 composelayer 的 region 裁剪纹理池(按尺寸+用途键复用)。
+    private var regionTexPool: [String: MTLTexture] = [:]
+    /// 该层 quad 在画布纹理里的像素矩形(mvp 投 unit quad 四角取包围盒;画布纹理 v 向下)。
+    /// 用于区域性 composelayer:把整画布场景底图 + 全画布遮罩(影子)裁到该层 region → 特效在 region [0,1] 跑。
+    private func regionPixelRect(_ layer: GPULayer) -> (x: Int, y: Int, w: Int, h: Int)? {
+        let W = Int(canvas.x), H = Int(canvas.y)
+        guard W > 0, H > 0 else { return nil }
+        let corners = [SIMD4<Float>(-0.5,-0.5,0,1), SIMD4(0.5,-0.5,0,1), SIMD4(-0.5,0.5,0,1), SIMD4(0.5,0.5,0,1)]
+        var u0: Float = 1, v0: Float = 1, u1: Float = 0, v1: Float = 0
+        for c in corners {
+            let p = layer.mvp * c
+            guard abs(p.w) > 1e-6 else { return nil }
+            let u = (p.x / p.w) * 0.5 + 0.5
+            let v = (-(p.y / p.w)) * 0.5 + 0.5
+            u0 = min(u0, u); u1 = max(u1, u); v0 = min(v0, v); v1 = max(v1, v)
+        }
+        // 注:曾试「不钳裁、region 覆盖完整 quad」修中音条「只有左边」(超界条),但实测**弄坏 Postscript 云层**
+        // (它也是 regionFit、quad 略超画布,unclamp 后云扭曲读到透明边 → 整片变暗,meanDiff 60)→ 已撤回钳裁。
+        // 中音条超界错位待更安全的针对性方案(只对音频条而非所有 regionFit composelayer)。
+        let px0 = max(0, min(W - 1, Int(u0 * Float(W))))
+        let py0 = max(0, min(H - 1, Int(v0 * Float(H))))
+        let rw = max(8, min(W - px0, Int((u1 - u0) * Float(W))))
+        let rh = max(8, min(H - py0, Int((v1 - v0) * Float(H))))
+        return (px0, py0, rw, rh)
+    }
+    /// blit 把画布尺寸纹理裁到 region 矩形(场景底图、全画布遮罩用同一 rect → 对齐)。
+    private func cropToRegion(_ src: MTLTexture, rect r: (x: Int, y: Int, w: Int, h: Int), key: String, commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
+        guard r.x + r.w <= src.width, r.y + r.h <= src.height else { return nil }
+        let k = "\(key)@\(r.w)x\(r.h)@\(src.pixelFormat.rawValue)"
+        var t = regionTexPool[k]
+        if t == nil || t!.width != r.w || t!.height != r.h {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: src.pixelFormat, width: r.w, height: r.h, mipmapped: false)
+            d.usage = [.renderTarget, .shaderRead]; d.storageMode = .private
+            t = device.makeTexture(descriptor: d); regionTexPool[k] = t
+        }
+        guard let dst = t, let blit = cmd.makeBlitCommandEncoder() else { return nil }
+        blit.copy(from: src, sourceSlice: 0, sourceLevel: 0, sourceOrigin: MTLOrigin(x: r.x, y: r.y, z: 0),
+                  sourceSize: MTLSize(width: r.w, height: r.h, depth: 1),
+                  to: dst, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        blit.endEncoding()
+        return dst
+    }
 
     private var postedSceneTex: MTLTexture?
     /// 后处理输出的中间画面(供 aboveBloom 粒子在其上叠加 + 折射采样);独立于 refractSceneTex 避免别名冲突。
@@ -1693,20 +1728,20 @@ final class SceneRenderEngine {
         guard let we = weEffects else { return }
             var current = layers[i].texture
             // composelayer/_rt_FullFrameBuffer:特效链输入 = 该层之下已合成的整帧场景(照 WE FBOProvider 取场景主 FBO)。
-            // **忠实移植 lwe(CImage.cpp:785-853 + composelayer.vert/.frag,逐行核对)**:composelayer 的材质贴图
-            // 槽 0 = _rt_FullFrameBuffer(完整场景主 FBO),其首 copy pass(passthrough 几何,m_modelViewProjectionCopy
-            // = screen mvp)按**该层屏幕投影位置**把场景采样进**该层尺寸**的自有 [0,1] FBO,之后各 effect pass 在该 FBO
-            // 内全屏跑,末 pass 用 screen mvp 把结果渲回场景 FBO。我方 encode 已等价末 pass(按 layer.mvp 渲层 quad
-            // 采样 effectedTexture),故这里只需把**完整场景 FBO + footprint(layer.mvp)+ 层尺寸**喂给 run,由 run 的
-            // composelayer copy pass(WEEffectChain.run sceneFootprint)产出层 [0,1] 空间的特效结果。
-            // 位移特效(cloudmotion/shake)由此读到的是该层 region 内的场景邻域(与 lwe 一致),不再裁场景小图→无接缝/暗带。
-            var footprint: (mvp: simd_float4x4, outW: Int, outH: Int)? = nil
+            // 之上跑 pulse(据 mask 在云带周期增亮=打雷)/opacity/调色等,结果存 effectedTexture 由 encode 按其 mvp 贴回。
+            // regionFit(非 pulse 的区域性 composelayer,如音频条):把场景裁到该层 region → 特效在 region [0,1] 跑
+            // (32 条等正好铺满该层,而非整画布切片);下方 aux(全画布遮罩如影子)用同一 region 裁 → 对齐。
+            // pulse(打雷,regionFit=false)走原全屏路径不变。
+            var regionRect: (x: Int, y: Int, w: Int, h: Int)? = nil
             if layers[i].frameBufferInput {
                 let scene = sceneInput ?? compositeSceneBelow(upTo: i, commandBuffer: cmd) ?? current
-                current = scene
-                // 层尺寸 = effect FBO 尺寸(lwe CImage.cpp:278-283 = size×size = 层自有 FBO 尺寸)。
-                let sp = layers[i].sizePx
-                footprint = (mvp: layers[i].mvp, outW: max(1, Int(sp.x.rounded())), outH: max(1, Int(sp.y.rounded())))
+                if layers[i].regionFit, let r = regionPixelRect(layers[i]),
+                   let cropped = cropToRegion(scene, rect: r, key: "scene", commandBuffer: cmd) {
+                    current = cropped
+                    regionRect = r
+                } else {
+                    current = scene
+                }
             }
             let auxes = layers[i].effectAux
             let auxFlags = layers[i].effectAuxFlags
@@ -1726,28 +1761,15 @@ final class SceneRenderEngine {
                 if Self.fxSkip.contains(eff.weName) { continue }   // 诊断:WP_SKIP_FX 跳过
                 // 逐特效辅助贴图:weAux 的 slot → g_Texture<slot>(WE pass.textures[N] → 采样器 g_TextureN)。
                 // 这统一了 opacitymask/法线/相位/流向等所有辅助槽,取代旧的单一 maskTexture 机制。
-                // **全画布 opacitymask(如身体影子 4096×2296)按与场景同一 footprint 采进层 [0,1]**:effect frag 在层
-                // [0,1](v_TexCoord)采遮罩,而场景已经过 footprint copy 进层 [0,1];整画布遮罩(身体剪影按画布坐标画)
-                // 必须用**同一 footprint** 采,才能落在 footprint 内的 body 上对齐。per-Image FBO 端口只对场景做了 footprint、
-                // 漏了遮罩(直接 [0,1] 绑 → 整画布影子压扁进层 = 身体音频条错位/眼睛肉块/多余阴影)。层尺寸遮罩或非
-                // footprint 层 → 按 [0,1] 直接绑(行为不变)。
                 var auxTextures: [String: MTLTexture] = [:]
                 if ei < auxes.count {
                     for (slot, tex) in auxes[ei] {
                         var t = tex
-                        if ProcessInfo.processInfo.environment["WP_DBG_MASK"] != nil {
-                            Log.write("MASK id=\(layers[i].id) eff=\(eff.weName) slot=\(slot) tex=\(tex.width)x\(tex.height) canvas=\(Int(canvas.x))x\(Int(canvas.y)) footprint=\(footprint != nil ? "\(footprint!.outW)x\(footprint!.outH)" : "nil")")
-                        }
-                        // 全画布遮罩(身体影子 4096×2296,按画布坐标画)→ 用**该层自己的 mvp footprint** 采进层尺寸 [0,1]
-                        // FBO,使遮罩 [0,1] = 该层在画布的 footprint(身体那块)→ 与层 [0,1] 渲的音频条对齐。
-                        // 不依赖 frameBufferInput(opacity 不读场景但层有位置);层尺寸遮罩(tex≠canvas)不动。
-                        if tex.width == Int(canvas.x), tex.height == Int(canvas.y) {
-                            let sp = layers[i].sizePx
-                            if let sampled = we.footprintSample(tex, mvp: layers[i].mvp,
-                                                                outW: max(1, Int(sp.x.rounded())), outH: max(1, Int(sp.y.rounded())),
-                                                                commandBuffer: cmd) {
-                                t = sampled
-                            }
+                        // regionFit:全画布尺寸的 aux(如 opacity 的影子遮罩 4096×2296)用与场景同一 region 裁,
+                        // 使其在 region [0,1] 与裁后场景对齐(影子=身体剪影,裁出 region 内那块身体形状)。
+                        if let r = regionRect, tex.width == Int(canvas.x), tex.height == Int(canvas.y),
+                           let cropped = cropToRegion(tex, rect: r, key: "aux\(slot)", commandBuffer: cmd) {
+                            t = cropped
                         }
                         auxTextures["g_Texture\(slot)"] = t
                     }
@@ -1760,22 +1782,17 @@ final class SceneRenderEngine {
                 // 需要整帧底图的特效(frame_builder 的 g_Texture3=_rt_FullFrameBuffer):喂「该层之下
                 // 已合成场景」底图。暂用 sceneBelowTex(下方),空则退该层输入(仍非白,不会冲白)。
                 let fb: MTLTexture? = we.needsFrameBuffer(eff.weName) ? (sceneBelowForEffects ?? layers[i].texture) : nil
-                // footprint 只用于**链中第一个跑的特效**:其 input 是完整场景 FBO,由 run 的 composelayer copy
-                // pass 转成层 [0,1] 空间(lwe 首 copy pass);之后 current 已是层空间输出 → footprint=nil(后续特效
-                // 在层 FBO 内全屏跑,对齐 lwe effect 各 pass)。
                 let runOut = we.run(effect: eff.weName, input: current,
                                     pkgParams: eff.weParams as [String: Any],
                                     combos: eff.weCombos as [String: Any],
                                     auxTextures: auxTextures,
                                     texFlags: flagsMap,
                                     paramsPerPass: eff.weParamsPerPass.map { $0 as [String: Any] },
-                                    time: currentTime, cursor: cursorUV, cursorLast: cursorUVLast,
-                                    audio: currentAudio, frameBuffer: fb,
-                                    sceneFootprint: footprint, commandBuffer: cmd)
+                                    time: currentTime, cursor: cursorUV,
+                                    audio: currentAudio, frameBuffer: fb, commandBuffer: cmd)
                 if let out = runOut {
                     current = out
                     primaryFlags = nil   // 后续特效的输入是上一特效的全屏输出 → clamp+linear
-                    footprint = nil      // copy 已发生,后续特效用层空间输入(全 [0,1])
                 }
             }
             layers[i].effectedTexture = (current !== layers[i].texture) ? current : nil
@@ -1972,7 +1989,7 @@ final class SceneRenderEngine {
                                 pkgParams: eff.weParams as [String: Any],
                                 combos: eff.weCombos as [String: Any],
                                 paramsPerPass: eff.weParamsPerPass.map { $0 as [String: Any] },
-                                time: currentTime, cursor: cursorUV, cursorLast: cursorUVLast,
+                                time: currentTime, cursor: cursorUV,
                                 audio: currentAudio, commandBuffer: cmd) {
                 current = out
             }
@@ -2291,7 +2308,7 @@ final class SceneRenderEngine {
 
     struct VIn  { float2 pos [[attribute(0)]]; float2 uv [[attribute(1)]]; };
     struct VOut { float4 position [[position]]; float2 uv; float4 color; };
-    struct Uniforms { float4x4 mvp; float4 color; };
+    struct Uniforms { float4x4 mvp; float4 color; int4 fb; };
 
     vertex VOut scene_vertex(uint vid [[vertex_id]],
                              const device float4* verts [[buffer(0)]],
@@ -2300,10 +2317,16 @@ final class SceneRenderEngine {
         float4 v = verts[vid];            // xy = pos, zw = uv
         VOut o;
         o.position = u.mvp * float4(v.xy, 0.0, 1.0);
-        // 所有图层(含 frameBufferInput composelayer)都按普通 quad UV(v.zw)采样 effectedTexture:
-        // 它现为**层 [0,1] 空间**结果(WEEffectChain.run 的 composelayer copy pass 已把场景按 footprint 采进
-        // 层 FBO,= lwe 首 copy pass)→ 渲层 quad 采样贴回即 lwe 末 pass。已删除旧的「整帧画布底图 + 画布 UV」分支。
-        o.uv = v.zw;
+        // frameBufferInput(composelayer/_rt_FullFrameBuffer,如打雷):effectedTexture 是**整帧画布空间**底图,
+        // 必须按**画布 UV**(ndcScale 之前的 NDC→[0,1])采样,而非 quad 局部 UV——这样区域 quad(打雷的上部
+        // 3840×1400)只覆盖其屏幕区域、且 1:1 不压扁/不接缝。canvas UV 取自未乘 ndcScale 的 NDC(与 compositeSceneBelow
+        // 的 ndc=(1,1) 画布空间一致)。
+        if (u.fb.x != 0) {
+            float2 cndc = o.position.xy / o.position.w;
+            o.uv = cndc * float2(0.5, -0.5) + 0.5;
+        } else {
+            o.uv = v.zw;
+        }
         o.position.xy *= ndcScale;        // 宽高比 cover 适配
         o.color = u.color;
         return o;
