@@ -113,6 +113,22 @@ final class PreferencesStore {
         get { d.bool(forKey: "fxaaEnabled") }
         set { d.set(newValue, forKey: "fxaaEnabled") }
     }
+    /// 壁纸缩放模式(屏幕长宽比 ≠ 壁纸时):0=cover 填满+裁切(WE 默认)、1=fit 适应+黑边(全可见有黑边)、
+    /// 2=stretch 拉伸填满(全屏无黑边全可见,但画面被拉伸变形)。默认 0。
+    var wallpaperScaleMode: Int {
+        get {
+            if ProcessInfo.processInfo.environment["WP_FIT"] == "1" { return 1 }
+            if ProcessInfo.processInfo.environment["WP_STRETCH"] == "1" { return 2 }
+            return d.integer(forKey: "wallpaperScaleMode")
+        }
+        set { d.set(newValue, forKey: "wallpaperScaleMode") }
+    }
+    /// 同步呈现:presentsWithTransaction + 主动同步 present,修 Mac 内屏(120Hz ProMotion)上连续动画
+    /// 壁纸的横向撕裂/分带(后台线程异步 present 与合成不同步)。默认关。开启需重选壁纸(重建图层)。
+    var syncPresent: Bool {
+        get { d.bool(forKey: "syncPresent") }
+        set { d.set(newValue, forKey: "syncPresent") }
+    }
     /// 合成层(带特效/composite 的图层)最多渲染多少帧后冻结(完成)。0=∞ 不限(每帧都渲)。
     /// 用于给「不需要持续动画的特效层」省 GPU(如静态滤镜)。默认 0(不限,安全)。
     var compositeMaxFrames: Int {

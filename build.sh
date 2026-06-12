@@ -37,7 +37,7 @@ fi
 if [ -f Tools/generated/WEEffects.json ]; then
   cp Tools/generated/WEEffects.json "$APP/Contents/Resources/WEEffects.json"
   cp -R Tools/generated/we_effects "$APP/Contents/Resources/we_effects" 2>/dev/null || true
-  echo "==> 已打包 WE 转译特效: $(ls Tools/generated/we_effects | wc -l | tr -d ' ') 个着色器"
+  echo "==> 已打包 WE 转译特效: $(ls Tools/generated/we_effects/*.metal 2>/dev/null | wc -l | tr -d ' ') 个着色器"
 fi
 
 # 代码签名:优先用固定的自签名证书「LiveWallpaper Self-Signed」(签名身份稳定,
@@ -52,6 +52,20 @@ else
   echo "==> adhoc 签名(无固定证书;权限可能每次重问)"
 fi
 
+# 部署到 /Applications/(用户实际运行的位置)。重要:bundle id 相同时 `open` 会被 LaunchServices
+# 重定向到已注册的 /Applications/ 副本,所以只构建到开发目录会让用户一直跑旧版。除非 NO_DEPLOY=1。
+if [ "${NO_DEPLOY:-0}" != "1" ]; then
+  echo "==> 部署到 /Applications/"
+  killall LiveWallpaper 2>/dev/null && sleep 1 || true
+  rm -rf /Applications/LiveWallpaper.app
+  cp -R "$APP" /Applications/LiveWallpaper.app
+  if [ -n "$SIGN_HASH" ]; then
+    codesign --force --deep --sign "$SIGN_HASH" /Applications/LiveWallpaper.app 2>/dev/null || true
+  fi
+  /System/Library/Frameworks/CoreServices.framework/Versions/A/Frameworks/LaunchServices.framework/Versions/A/Support/lsregister -f /Applications/LiveWallpaper.app 2>/dev/null || true
+  echo "==> 已部署: /Applications/LiveWallpaper.app"
+fi
+
 echo "==> 完成: $(pwd)/$APP"
-echo "运行:  open '$(pwd)/$APP'"
+echo "运行:  open '/Applications/LiveWallpaper.app'"
 echo "在 Xcode 里开发:  open '$(pwd)/Package.swift'"

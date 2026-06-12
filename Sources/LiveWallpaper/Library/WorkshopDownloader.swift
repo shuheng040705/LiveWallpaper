@@ -99,21 +99,31 @@ final class WorkshopDownloader: ObservableObject {
     }
 
     private var didPrewarm = false
-    /// 预热 steamcmd:app 启动后后台先跑一次 `+login anonymous +quit`,让它自更新/bootstrap Steam 客户端。
-    /// 用户首次真实下载时即可跳过这段冷启动(否则首个下载的「连接中」会白等十几秒,被误当卡住)。
+    /// 预热 + **登录续期**:app 启动后台跑一次 steamcmd 登录。
+    /// 配了账号就用账号 `+login <account> +quit` —— steamcmd 每次成功登录都会从 Steam 拿一个新的
+    /// refresh token 并存回 config.vdf,所以这相当于给登录态**续期**。只要在 token 服务端有效期内
+    /// (隔天就掉的那种)打开过 app,登录就一直有效,缓解「天天要重新登录」。
+    /// 续期失败(token 已被作废)→ 立刻标记 loginExpired,让 UI 及时提醒重新登录,而不是等下载失败才知道。
+    /// 没配账号则匿名预热(仅 bootstrap,跳过首次下载冷启动)。
     func prewarm() {
         guard !didPrewarm, let steamcmd = steamcmdPath else { return }
         didPrewarm = true
+        let account = PreferencesStore.shared.steamAccount
         DispatchQueue.global(qos: .utility).async {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: steamcmd)
-            p.arguments = ["+login", "anonymous", "+quit"]
+            p.arguments = ["+login", account ?? "anonymous", "+quit"]
             p.standardInput = FileHandle.nullDevice
             let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
             guard (try? p.run()) != nil else { return }
-            _ = pipe.fileHandleForReading.readDataToEndOfFile()
+            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             p.waitUntilExit()
-            Log.write("WorkshopDownloader: steamcmd 预热完成(首次下载将跳过冷启动)")
+            guard let account else {
+                Log.write("WorkshopDownloader: steamcmd 预热完成(匿名)"); return
+            }
+            let ok = out.contains("Waiting for user info...OK") || out.contains("Logged in OK")
+            DispatchQueue.main.async { self.loginExpired = !ok }
+            Log.write("WorkshopDownloader: 账号 \(account) token 续期\(ok ? "成功" : "失败(需重新登录)")")
         }
     }
 

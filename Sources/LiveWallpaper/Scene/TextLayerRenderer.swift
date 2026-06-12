@@ -18,7 +18,9 @@ enum TextLayerKind {
 struct TextLayerDesc {
     var kind: TextLayerKind
     var color: SIMD3<Float>
-    var pointSize: CGFloat
+    var pointSize: CGFloat          // 渲染字号(放大求清晰,= renderPt);屏上真实大小另算
+    var srcPointSize: CGFloat = 32  // pkg 原始 pointsize:屏上字高 = srcPointSize × scale(WE 真义)
+    var useScreenPointSize = false  // 锚点 size/media 文本:屏上按 srcPointSize×scale,不塞 box、不按 box 折行
     var use12h: Bool = false
     var align: String = "center"   // left/center/right(horizontalalign)
     var verticalAlign: String = "center"   // top/center/bottom(verticalalign)
@@ -78,7 +80,16 @@ enum TextLayerRenderer {
         //     施加 .boldFontMask/.italicFontMask(或 monospacedSystemFont(weight:))。当前无字段 → 用注册体本身的字重。
         attrs[.paragraphStyle] = para   // no-op 写回(保持 attrs 为 var);补字段解开上面赋值后可删此行。
 
-        let attr = NSAttributedString(string: str, attributes: attrs)
+        // 符号字形回退 + 加粗(月相 ☽/☾ 等):WE 在 Windows(CrossOver)用 Arial 渲符号——但实测 Windows Arial.TTF
+        //   同样**不含** ☽(U+263D)/☾(U+263E),走 Windows 字体链回退到 Segoe UI Symbol(粗实月牙、亮)。
+        //   macOS 上 Arial/Helvetica 也无该字形,CoreText 默认回退到 **Menlo**(等宽体,月牙细瘦、AA 边发暗
+        //   → 形状不同 + 整体偏暗)。修法:对**基础字体渲不出**的字符,改用含该字形且更饱满的符号体
+        //   (Arial Unicode MS,Arial 家族、macOS 自带、月牙更粗亮),并加细描边补偿小字号 AA 发暗
+        //   —— 让 ☽/☾ 接近 WE 的亮实月牙。普通拉丁字(基础字体能渲)不受影响 → 不动其它壁纸时钟/日期外观。
+        // WP_NO_MOONFIX=1 退回旧的「单一字体 + CoreText 自动回退」(A/B 诊断符号字形改动)。
+        let attr = (ProcessInfo.processInfo.environment["WP_NO_MOONFIX"] != nil)
+            ? NSAttributedString(string: str, attributes: attrs)
+            : Self.makeAttributed(str, baseAttrs: attrs, baseFont: font, pointSize: desc.pointSize)
 
         // 折行宽度上限:优先用 WE 文本框的显式宽度 boxSizePx.x(画布单位)。注意 boxSizePx 未乘 scale,
         //   而这里的纹理按 pointSize 的自然像素绘制——两者单位不同(框是画布单位,纹理是字号像素)。
@@ -143,7 +154,9 @@ enum TextLayerRenderer {
             switch s.runString(current: "", simTime: simTime) {
             case .string(let out): return out
             case .vec3, .failed:
-                // 脚本失败:退化到时钟近似(脚本层多数是时钟/日期),不至于空白。
+                // 纯 media 文本(歌名/艺术家):没在播音乐时就该**空**,绝不能回退成时钟(否则歌名位置
+                // 冒出一个时间 = 用户报的"music name 没识别")。其余脚本层多是时钟/日期 → 时钟近似兜底。
+                if s.isMediaDriven { return "" }
                 return fallbackClock(desc)
             }
         case .staticText(let s): return s
@@ -169,6 +182,56 @@ enum TextLayerRenderer {
         let f = DateFormatter()
         f.dateFormat = desc.use12h ? "h:mm" : "HH:mm"
         return f.string(from: Date())
+    }
+
+    // MARK: - 符号字形回退
+
+    /// 含 ☽/☾ 等符号字形且较饱满的回退体(macOS 自带)。优先 Arial Unicode MS(Arial 家族、月牙粗亮),
+    /// 退 STIXGeneral / Apple Symbols。缓存命中名,避免每帧 NSFont(name:) 查找。
+    private static var _symbolFallbackName: String? = {
+        for n in ["Arial Unicode MS", "ArialUnicodeMS", "STIXGeneral-Regular", "STIXGeneral", "Apple Symbols", "AppleSymbols"] {
+            if let f = NSFont(name: n, size: 12), (f as CTFont).hasGlyph(for: "\u{263E}") { return f.fontName }
+        }
+        return nil
+    }()
+
+    /// 构造属性串:逐字符检测**基础字体能否渲该字形**;不能→改用符号回退体 + 细描边(thicken/提亮)。
+    /// 普通字(基础字体可渲)沿用 baseAttrs(零变化)。无可用符号体时退回纯 baseAttrs(= 旧 CoreText 自动回退)。
+    private static func makeAttributed(_ str: String, baseAttrs: [NSAttributedString.Key: Any],
+                                       baseFont: NSFont, pointSize: CGFloat) -> NSAttributedString {
+        let ctBase = baseFont as CTFont
+        // 快路:所有字符基础字体都能渲 → 直接用 baseAttrs(绝大多数时钟/日期/拉丁文本)。
+        let needsFallback = str.unicodeScalars.contains { sc in
+            // 跳过空白/控制/变体选择符(它们无独立字形,不触发回退)。
+            if sc.value < 0x20 || sc.value == 0x20 || (0xFE00...0xFE0F).contains(sc.value) { return false }
+            return !ctBase.hasGlyph(for: String(sc))
+        }
+        guard needsFallback, let symName = _symbolFallbackName,
+              let symBase = NSFont(name: symName, size: pointSize) else {
+            return NSAttributedString(string: str, attributes: baseAttrs)
+        }
+        let symFont = symBase
+        // 细描边(负值=填充+外描边,WE 描边语义):按字号 ~10% 厚度补偿小字号 AA 发暗,让月牙更亮实。
+        let strokePct: CGFloat = 8.0
+        let out = NSMutableAttributedString()
+        for ch in str {
+            let s = String(ch)
+            // 该字符的任一 scalar 基础字体渲不出 → 整字符用符号回退体 + 描边。
+            let needSym = ch.unicodeScalars.contains { sc in
+                if sc.value < 0x20 || sc.value == 0x20 || (0xFE00...0xFE0F).contains(sc.value) { return false }
+                return !ctBase.hasGlyph(for: String(sc))
+            }
+            if needSym {
+                var a = baseAttrs
+                a[.font] = symFont
+                a[.strokeColor] = a[.foregroundColor]
+                a[.strokeWidth] = -strokePct
+                out.append(NSAttributedString(string: s, attributes: a))
+            } else {
+                out.append(NSAttributedString(string: s, attributes: baseAttrs))
+            }
+        }
+        return out
     }
 
     // MARK: - 字体解析
@@ -268,5 +331,15 @@ final class FontRegistry {
         cache[path] = ps
         Log.write("FontRegistry: registered \(path) → \(ps ?? "nil")")
         return ps
+    }
+}
+
+extension CTFont {
+    /// 该字体是否含字符串里所有 scalar 的真实字形(glyph id 非 0)。用于判断是否需符号回退。
+    func hasGlyph(for s: String) -> Bool {
+        let u = Array(s.utf16)
+        guard !u.isEmpty else { return true }
+        var g = [CGGlyph](repeating: 0, count: u.count)
+        return CTFontGetGlyphsForCharacters(self, u, &g, u.count) && g.allSatisfy { $0 != 0 }
     }
 }

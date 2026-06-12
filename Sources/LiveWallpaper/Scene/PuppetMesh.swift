@@ -20,13 +20,116 @@ struct PuppetMesh {
     private let boneWt: [SIMD4<Float>]      // 每顶点 4 个权重(和=1)
     // 骨骼:
     private let parent: [Int]
+    private let localBind: [simd_float4x4]  // 每骨局部 bind(父相对)
+    private let worldBind: [simd_float4x4]  // 累乘后的世界 bind
     private let invBind: [simd_float4x4]    // 预算:inverse(worldBind[b])
     // 动画(按 id 索引):
     struct Anim { let id: Int; let fps: Float; let frameCount: Int; let tracks: [[[Float]]] }  // tracks[bone][frame] = 9 floats TRS
     private let anims: [Anim]
+    // 部件间挂点(MDAT0001):父部件用具名 attachment(如「头部」「胸部」)暴露子部件可挂的世界变换。
+    // 每条 = (名, 所挂骨索引, 该挂点相对该骨的局部行主序矩阵)。子部件 scene.json 的 attachment 串按名匹配此表。
+    struct Attachment { let name: String; let bone: Int; let local: simd_float4x4 }  // local 已转成列主序
+    let attachments: [Attachment]
 
     var hasSkin: Bool { !anims.isEmpty && !parent.isEmpty }
     var bindVerts: [Float] { unitVerts(rawPos) }   // 静态 bind 姿态 [x,y,u,v]×N(与旧行为一致)
+    var hasBones: Bool { !parent.isEmpty }
+
+    /// 父部件具名挂点(如「头部」)的**世界变换**(列主序;平移在列 3)。无该名返回 nil。
+    /// = attachLocal · worldBind[bone](行主序链:点 p_row·local·worldBindRow;列主序等价 worldBindCol·localCol·p_col,
+    ///   见 parse 里转置约定)。供子部件做部件间 attachment。
+    func attachmentWorld(_ name: String) -> simd_float4x4? {
+        guard let a = attachments.first(where: { $0.name == name }), a.bone >= 0, a.bone < worldBind.count else { return nil }
+        // 行主序语义:attachWorldRow = attachLocalRow · boneWorldRow。列主序矩阵存的是其转置,
+        // 故列主序 attachWorldCol = boneWorldCol · attachLocalCol(乘序反转)。
+        return worldBind[a.bone] * a.local
+    }
+
+    /// 父部件具名挂点在 animId/time 时刻的**动画后**世界变换(列主序;平移在列 3)。
+    /// = worldAnim[bone](t) · attachLocal —— 与 attachmentWorld 同构,只是把静态 worldBind[bone] 换成
+    /// 该帧动画求值得到的 worldAnim[bone](骨骼随动画移动/旋转/缩放)。这让挂在该骨上的子部件(眼/睑/耳)
+    /// **逐帧跟随父的骨骼动画**(凯尔希主体 anim206 呼吸让头骨 bone5 移动 → 眼睛跟头一起动,不脱离脸)。
+    /// 失败(无骨/无该挂点/无该动画)返回 nil → 调用方退回静态 attachmentWorld(t=0 退化兜底)。
+    func animatedAttachmentWorld(_ name: String, time: Double, rate: Float, animId: Int) -> simd_float4x4? {
+        guard let a = attachments.first(where: { $0.name == name }), a.bone >= 0, a.bone < parent.count else { return nil }
+        guard let world = worldAnim(time: time, rate: rate, animId: animId), a.bone < world.count else { return nil }
+        // 与 attachmentWorld 同乘序:列主序 attachWorldCol = boneWorldAnimCol · attachLocalCol。
+        return world[a.bone] * a.local
+    }
+
+    /// 具名挂点所在**骨**在 animId/time 时刻的**蒙皮变换**(列主序;= worldAnim[bone]·invBind[bone])。
+    /// 与 attach 的 `attachLocal` 无关——它把**任意** mesh-local 点(如子部件实际锚点 = 挂点平移 + 子局部 origin)
+    /// 当作刚性绑在该骨上的点,变换到动画后的位置。
+    /// 为何需要它(凯尔希眼睛偏离脸的真因,2026-06-07 引擎 parser 实测):
+    ///   旧 `animatedAttachmentWorld` 只给挂点**枢轴**(头部 bone5 @ mesh-local(734,856))的运动,然后把这同一个
+    ///   位移平移给挂在「头部」上的**所有**子部件。但呼吸 anim206 让 bone5 **旋转+平移**,离枢轴越远的点位移越不同:
+    ///     · 眼睛组合锚点在 (1364,855)(枢轴右 630px)→ 实际应下沉 −91.5px,旧式只给 −59.1px → 偏离 24.4px(屏幕)。
+    ///     · 左眼皮 (584,869) 应 −51.3 旧式 −59.1 → 偏 6px;右眼上眼睑 (845,937) 应 −64.4 → 偏 3.8px。
+    ///   正解:把子的**实际锚点**(在父 mesh-local 空间)经该骨的蒙皮矩阵变换,捕获旋转放大的真实位移 →
+    ///   眼睛随脸皮一起下沉/不脱位。这是 WE attachment 的真语义(子刚绑父骨的局部坐标系,按子的偏移点求值)。
+    /// 失败(无骨/无该挂点/无该动画)返回 nil → 调用方退回旧枢轴增量(零回归兜底)。
+    func attachBoneSkinMatrix(_ name: String, time: Double, rate: Float, animId: Int) -> simd_float4x4? {
+        guard let a = attachments.first(where: { $0.name == name }), a.bone >= 0, a.bone < parent.count,
+              a.bone < invBind.count else { return nil }
+        guard let world = worldAnim(time: time, rate: rate, animId: animId), a.bone < world.count else { return nil }
+        return world[a.bone] * invBind[a.bone]
+    }
+
+    /// 求 animId 在 time 时刻每根骨的**世界动画变换**(列主序;父链累乘的 worldAnim[b])。
+    /// 与 skin() 内部的 world[] 计算逐式相同(共享逻辑)。失败/无骨/无该动画返回 nil。
+    /// t=0(或 anim 首帧 == bind)时退化为 worldBind → 与静态结果一致(回归兜底)。
+    private func worldAnim(time: Double, rate: Float, animId: Int) -> [simd_float4x4]? {
+        guard hasSkin else { return nil }
+        guard let anim = anims.first(where: { $0.id == animId }) ?? anims.first else { return nil }
+        guard anim.frameCount > 0, anim.fps > 0 else { return nil }
+        let nb = parent.count
+        let tt = time * Double(anim.fps) * Double(max(0.0001, rate))
+        let fc = Double(anim.frameCount)
+        var ft = tt.truncatingRemainder(dividingBy: fc); if ft < 0 { ft += fc }
+        let f0 = Int(ft), f1 = (f0 + 1) % anim.frameCount
+        let a = Float(ft - Double(f0))
+        var local = [simd_float4x4](repeating: matrix_identity_float4x4, count: nb)
+        for b in 0..<nb {
+            guard b < anim.tracks.count, f0 < anim.tracks[b].count, f1 < anim.tracks[b].count else { continue }
+            let k0 = anim.tracks[b][f0], k1 = anim.tracks[b][f1]
+            func lp(_ i: Int) -> Float { k0[i] + (k1[i] - k0[i]) * a }
+            let t = SIMD3<Float>(lp(0), lp(1), lp(2))
+            let rz = lp(5)
+            let s = SIMD3<Float>(lp(6), lp(7), lp(8))
+            local[b] = Self.trs(t: t, rz: rz, s: s)
+        }
+        var world = [simd_float4x4](repeating: matrix_identity_float4x4, count: nb)
+        for b in 0..<nb {
+            let p = parent[b]
+            world[b] = (p >= 0 && p < nb) ? world[p] * local[b] : local[b]
+        }
+        return world
+    }
+
+    /// 本(子)部件 bind 姿态下蒙皮后的局部顶点(SIMD2,**子部件 mesh 原始空间**),供做部件间 attachment 用。
+    /// bind 姿态蒙皮 = Σ wᵢ·(worldBind[i]·invBind[i])·v = v(恒等),即等于 rawPos;此处显式走蒙皮路径以保持
+    /// 与运行时蒙皮一致(若将来叠 eyeblink 动画可换成 skin())。
+    var skinnedBindPositions: [SIMD2<Float>] { rawPos }
+
+    /// 本(子)部件 root 骨(bone 0)的世界 bind 变换(列主序)。无骨返回单位阵。
+    var rootBoneWorld: simd_float4x4 { worldBind.first ?? matrix_identity_float4x4 }
+
+    /// 部件间 attachment:把本(子)部件蒙皮后的局部顶点搬到**父部件 mesh-local 空间**,输出单位空间 [x,y,u,v]
+    /// (按 **父部件 size** 归一,以便用父部件的 origin/scale/angle 渲染)。
+    ///   childInParent = inv(childRootBoneWorld) · parentAttachWorld  (把子 root 对齐到父挂点)
+    /// 已离线验证(凯尔希:眼睛 root 对齐到主体「头部」挂点后落到光头脸上)。parentSize 为父部件 quad size。
+    func attachedUnitVerts(parentAttachWorld: simd_float4x4, parentSize: SIMD2<Float>) -> [Float] {
+        let m = parentAttachWorld * rootBoneWorld.inverse   // 列主序:childWorldInParent = parentAttach · inv(childRoot)
+        let pts = skinnedBindPositions
+        var out = [Float](); out.reserveCapacity(pts.count * 4)
+        for i in 0..<pts.count {
+            let v = m * SIMD4<Float>(pts[i].x, pts[i].y, 0, 1)
+            // 归一到**父** size(渲染用父的 matModel:unitVert·parentSize = 父空间像素 = v.xy)
+            out.append(v.x / parentSize.x); out.append(v.y / parentSize.y)
+            out.append(uv[i].x); out.append(uv[i].y)
+        }
+        return out
+    }
 
     // ---- 原始 → 单位空间 [x,y,u,v](x=rawX/size.x、y=+rawY/size.y、uv 直取)----
     // 注:不翻 Y 是对的——我方普通 quad 约定 pos.y=+0.5↔uv.v=0(贴图顶),而 puppet 网格拟合
@@ -41,35 +144,65 @@ struct PuppetMesh {
         return out
     }
 
-    /// 求指定 animId 在 time 时刻的蒙皮顶点(单位空间 [x,y,u,v])。失败/无骨返回 nil(调用方回退 bind)。
-    func skin(time: Double, rate: Float, animId: Int) -> [Float]? {
-        guard hasSkin else { return nil }
-        guard let anim = anims.first(where: { $0.id == animId }) ?? anims.first else { return nil }
+    /// 单个动画在 time 时刻的每骨**局部** TRS 矩阵(父链累乘前)。无该动画返回 nil。
+    private func localPose(time: Double, rate: Float, animId: Int) -> [simd_float4x4]? {
+        guard let anim = anims.first(where: { $0.id == animId }) else { return nil }
         guard anim.frameCount > 0, anim.fps > 0 else { return nil }
         let nb = parent.count
-        // 时间 → 帧(loop):t = time·fps·rate mod frameCount
         let tt = time * Double(anim.fps) * Double(max(0.0001, rate))
         let fc = Double(anim.frameCount)
         var ft = tt.truncatingRemainder(dividingBy: fc); if ft < 0 { ft += fc }
         let f0 = Int(ft), f1 = (f0 + 1) % anim.frameCount
         let a = Float(ft - Double(f0))
-        // 每骨局部动画矩阵 = T·Rz·S(2D puppet 只 Rz 有效;线性插值 TRS)
         var local = [simd_float4x4](repeating: matrix_identity_float4x4, count: nb)
         for b in 0..<nb {
             guard b < anim.tracks.count, f0 < anim.tracks[b].count, f1 < anim.tracks[b].count else { continue }
             let k0 = anim.tracks[b][f0], k1 = anim.tracks[b][f1]
             func lp(_ i: Int) -> Float { k0[i] + (k1[i] - k0[i]) * a }
-            let t = SIMD3<Float>(lp(0), lp(1), lp(2))
-            let rz = lp(5)
-            let s = SIMD3<Float>(lp(6), lp(7), lp(8))
-            local[b] = Self.trs(t: t, rz: rz, s: s)
+            local[b] = Self.trs(t: SIMD3(lp(0), lp(1), lp(2)), rz: lp(5), s: SIMD3(lp(6), lp(7), lp(8)))
         }
-        // worldAnim[b] = worldAnim[parent]·local[b];skin[b] = worldAnim[b]·invBind[b]
+        return local
+    }
+
+    /// **多 animationlayer 合成蒙皮**(WE 真义:对象的 animationlayers 全部叠加,additive 层在 base 姿势上
+    /// 追加位移)。御剑龙 = 「动画 1」(546, base) + 「动画 2」(639, additive:含下压/飞行大位移)——
+    /// 只播 base 会把 additive 的整体运动丢掉(龙恒停在 bind 高位 = 用户报「龙偏上」的真因)。
+    /// 合成约定:local = L_base · Π(invLocalBind · L_add)。additive 轨道 entry== bind 时 invLB·L_add = I(零贡献),
+    /// 已对照 pkg 数据验证(动画2 entry0 == localBind 逐骨全等 → t=0 合成 == 纯 base == 旧行为,天然回归兜底)。
+    /// layers 为空/全不可用 → 返回 nil(调用方维持现状)。
+    func skinLayers(time: Double, layers: [(animId: Int, rate: Float, additive: Bool)]) -> [Float]? {
+        guard hasSkin, !layers.isEmpty else { return nil }
+        let nb = parent.count
+        var composed: [simd_float4x4]? = nil
+        for l in layers {
+            guard let pose = localPose(time: time, rate: l.rate, animId: l.animId) else { continue }
+            if composed == nil {
+                composed = pose                      // 首个可用层 = base(additive 标志忽略,作 base 用)
+            } else if l.additive {
+                for b in 0..<nb { composed![b] = composed![b] * (localBind[b].inverse * pose[b]) }
+            } else {
+                composed = pose                      // 后续非 additive 层覆盖(WE blend=1 全量)
+            }
+        }
+        guard let local = composed else { return nil }
         var world = [simd_float4x4](repeating: matrix_identity_float4x4, count: nb)
         for b in 0..<nb {
             let p = parent[b]
             world[b] = (p >= 0 && p < nb) ? world[p] * local[b] : local[b]
         }
+        return skinVerts(world: world)
+    }
+
+    /// 求指定 animId 在 time 时刻的蒙皮顶点(单位空间 [x,y,u,v])。失败/无骨返回 nil(调用方回退 bind)。
+    func skin(time: Double, rate: Float, animId: Int) -> [Float]? {
+        // worldAnim[b] = 父链累乘的该帧骨骼世界变换(与 animatedAttachmentWorld 共享同一求值)。
+        guard let world = worldAnim(time: time, rate: rate, animId: animId) else { return nil }
+        return skinVerts(world: world)
+    }
+
+    /// 共享顶点蒙皮:skin[b] = world[b]·invBind[b],逐顶点 4 骨加权,输出单位空间 [x,y,u,v]。
+    private func skinVerts(world: [simd_float4x4]) -> [Float] {
+        let nb = world.count
         var skinned = [SIMD2<Float>](repeating: .zero, count: rawPos.count)
         for i in 0..<rawPos.count {
             let p4 = SIMD4<Float>(rawPos[i].x, rawPos[i].y, 0, 1)
@@ -104,7 +237,10 @@ struct PuppetMesh {
         let b = [UInt8](data)
         let markerSize = 9
         guard b.count >= markerSize, let magic = String(bytes: b[0..<8], encoding: .ascii),
-              magic == "MDLV0021" || magic == "MDLV0023" else { return nil }
+              magic == "MDLV0019" || magic == "MDLV0021" || magic == "MDLV0023" else { return nil }
+        // MDLV0019(御剑 朱鹤/挂饰/刀 等):mesh 顶点布局与 0021/0023 相同(stride 80,pos@0/uv@72,扫描定位);
+        // MDLS=0002 / MDLA=0005 经逐字节验证与 0004/0006 布局相同(2026-06-10),骨骼/动画一并解析。
+        // 刀 anim673=沿刀身滑动+飞行(与龙配对)、挂饰 516=摆动、朱鹤=飞行——此前版本门禁跳过=静态 bind 是「刀偏上」的另一半真因。
         func u32(_ o: Int) -> UInt32 {
             guard o + 4 <= b.count else { return 0 }
             return UInt32(b[o]) | (UInt32(b[o+1]) << 8) | (UInt32(b[o+2]) << 16) | (UInt32(b[o+3]) << 24)
@@ -125,14 +261,21 @@ struct PuppetMesh {
         let mdlsRaw = findTag([0x4D,0x44,0x4C,0x53], from: markerSize)   // "MDLS"(原始位置,定 mesh 扫描上界)
         let mdlaRaw = findTag([0x4D,0x44,0x4C,0x41], from: markerSize)   // "MDLA"
         let meshUpper = mdlsRaw ?? mdlaRaw ?? b.count
-        // 仅对已逐字节验证的版本启用骨骼/动画解析(MDLS0004 / MDLA0006);其他版本布局未知 → 跳过 → 静态 bind(安全)。
-        func verOK(_ p: Int?, _ ver: String) -> Int? {
+        // 已逐字节验证的版本启用骨骼/动画解析:MDLS0004/0002、MDLA0006/0005(2026-06-10 御剑刀/挂饰逐字节
+        // 验证 0002/0005 与 0004/0006 **布局完全相同**:MDLS u8+u32ptr+u32 boneCount+每骨同构;MDLA 解析出
+        // 刀 anim id=673「动画 1」与 scene.json 精确匹配、track sz==36×(frames+1) 自洽、挂饰 516/150帧同验)。
+        // 其他版本布局未知 → 跳过 → 静态 bind(安全)。
+        func verOK(_ p: Int?, _ vers: [String]) -> Int? {
             guard let p = p, p + 8 <= b.count,
-                  String(bytes: b[(p+4)..<(p+8)], encoding: .ascii) == ver else { return nil }
+                  let v = String(bytes: b[(p+4)..<(p+8)], encoding: .ascii), vers.contains(v) else { return nil }
             return p
         }
-        let mdls = verOK(mdlsRaw, "0004")
-        let mdla = verOK(mdlaRaw, "0006")
+        let mdlsRaw2 = mdlsRaw   // 供 MDAT 上界
+        let mdls = verOK(mdlsRaw, ["0004", "0002"])
+        let mdla = verOK(mdlaRaw, ["0006", "0005"])
+        let mdatRaw = findTag([0x4D,0x44,0x41,0x54], from: markerSize)   // "MDAT"(部件间挂点)
+        let mdat = verOK(mdatRaw, ["0001"])
+        _ = mdlsRaw2
 
         // ---- MDLV mesh:[reserved u32][vertexBytes u32] + 顶点 + [indexBytes u32] + 索引 ----
         let vertexStride = 80, meshHeaderSize = 8
@@ -210,8 +353,9 @@ struct PuppetMesh {
         }
         // worldBind = 父链累乘;invBind = inverse(worldBind)
         var invBind = [simd_float4x4]()
+        var worldBind = [simd_float4x4]()
         if !parent.isEmpty {
-            var worldBind = [simd_float4x4](repeating: matrix_identity_float4x4, count: parent.count)
+            worldBind = [simd_float4x4](repeating: matrix_identity_float4x4, count: parent.count)
             for bIdx2 in 0..<parent.count {
                 let p = parent[bIdx2]
                 worldBind[bIdx2] = (p >= 0 && p < parent.count) ? worldBind[p] * localBind[bIdx2] : localBind[bIdx2]
@@ -219,36 +363,86 @@ struct PuppetMesh {
             invBind = worldBind.map { $0.inverse }
         }
 
+        // ---- MDAT 部件间挂点:u8 + u32(ptr) + u16 count;每条 = u16 boneIdx + cstr name + 16×f32 行主序矩阵 ----
+        // (凯尔希主体_puppet.mdl 逐字节验证:头部→bone5、脖颈→bone3、胸部→bone1,各带局部偏移矩阵。)
+        // 矩阵行主序(平移在 [12][13][14]),与骨骼 bind 同约定 → `columns:` 装入即得列主序(=转置)。
+        var attachments = [Attachment]()
+        if let m = mdat {
+            var o = m + 8
+            o += 1                         // u8 flag
+            o += 4                         // u32 ptr
+            guard o + 2 <= b.count else { return nil }
+            let cnt = Int(UInt(b[o]) | (UInt(b[o+1]) << 8)); o += 2
+            if cnt > 0 && cnt < 4096 {
+                for _ in 0..<cnt {
+                    guard o + 2 <= b.count else { break }
+                    let bi = Int(UInt(b[o]) | (UInt(b[o+1]) << 8)); o += 2
+                    let start = o
+                    while o < b.count && b[o] != 0 { o += 1 }
+                    let name = String(bytes: b[start..<o], encoding: .utf8) ?? ""
+                    o += 1                 // 跳 NUL
+                    guard o + 64 <= b.count else { break }
+                    var rm = [Float](repeating: 0, count: 16)
+                    for k in 0..<16 { rm[k] = f32(o + k * 4) }
+                    o += 64
+                    let mat = simd_float4x4(columns: (
+                        SIMD4(rm[0], rm[1], rm[2], rm[3]),
+                        SIMD4(rm[4], rm[5], rm[6], rm[7]),
+                        SIMD4(rm[8], rm[9], rm[10], rm[11]),
+                        SIMD4(rm[12], rm[13], rm[14], rm[15])))
+                    attachments.append(Attachment(name: name, bone: bi, local: mat))
+                }
+            }
+        }
+
         // ---- MDLA 动画:u8 + u32(ptr) + u32 animCount;每动画 头部 + boneCount 条轨道 ----
+        // ⚠️ anim 之间存在**零填充 footer**(御剑龙 anim1「动画 1」→ anim2「动画 2」之间 31 字节 0x00,语义未知):
+        //   旧顺序解析读完 anim1 轨道后直接读 anim2 头 → 读进 footer → guard 失败 break → **后续动画全部静默丢失**
+        //  (御剑龙的 additive「动画 2」=下压/飞行整体运动被丢 = 龙偏上的真因之一)。
+        //   修:probeAnimHeader 头部探测(不前进;boneCount≤骨数+fps/frameCount 合理 = 强校验),直接位置失败则
+        //   跳过连续 0x00 重试一次(footer 全零;误同步概率极低,失败仍 break 保持旧行为)。
         var anims = [Anim]()
         if let m = mdla, !parent.isEmpty {
             var o = m + 8
             o += 1                         // u8 flag
             o += 4                         // u32 ptr
             let animCount = Int(u32(o)); o += 4
-            func cstr() -> String {        // 读 NUL 结尾字符串(并推进 o)
-                let start = o
-                while o < b.count && b[o] != 0 { o += 1 }
-                let s = String(bytes: b[start..<o], encoding: .utf8) ?? ""
-                o += 1
-                return s
+            // 头部探测:id+unk + name(cstr) + mode(cstr) + fps + frameCount + unk + boneCount + unk。
+            // 合理则返回 (id,fps,frameCount,boneCount,轨道起点),否则 nil(不动 o)。
+            func probeAnimHeader(_ start: Int) -> (id: Int, fps: Float, frameCount: Int, bc: Int, tracksStart: Int)? {
+                var p = start
+                guard p + 8 <= b.count else { return nil }
+                let id = Int(u32(p)); p += 8
+                func skipCstr(_ p: inout Int, maxLen: Int = 96) -> Bool {
+                    let s = p
+                    while p < b.count && b[p] != 0 { p += 1; if p - s > maxLen { return false } }
+                    guard p < b.count else { return false }
+                    p += 1
+                    return true
+                }
+                guard skipCstr(&p), skipCstr(&p), p + 20 <= b.count else { return nil }
+                let fps = f32(p); p += 4
+                let fc = Int(u32(p)); p += 4
+                p += 4                     // u32 unk
+                let bc = Int(u32(p)); p += 4
+                p += 4                     // u32 unk
+                guard id >= 0, id < 1_000_000, fps > 0, fps <= 480,
+                      fc > 0, fc < 100_000, bc > 0, bc <= parent.count else { return nil }
+                return (id, fps, fc, bc, p)
             }
             if animCount > 0 && animCount < 256 {
-                for _ in 0..<animCount {
-                    guard o + 8 <= b.count else { break }
-                    let id = Int(u32(o)); o += 4
-                    o += 4                 // u32 unk
-                    _ = cstr()             // name
-                    _ = cstr()             // mode
-                    let fps = f32(o); o += 4
-                    let frameCount = Int(u32(o)); o += 4
-                    o += 4                 // u32 unk
-                    let bc = Int(u32(o)); o += 4
-                    o += 4                 // u32 unk
-                    guard frameCount > 0, frameCount < 100000, bc > 0, bc < 4096 else { break }
+                for animIdx in 0..<animCount {
+                    var hdr = probeAnimHeader(o)
+                    if hdr == nil, animIdx > 0 {            // 直接位置失败 → 跳零 footer 重试
+                        var p = o
+                        while p + 1 < b.count && b[p] == 0 { p += 1 }
+                        if p != o, let h2 = probeAnimHeader(p) { hdr = h2; o = p }
+                    }
+                    guard let h = hdr else { break }
+                    o = h.tracksStart
                     var tracks = [[[Float]]]()
                     var bad = false
-                    for _ in 0..<bc {
+                    for _ in 0..<h.bc {
                         guard o + 4 <= b.count else { bad = true; break }
                         let trackSize = Int(u32(o)); o += 4
                         let recCount = trackSize / 36
@@ -264,12 +458,15 @@ struct PuppetMesh {
                         o += trackSize
                         o += 4             // u32 trailer
                     }
-                    if !bad { anims.append(Anim(id: id, fps: fps, frameCount: frameCount, tracks: tracks)) }
+                    if bad { break }
+                    anims.append(Anim(id: h.id, fps: h.fps, frameCount: h.frameCount, tracks: tracks))
                 }
             }
         }
 
         return PuppetMesh(size: size, indices: indices, rawPos: rawPos, uv: uv,
-                          boneIdx: bIdx, boneWt: bWt, parent: parent, invBind: invBind, anims: anims)
+                          boneIdx: bIdx, boneWt: bWt, parent: parent,
+                          localBind: localBind, worldBind: worldBind, invBind: invBind,
+                          anims: anims, attachments: attachments)
     }
 }

@@ -45,8 +45,13 @@ final class WEScript {
     private let mediaPropertiesChangedFn: JSValue?
     private let mediaTimelineChangedFn: JSValue?
     private let mediaPlaybackChangedFn: JSValue?
+    /// 纯 media 驱动文本层(无 update,只有 mediaPropertiesChanged):歌名/艺术家。失败不回退时钟。
+    let isMediaDriven: Bool
     /// 脚本是否用音频(调 engine.registerAudioBuffers / 读 __audio*)→ 引擎据此采集音频并每帧喂 setAudioSpectrum。
     let usesAudio: Bool
+    /// 脚本是否在 init 里调 thisScene.createLayer(运行时动态建层,如音频条 64 根 bar)。
+    /// 引擎据此走「多实例渲染同一模型」路径(runDynamicBars),不把它当普通 visible/scale 脚本(其 update void)。
+    let createsLayers: Bool
     /// 上次派发的签名,用于 lwe 式去重:仅在变化时再派发,避免每帧重复触发脚本回调。
     private var lastMediaPropertiesSig: String? = nil
     private var lastMediaTimelineSig: String? = nil
@@ -64,6 +69,8 @@ final class WEScript {
         self.sourceTag = tag
         // 纯局部检查(无 self):脚本是否用音频。供引擎决定采集音频 + 每帧喂频谱。
         self.usesAudio = script.contains("registerAudioBuffers") || script.contains("__audio")
+        // 纯局部检查:脚本是否运行时建层(thisScene.createLayer,音频条 64 根 bar)。
+        self.createsLayers = script.contains("createLayer")
 
         // JS 异常 → 记一笔并标记失败(update() 仍可能返回 undefined,调用方据 didFail/nil 回退)。
         // 只捕获引用盒(非 self),避免在所有存储属性初始化完成前引用 self。
@@ -79,12 +86,28 @@ final class WEScript {
         //    复杂脚本(console.log / setInterval / 读写 thisLayer 等)才不会因缺全局抛错回退。
         context.evaluateScript(WEScript.preludeSource)
 
-        // 0b) 注入 engine.canvasSize(WE 的渲染画布尺寸,这里用场景 orthogonalprojection w/h)。
-        //     WE 挂件容器/时钟/日期的 origin 脚本第一行就读 engine.canvasSize.x/y,缺它必抛 TypeError → 回退。
+        // 0b) 注入 engine.canvasSize + engine.screenResolution(WE 的渲染画布尺寸,这里用场景
+        //     orthogonalprojection w/h)。WE 挂件容器/时钟/日期/灵动岛/拖拽脚本第一行就读
+        //     engine.canvasSize.x/y 或 engine.screenResolution.x/y,缺任一必抛 TypeError →
+        //     整个时钟挂件脚本崩、时钟不显示。screenResolution 用画布尺寸作为合理值(脚本主要用它
+        //     做相对定位,画布即渲染区域;真实屏幕分辨率会被等比 cover 到画布,相对位置一致)。
         if let engine = context.objectForKeyedSubscript("engine"), engine.isObject {
             let cs: [String: Any] = ["x": canvas.x, "y": canvas.y]
             engine.setObject(cs, forKeyedSubscript: "canvasSize" as NSString)
+            engine.setObject(cs, forKeyedSubscript: "screenResolution" as NSString)
         }
+        // 0c) 注入 video 播放控制桩。视频图层(MP4 动态贴图)的可见性/播放控制脚本会读
+        //     video.isPlaying/duration/rate/getCurrentTime() 并调 play()/pause()/stop()/setCurrentTime()。
+        //     我方 VideoTexture 自管「一直播放 + 手动循环」,这里给个**恒在播放**的桩:让这类脚本不再因
+        //     缺 video 全局每帧抛 TypeError(刷日志),可见性脚本据 isPlaying=true 正常返回可见。方法均 no-op
+        //     (播放真由 VideoTexture 控,脚本的 start/end/speed 修剪暂不接,层照常全程播放)。
+        context.evaluateScript("""
+        var video = {
+          isPlaying: true, rate: 1.0, duration: 1e9,
+          play: function(){}, pause: function(){}, stop: function(){},
+          setRate: function(){}, setCurrentTime: function(){}, getCurrentTime: function(){ return 0; }
+        };
+        """)
 
         // 1) 注入 createScriptProperties shim + 覆盖表。shim 是纯 JS,链式 addX/finish。
         //    覆盖值通过原生注入的 __wePropOverrides 提供:finish() 时按 name 用覆盖替换默认。
@@ -99,11 +122,22 @@ final class WEScript {
 
         // 3) 取 update 句柄。注意:这是核心契约——文本/矢量脚本都靠 update(value) 的**返回值**
         //    模型(实测时钟脚本就是返回 string;别破坏)。update 缺失才判失败。
-        guard let fn = context.objectForKeyedSubscript("update"), !fn.isUndefined else {
-            Log.write("WEScript[\(tag)] no update() after eval")
+        // update 句柄。**纯 media 文本**(歌名/艺术家:无 update,只有 mediaPropertiesChanged)不能因缺
+        // update 丢弃 —— 否则 Now Playing 整组文本消失,正是用户报的"music name 没识别"。无 update **且**
+        // 无任何 media 回调才判失败。update 仍是时钟/矢量脚本的核心契约(返回值模型),有则照常用。
+        let updateCandidate = context.objectForKeyedSubscript("update")
+        let hasUpdate = updateCandidate.map { !$0.isUndefined } ?? false
+        // 显式接 ctx(不捕获 self):此时 self 的存储属性尚未全初始化,捕获 self 的闭包会触发
+        // Swift「self used before initialized」。同下方 grabFn 的写法。
+        func hasGlobalFn(_ ctx: JSContext, _ n: String) -> Bool {
+            guard let f = ctx.objectForKeyedSubscript(n) else { return false }
+            return !f.isUndefined && !f.isNull && f.isObject
+        }
+        guard hasUpdate || hasGlobalFn(context, "mediaPropertiesChanged") || hasGlobalFn(context, "mediaTimelineChanged") else {
+            Log.write("WEScript[\(tag)] no update() nor media callback after eval")
             return nil
         }
-        self.updateFn = fn
+        self.updateFn = hasUpdate ? updateCandidate : nil
 
         // 3b) 可选 init():部分复杂脚本把一次性初始化放在 init() 里(WE 生命周期首帧调一次)。
         //     时钟脚本没有 init,这里取到的就是 nil/undefined,不影响其返回值模型。
@@ -126,6 +160,11 @@ final class WEScript {
         self.mediaPropertiesChangedFn = grabFn(context, "mediaPropertiesChanged")
         self.mediaTimelineChangedFn = grabFn(context, "mediaTimelineChanged")
         self.mediaPlaybackChangedFn = grabFn(context, "mediaPlaybackChanged")
+        // 纯 media 驱动文本(歌名/艺术家):无 update(),只有 mediaPropertiesChanged 把 now-playing 写进
+        // thisLayer.text。这类层"当前字符串"由 dispatchMediaState 设、runString 读回 thisLayer.text,
+        // 失败时**不可**回退成时钟(它不是时钟层,见 TextLayerRenderer.currentString)。
+        self.isMediaDriven = !hasUpdate &&
+            (self.mediaPropertiesChangedFn != nil || self.mediaTimelineChangedFn != nil)
 
         // 解析后的属性快照(scriptProperties 是普通对象)。
         if let sp = context.objectForKeyedSubscript("scriptProperties"), sp.isObject,
@@ -141,8 +180,18 @@ final class WEScript {
     ///   - frametime:引擎本帧 sim dt(秒,对标 lwe `g_Time - g_TimeLast`);音频平滑等脚本依赖它。
     ///     传入时 engine.frametime 直接取此真实帧间隔;nil 时回退用 runtime 差近似。
     func runString(current: String, simTime: Double? = nil, frametime: Double? = nil) -> Result {
-        guard let fn = updateFn else { return .failed }
         didFail = false
+        // 纯 media 文本(歌名/艺术家):无 update()。now-playing 由 dispatchMediaState 写进 thisLayer.text,
+        // 这里直接读回(不需要 update 返回值)。无歌曲信息时 text 为空 → .failed 让调用方回退 pkg value/空。
+        if updateFn == nil {
+            if isMediaDriven, let layer = context.objectForKeyedSubscript("thisLayer"),
+               layer.isObject, let textVal = layer.objectForKeyedSubscript("text"), textVal.isString {
+                let s = textVal.toString() ?? ""
+                if !s.isEmpty { return .string(s) }
+            }
+            return .failed
+        }
+        let fn = updateFn!
         tickFrame(initArg: current, simTime: simTime, frametime: frametime)  // 刷新 engine.runtime/frametime/timeOfDay + 首帧 init(传当前值) + 跑 intervals
         guard let ret = fn.call(withArguments: [current]), !didFail else { return .failed }
         if ret.isString { return .string(ret.toString()) }
@@ -210,6 +259,77 @@ final class WEScript {
         guard let ret = fn.call(withArguments: [Double(current)]), !didFail else { return nil }
         if ret.isNumber { let d = ret.toDouble(); return d.isFinite ? Float(d) : nil }
         return nil
+    }
+
+    /// 把外部(3D 单-context 宿主跑出的)`shared` 快照合并进本脚本的 context。
+    /// 3D 场景:per-layer 2D 脚本各自独立 context、无 shared(读 shared.sun_D_real 等会抛错→文字空/位置错)。
+    /// 引擎在建好层后,把宿主算出的 shared(324 键:行星位置/角度/dock 屏幕坐标)注入每层脚本 → 文字/位置算得出。
+    func injectShared(_ json: String) {
+        guard !json.isEmpty, json != "{}" else { return }
+        context.setObject(json, forKeyedSubscript: "__injJSON" as NSString)
+        context.evaluateScript("(function(){try{var s=JSON.parse(__injJSON); if(typeof shared==='undefined'||!shared)shared={}; for(var k in s)shared[k]=s[k];}catch(e){}})()")
+    }
+
+    // MARK: - 运行时动态图层(thisScene.createLayer:音频条等脚本运行时生成的层)
+
+    /// 一根运行时动态图层(脚本 createLayer 出来的 bar)读回的变换。引擎据此多实例渲染同一 bar 模型。
+    /// origin/scale/angles 是 WE 对象空间(像素;与本层 originPx 同空间),alignment 是 'centre'/'bottom'/'top'。
+    struct DynamicBar {
+        var origin: SIMD3<Float>
+        var scale: SIMD3<Float>
+        var angles: SIMD3<Float>     // 此脚本 anglesY 滑块单位=度
+        var alignment: String
+    }
+
+    /// 把模板层(thisLayer)的真实场景 origin/scale/angles 注入,供脚本 `baseOrigin = thisLayer.origin` 读对。
+    /// 必须在首次 runDynamicBars(init)之前调用一次。
+    /// ⚠ 必须注入真正的 **Vec3 实例**(不是裸 {x,y,z} 对象):脚本 `baseOrigin = thisLayer.origin; baseOrigin.copy()`
+    ///   会调 Vec3.copy(),裸对象无此方法 → 抛异常被脚本 try/catch 吞掉 → 所有 bar 静止不更新。故用 JS new Vec3(...)。
+    func setTemplateLayerTransform(origin: SIMD3<Float>, scale: SIMD3<Float>, angles: SIMD3<Float>) {
+        guard let layer = context.objectForKeyedSubscript("thisLayer"), layer.isObject else { return }
+        context.evaluateScript("""
+        (function(){
+          if (typeof thisLayer === 'undefined' || !thisLayer) return;
+          thisLayer.origin = new Vec3(\(origin.x), \(origin.y), \(origin.z));
+          thisLayer.scale  = new Vec3(\(scale.x), \(scale.y), \(scale.z));
+          thisLayer.angles = new Vec3(\(angles.x), \(angles.y), \(angles.z));
+        })();
+        """)
+    }
+
+    /// 驱动一帧「动态层脚本」(音频条):首帧先跑 init()(建 bars 数组),再每帧跑 update()(按音频
+    /// 写各 bar 的 origin/scale/alignment),然后把 thisLayer + 所有 createLayer 出来的 bar 读回。
+    /// 返回每根 bar 的变换(含模板层 thisLayer 自身,index 0)。失败/异常 → 返回 nil(调用方回退不画条)。
+    /// - 调用方应先 setAudioSpectrum 喂当帧频谱、再调本方法;simTime/dt 透传给 engine.runtime/frametime。
+    func runDynamicBars(simTime: Double? = nil, frametime: Double? = nil) -> [DynamicBar]? {
+        guard createsLayers, let upd = updateFn else { return nil }
+        didFail = false
+        tickFrame(initArg: 0, simTime: simTime, frametime: frametime)  // 首帧 init() 建 bars + 跑 intervals
+        if didFail { return nil }
+        // __barList = [thisLayer, ...__createdLayers](顺序与脚本 bars.push 一致:模板在前,createLayer 在后)。
+        // 由原生重建(不依赖脚本是否自行维护),保证引擎读回顺序确定。
+        context.evaluateScript("globalThis.__barList = [globalThis.thisLayer].concat(globalThis.__createdLayers || []);")
+        _ = upd.call(withArguments: [])   // update() 是 void:就地改各 bar 的 scale/origin/alignment
+        if didFail { return nil }
+        guard let listVal = context.objectForKeyedSubscript("__barList"),
+              listVal.isObject, let arr = listVal.toArray() else { return nil }
+        var out: [DynamicBar] = []
+        out.reserveCapacity(arr.count)
+        for case let item as [String: Any] in arr {
+            func vec3(_ key: String, _ d: SIMD3<Float>) -> SIMD3<Float> {
+                guard let v = item[key] as? [String: Any] else { return d }
+                let x = (v["x"] as? NSNumber)?.floatValue ?? d.x
+                let y = (v["y"] as? NSNumber)?.floatValue ?? d.y
+                let z = (v["z"] as? NSNumber)?.floatValue ?? d.z
+                return SIMD3(x, y, z)
+            }
+            out.append(DynamicBar(
+                origin: vec3("origin", .zero),
+                scale: vec3("scale", SIMD3(1, 1, 1)),
+                angles: vec3("angles", .zero),
+                alignment: (item["alignment"] as? String) ?? "centre"))
+        }
+        return out.isEmpty ? nil : out
     }
 
     // MARK: - 音频频谱注入(审计修复 #1:最高优先)
@@ -405,7 +525,7 @@ final class WEScript {
     /// thisLayer / thisScene 桩,让复杂脚本不再因缺全局抛错回退。engine.runtime/frametime/
     /// timeOfDay 由 Swift 每帧(tickFrame)刷新;setInterval 注册的回调由 __weRunIntervals 每帧跑。
     /// 注意:这里**不**定义 createScriptProperties(由下面的 shimSource 定义,带 __wePropOverrides 覆盖)。
-    private static let preludeSource = """
+    static let preludeSource = """
     globalThis.__weNum = function(v, fallback) {
       var n = parseFloat(v);
       return Number.isFinite(n) ? n : fallback;
@@ -577,9 +697,35 @@ final class WEScript {
       color: new Vec4(1, 1, 1, 1), parallaxDepth: new Vec2(0, 0),
       getMaterial() { return null; }
     };
+    // 运行时动态建层:音频条脚本 init() 调 thisScene.createLayer 建 N 根 bar、getLayerIndex 取基准、
+    // sortLayer 排序。本引擎把这些 bar 当「同一模型的多实例」渲染(见 SceneRenderEngine 多实例路径),
+    // 故此处只需让脚本能建对象、读写其 origin/scale/angles/alignment,并把它们登记进 __barList 供 Swift 读回。
+    globalThis.__createdLayers = [];   // createLayer 出来的对象(不含模板 thisLayer)
+    globalThis.__barList = [];         // 引擎读回用:模板 thisLayer + 所有 createLayer 对象,按脚本 push 顺序
+    globalThis.__makeDynamicLayer = function(modelPath) {
+      // 与 thisLayer 同构的可读写层对象。脚本会写 origin/scale/angles/alignment;引擎读回这些。
+      return {
+        name: '', model: String(modelPath || ''),
+        visible: true, alpha: 1, text: '',
+        origin: new Vec3(0, 0, 0), scale: new Vec3(1, 1, 1), angles: new Vec3(0, 0, 0),
+        color: new Vec4(1, 1, 1, 1), parallaxDepth: new Vec2(0, 0),
+        alignment: 'centre',
+        getMaterial: function() { return null; }
+      };
+    };
     globalThis.thisScene = globalThis.thisScene || {
       getLayer(name) { return globalThis.__missingLayer; },
-      enumerateLayers() { return []; }
+      enumerateLayers() { return []; },
+      // 模板层 thisLayer 的索引基准。脚本只用其相对关系(getLayerIndex→sortLayer),返回稳定占位即可。
+      getLayerIndex(layer) { return 0; },
+      createLayer(modelPath) {
+        var obj = globalThis.__makeDynamicLayer(modelPath);
+        globalThis.__createdLayers.push(obj);
+        return obj;
+      },
+      // 把动态层排到 index 处。本引擎按 __barList 顺序统一画 bar,排序无额外语义 → no-op。
+      sortLayer(layer, index) {},
+      removeLayer(layer) {}
     };
     """
 
@@ -588,7 +734,7 @@ final class WEScript {
     /// 纯 JS 实现的 createScriptProperties():链式 addCheckbox/addSlider/addText/addColor/addCombo,
     /// finish() 返回一个对象,每个 name → 其值。值优先取 __wePropOverrides[name](图层/用户覆盖),
     /// 否则取该 addX 调用里的 value(脚本默认)。
-    private static let shimSource = """
+    static let shimSource = """
     var createScriptProperties = function() {
         var defs = {};
         var add = function(o) { if (o && o.name !== undefined) defs[o.name] = o.value; return builder; };
@@ -645,6 +791,14 @@ final class WEScript {
       };
       globalThis.thisScene.enumerateLayers = function() {
         return globalThis.__layerList || [];
+      };
+      // 真实层列表里查 layer 的索引(按对象引用,回退按 id);找不到返回 0(脚本只用相对关系)。
+      globalThis.thisScene.getLayerIndex = function(layer) {
+        var l = globalThis.__layerList || [];
+        for (var i = 0; i < l.length; i++) {
+          if (l[i] === layer || (layer && l[i] && l[i].id === layer.id)) return i;
+        }
+        return 0;
       };
     })();
     """

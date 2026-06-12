@@ -17,8 +17,11 @@ enum VideoFrame {
         let asset = AVURLAsset(url: tmp)
         let gen = AVAssetImageGenerator(asset: asset)
         gen.appliesPreferredTrackTransform = true   // 尊重视频自带的旋转/镜像
+        // 兜底帧**必须**取精确第 0 帧:`toleranceAfter = .positiveInfinity` 会返回最近可解的关键帧——
+        // 某些视频(如 WuWa×Cyberpunk 3737365345)开头/中间有「glitch 打码」帧,+∞ 容差正好抓到那帧当
+        // 静态底图 → 视频未稳定产帧时一直显示打码头(看似"人物头被东西挡住")。零容差取真正的首帧(清晰)。
         gen.requestedTimeToleranceBefore = .zero
-        gen.requestedTimeToleranceAfter = .positiveInfinity
+        gen.requestedTimeToleranceAfter = .zero
         guard let cg = try? gen.copyCGImage(at: .zero, actualTime: nil) else {
             Log.write("VideoFrame: copyCGImage failed (\(data.count) bytes)")
             return nil

@@ -25,6 +25,34 @@ struct WallpaperSettingsPanel: View {
         }
     }
 
+    /// 把可见属性按 WE 分组拼成有序渲染单元:顶层属性逐条 single,连续同组成员合成 group。
+    /// 属性已按 order 排序、同组成员连续(解析时按 order 归组),故顺扫即可。
+    private enum RenderUnit: Identifiable {
+        case single(WallpaperProperty)
+        case group(title: String, props: [WallpaperProperty])
+        var id: String {
+            switch self {
+            case .single(let p): return "s.\(p.id)"
+            case .group(let t, let ps): return "g.\(t).\(ps.first?.id ?? "")"
+            }
+        }
+    }
+    private var renderUnits: [RenderUnit] {
+        let props = visibleProperties
+        var units: [RenderUnit] = []
+        var i = 0
+        while i < props.count {
+            if let g = props[i].group {
+                var members: [WallpaperProperty] = []
+                while i < props.count, props[i].group == g { members.append(props[i]); i += 1 }
+                units.append(.group(title: g, props: members))
+            } else {
+                units.append(.single(props[i])); i += 1
+            }
+        }
+        return units
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             header
@@ -34,10 +62,16 @@ struct WallpaperSettingsPanel: View {
                 emptyState
             } else {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 16) {
-                        ForEach(props) { prop in
-                            PropertyControl(item: item, prop: prop, accent: accent,
-                                            onChange: { version += 1; onApply() })
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(renderUnits) { unit in
+                            switch unit {
+                            case .single(let prop):
+                                PropertyControl(item: item, prop: prop, accent: accent,
+                                                onChange: { version += 1; onApply() })
+                            case .group(let title, let members):
+                                PropertyGroupSection(item: item, title: title, props: members, accent: accent,
+                                                     onChange: { version += 1; onApply() })
+                            }
                         }
                     }
                     .padding(.horizontal, 18).padding(.vertical, 16)
@@ -85,7 +119,7 @@ struct WallpaperSettingsPanel: View {
             }
             .buttonStyle(.plain).foregroundStyle(.secondary)
             Spacer()
-            Text("\(visibleProperties.count) 项").font(.system(size: 11)).foregroundStyle(.tertiary)
+            Text("\(visibleProperties.filter { $0.type != .label }.count) 项").font(.system(size: 11)).foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 16).padding(.vertical, 12)
     }
@@ -174,7 +208,7 @@ struct PropertyControl: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                Slider(value: numberBinding(value), in: prop.sliderMin...prop.sliderMax).tint(accent)
+                Slider(value: numberBinding(value), in: prop.sliderRange).tint(accent)
             }
         case .combo:
             HStack {
@@ -191,7 +225,12 @@ struct PropertyControl: View {
                 TextField("", text: stringBinding(value)).textFieldStyle(.roundedBorder).font(.system(size: 12))
             }
         case .label:
-            EmptyView()
+            // type=None 说明文本(作者头/分节说明):次要文字,可换行,不可交互。
+            Text(prop.label)
+                .font(.system(size: 11))
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -216,6 +255,49 @@ struct PropertyControl: View {
     private func stringBinding(_ v: WallpaperProperty.Value) -> Binding<String> {
         Binding(get: { if case .string(let s) = v { return s }; return "" },
                 set: { store.setValue(.string($0), forID: item.id, propertyKey: prop.id); onChange() })
+    }
+}
+
+/// WE 分组(type='group'):可折叠的子菜单。标题 + 右侧 → 箭头,默认折叠,展开显示组内控件。
+/// 对齐 WE 属性面板:pkg 用 group 分类 → 我们也分类成折叠组;pkg 没分类 → 不会走到这里(全顶层)。
+struct PropertyGroupSection: View {
+    let item: WallpaperItem
+    let title: String
+    let props: [WallpaperProperty]
+    let accent: Color
+    var onChange: () -> Void
+
+    @State private var expanded = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.18)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 8) {
+                    Text(title).font(.system(size: 13, weight: .medium))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .multilineTextAlignment(.leading)
+                    Spacer(minLength: 6)
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundStyle(accent)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                VStack(alignment: .leading, spacing: 14) {
+                    ForEach(props) { p in
+                        PropertyControl(item: item, prop: p, accent: accent, onChange: onChange)
+                    }
+                }
+                .padding(.leading, 6)
+                .transition(.opacity.combined(with: .move(edge: .top)))
+            }
+        }
     }
 }
 
@@ -293,7 +375,7 @@ struct WallpaperSettingsView: View {
                             .foregroundStyle(.secondary)
                     }
                 }
-                Slider(value: numberBinding(prop, value), in: prop.sliderMin...prop.sliderMax)
+                Slider(value: numberBinding(prop, value), in: prop.sliderRange)
                     .tint(accent)
             }
         case .combo:

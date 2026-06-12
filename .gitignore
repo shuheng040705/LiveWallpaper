@@ -8,3 +8,6 @@ LiveWallpaper-bin
 ui_shot.png
 particle_check.png
 particle_preview.png
+
+# Claude Code 会话/agent 状态(不提交)
+.claude/

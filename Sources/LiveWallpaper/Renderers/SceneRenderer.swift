@@ -42,6 +42,16 @@ final class SceneRenderer: WallpaperRenderer {
         layer.colorspace = CGColorSpace(name: CGColorSpace.sRGB)
         layer.framebufferOnly = false   // M3 Max(TBDR):true 会让 drawable 留在压缩平铺显存,桌面合成时
                                          // 平铺边界可能泄漏成网格状黑线;false 强制解析为完整线性纹理。
+        // 内屏 120Hz ProMotion「3 分带」实验性修复(WP_SYNC_PRESENT gate):后台线程异步 present 与
+        //   WindowServer 合成不同步 → 撕裂成横向带。presentsWithTransaction + CATransaction 包裹的同步
+        //   present(见 SceneRenderEngine.render)。默认关(走旧异步路,稳);=1 时开启测试。上次没包
+        //   CATransaction 导致黑屏,这次补上。
+        if ProcessInfo.processInfo.environment["WP_SYNC_PRESENT"] == "1" || PreferencesStore.shared.syncPresent {
+            layer.presentsWithTransaction = true
+            layer.displaySyncEnabled = true        // 强制 vsync(默认本就 true,显式保证)
+            layer.maximumDrawableCount = 2          // 双缓冲(默认 3)——减少在途 drawable,避免合成抓到多帧
+            Log.write("SceneRenderer: 同步呈现(presentsWithTransaction+vsync+双缓冲+waitUntilCompleted)修内屏分带")
+        }
         layer.frame = host.bounds
         layer.contentsScale = host.window?.backingScaleFactor ?? 2.0
         host.layer?.addSublayer(layer)
@@ -58,6 +68,27 @@ final class SceneRenderer: WallpaperRenderer {
         Log.write(String(format: "drawable: bounds=%.0fx%.0f scale=%.2f(win=%@) drawableSize=%.0fx%.0f contentsScale=%.2f",
                          host.bounds.width, host.bounds.height, scale,
                          host.window == nil ? "nil" : "ok", size.width, size.height, layer.contentsScale))
+        // ⭐内屏「3 分带」诊断(实机跑一次,把 /tmp/livewallpaper.log 里 DISPLAY-DIAG 行发我):
+        //   采集这块屏的真实参数,判断分带是分辨率/缩放/native-vs-scaled/EDR/notch/刷新 哪一类。
+        if let scr = host.window?.screen {
+            let num = (scr.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value ?? 0
+            let nativeW = num != 0 ? CGDisplayPixelsWide(num) : 0
+            let nativeH = num != 0 ? CGDisplayPixelsHigh(num) : 0
+            var modeStr = "?"
+            if num != 0, let m = CGDisplayCopyDisplayMode(num) {
+                modeStr = "\(m.pixelWidth)x\(m.pixelHeight)px/\(m.width)x\(m.height)pt@\(Int(m.refreshRate))Hz"
+            }
+            let edr = scr.maximumExtendedDynamicRangeColorComponentValue
+            let potEDR = scr.maximumPotentialExtendedDynamicRangeColorComponentValue
+            var safe = "0"
+            if #available(macOS 12.0, *) { let i = scr.safeAreaInsets; safe = "\(Int(i.top))/\(Int(i.left))/\(Int(i.bottom))/\(Int(i.right))" }
+            Log.write(String(format: "DISPLAY-DIAG name=%@ id=%u frame=%.0fx%.0f visible=%.0fx%.0f back=%.2f maxFPS=%ld nativePx=%dx%d mode=%@ EDR=%.2f/%.2f safeAreaTLBR=%@ colorspace=%@",
+                             scr.localizedName, num,
+                             scr.frame.width, scr.frame.height, scr.visibleFrame.width, scr.visibleFrame.height,
+                             scr.backingScaleFactor, scr.maximumFramesPerSecond,
+                             nativeW, nativeH, modeStr, edr, potEDR, safe,
+                             (layer.colorspace?.name as String?) ?? "nil"))
+        }
     }
 
     private var loadedItem: WallpaperItem?
@@ -74,12 +105,14 @@ final class SceneRenderer: WallpaperRenderer {
         renderLock.lock()
         engine.load(document: doc, source: source)
         renderLock.unlock()
-        if engine.layerCount == 0 {
+        // 3D 透视场景(太阳系/土星)走 3D 模型路径,故意清空 2D layers——此时 layerCount=0 但**不是**加载失败,
+        // 有 3D 模型即成功。漏掉 has3DScene 会把 3D 场景误判为空、回退到静态预览图(土星显示成 2D 照片的真因)。
+        if engine.layerCount == 0 && !engine.has3DScene {
             Log.write("SceneRenderer: 0 layers decoded for \(item.id) → preview fallback")
             showFallback(item); return
         }
         loaded = true
-        Log.write("SceneRenderer: \(item.title) → \(engine.layerCount) gpu layers, animated=\(engine.isAnimated)")
+        Log.write("SceneRenderer: \(item.title) → \(engine.layerCount) gpu layers, 3D=\(engine.has3DScene), animated=\(engine.isAnimated)")
     }
 
     /// 就地重载场景文档(属性改动后),**不重建 Metal 层** → 无黑屏。
@@ -150,7 +183,14 @@ final class SceneRenderer: WallpaperRenderer {
         let t = now - startTime
 
         // 鼠标相对主屏中心归一化到 [-1,1](y 向上)。
-        let mouse = NSEvent.mouseLocation
+        // ⚠ 关键(xray/视差不跟鼠标真因):本 app 是 .accessory 菜单栏代理,桌面窗口 ignoresMouseEvents=true 且
+        //   canBecomeKey=false、全程无任何鼠标事件监视器 → 进程事件流为空 → `NSEvent.mouseLocation` 会**冻结**在
+        //   最后一次有焦点时的值(实测卡死在 (-0.74,-0.36) 数千帧不变)→ xray 的 g_PointerPosition 恒定、揭示框不动。
+        //   改用 CoreGraphics 全局硬件光标(windowserver 当前位置,不依赖本进程事件流);CG 是左上原点 y 向下,
+        //   转回 AppKit 左下原点 y 向上:y = 全局顶 - cg.y(用各屏 maxY 的最大值,兼容主屏上方还有显示器的布局)。
+        let cgLoc = CGEvent(source: nil)?.location ?? .zero
+        let globalTop = NSScreen.screens.map { $0.frame.maxY }.max() ?? 0
+        let mouse = NSPoint(x: cgLoc.x, y: globalTop - cgLoc.y)
         var mn = SIMD2<Float>(0, 0)
         if let screen = NSScreen.screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) ?? NSScreen.main {
             let f = screen.frame

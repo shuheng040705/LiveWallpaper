@@ -11,8 +11,7 @@ import CoreVideo
 final class VideoTexture {
     private let player: AVPlayer
     private let output: AVPlayerItemVideoOutput
-    private let looper: AVPlayerLooper?
-    private let queuePlayer: AVQueuePlayer
+    private var loopObserver: NSObjectProtocol?   // 播到结尾 → seek 回 0 重播(手动循环)
     private var textureCache: CVMetalTextureCache?
     private let device: MTLDevice
 
@@ -44,19 +43,25 @@ final class VideoTexture {
             kCVPixelBufferMetalCompatibilityKey as String: true
         ]
         output = AVPlayerItemVideoOutput(pixelBufferAttributes: attrs)
-        item.add(output)
+        item.add(output)   // output 绑在**真正播放的** item 上(见下:不再用 AVPlayerLooper)
 
-        // AVQueuePlayer + AVPlayerLooper 实现无缝循环。
-        queuePlayer = AVQueuePlayer()
-        queuePlayer.isMuted = true                 // 壁纸静音
-        queuePlayer.actionAtItemEnd = .advance
-        looper = AVPlayerLooper(player: queuePlayer, templateItem: item)
-        player = queuePlayer
+        // ⚠ 修复「视频卡在兜底帧/打码帧不动」真因:AVPlayerLooper 会**复制** templateItem 生成内部副本来
+        //   循环播放,实际播的是副本、而 output 绑在原模板 item 上 → output 永远收不到 pixelBuffer →
+        //   hasNewPixelBuffer 恒 false → currentTexture 一直返回静态兜底帧(某些视频首帧是 glitch 打码帧,
+        //   就一直显示打码头)。改用普通 AVPlayer + 手动循环(播到结尾 seek 回 0),output 绑在该 item 上能正常收帧。
+        let p = AVPlayer(playerItem: item)
+        p.isMuted = true                  // 壁纸静音
+        p.actionAtItemEnd = .none
+        player = p
+        loopObserver = NotificationCenter.default.addObserver(
+            forName: .AVPlayerItemDidPlayToEndTime, object: item, queue: .main) { [weak p] _ in
+            p?.seek(to: .zero); p?.play()
+        }
 
         CVMetalTextureCacheCreate(kCFAllocatorDefault, nil, device, nil, &textureCache)
         if textureCache == nil { Log.write("VideoTexture: CVMetalTextureCache create failed"); return nil }
 
-        queuePlayer.play()
+        p.play()
         Log.write("VideoTexture: playing \(width)x\(height) (\(data.count) bytes)")
     }
 
@@ -67,6 +72,7 @@ final class VideoTexture {
         avLock.lock()
         player.pause()
         avLock.unlock()
+        if let ob = loopObserver { NotificationCenter.default.removeObserver(ob) }
         try? FileManager.default.removeItem(at: tmpURL)
     }
 

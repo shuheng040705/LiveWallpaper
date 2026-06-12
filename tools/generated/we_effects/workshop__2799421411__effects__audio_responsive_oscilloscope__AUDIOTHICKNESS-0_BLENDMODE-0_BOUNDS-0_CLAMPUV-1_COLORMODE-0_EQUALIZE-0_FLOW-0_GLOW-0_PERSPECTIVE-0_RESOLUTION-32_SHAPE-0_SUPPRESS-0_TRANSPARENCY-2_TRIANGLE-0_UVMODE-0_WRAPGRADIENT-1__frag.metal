@@ -77,6 +77,13 @@ struct _Globals
     float u_suppressFade;
     float u_suppressOffset;
     float u_suppressEdges;
+    // 移植修复:audioValue 改在 frag 内计算(原 vert→frag 传 32×float4 interpolant,
+    // 总插值标量 136 > Metal 片元输入上限 → 静默丢失 → 波形恒 0 不显示)。把音频频谱直接喂进
+    // frag UBO,消除 32 个 audioValue interpolant。offset 与 manifest 的 frag uniforms 对齐。
+    float u_ampExponent;            // offset 164(material: "Amplitude exponent")
+    char _pad_audio[8];             // 对齐到 176(16 对齐,float4 数组起点)
+    float4 g_AudioSpectrum32Left[32];   // offset 176
+    float4 g_AudioSpectrum32Right[32];  // offset 688
 };
 
 struct main0_out
@@ -86,38 +93,7 @@ struct main0_out
 
 struct main0_in
 {
-    float4 audioValue_0 [[user(locn0)]];
-    float4 audioValue_1 [[user(locn1)]];
-    float4 audioValue_2 [[user(locn2)]];
-    float4 audioValue_3 [[user(locn3)]];
-    float4 audioValue_4 [[user(locn4)]];
-    float4 audioValue_5 [[user(locn5)]];
-    float4 audioValue_6 [[user(locn6)]];
-    float4 audioValue_7 [[user(locn7)]];
-    float4 audioValue_8 [[user(locn8)]];
-    float4 audioValue_9 [[user(locn9)]];
-    float4 audioValue_10 [[user(locn10)]];
-    float4 audioValue_11 [[user(locn11)]];
-    float4 audioValue_12 [[user(locn12)]];
-    float4 audioValue_13 [[user(locn13)]];
-    float4 audioValue_14 [[user(locn14)]];
-    float4 audioValue_15 [[user(locn15)]];
-    float4 audioValue_16 [[user(locn16)]];
-    float4 audioValue_17 [[user(locn17)]];
-    float4 audioValue_18 [[user(locn18)]];
-    float4 audioValue_19 [[user(locn19)]];
-    float4 audioValue_20 [[user(locn20)]];
-    float4 audioValue_21 [[user(locn21)]];
-    float4 audioValue_22 [[user(locn22)]];
-    float4 audioValue_23 [[user(locn23)]];
-    float4 audioValue_24 [[user(locn24)]];
-    float4 audioValue_25 [[user(locn25)]];
-    float4 audioValue_26 [[user(locn26)]];
-    float4 audioValue_27 [[user(locn27)]];
-    float4 audioValue_28 [[user(locn28)]];
-    float4 audioValue_29 [[user(locn29)]];
-    float4 audioValue_30 [[user(locn30)]];
-    float4 audioValue_31 [[user(locn31)]];
+    // audioValue 不再由 vert 传(见 _Globals 注释);只保留几何 interpolant。
     float3 v_PerspCoord [[user(locn60)]];
     float2 v_TexCoord [[user(locn61)]];
     float3 v_ViewCoord [[user(locn62)]];
@@ -140,39 +116,21 @@ float BlendTransparency(float base, float blend, float opacity)
 fragment main0_out main0(main0_in in [[stage_in]], constant _Globals& _46 [[buffer(0)]], texture2d<float> g_Texture0 [[texture(0)]], texture2d<float> g_Texture2 [[texture(1)]], sampler g_Texture0Smplr [[sampler(0)]], sampler g_Texture2Smplr [[sampler(1)]])
 {
     main0_out out = {};
+    // audioValue 在 frag 内计算(原 vert 逻辑搬过来):amp = L*0.5+R*0.5,powr(2*amp, ampExp+0.001)。
+    // 每像素同值(整层一致),与原 vert 输出 + 插值在直线/三角光栅下数学等价(audioValue 在 vert 三顶点相同)。
     spvUnsafeArray<float4, 32> audioValue = {};
-    audioValue[0] = in.audioValue_0;
-    audioValue[1] = in.audioValue_1;
-    audioValue[2] = in.audioValue_2;
-    audioValue[3] = in.audioValue_3;
-    audioValue[4] = in.audioValue_4;
-    audioValue[5] = in.audioValue_5;
-    audioValue[6] = in.audioValue_6;
-    audioValue[7] = in.audioValue_7;
-    audioValue[8] = in.audioValue_8;
-    audioValue[9] = in.audioValue_9;
-    audioValue[10] = in.audioValue_10;
-    audioValue[11] = in.audioValue_11;
-    audioValue[12] = in.audioValue_12;
-    audioValue[13] = in.audioValue_13;
-    audioValue[14] = in.audioValue_14;
-    audioValue[15] = in.audioValue_15;
-    audioValue[16] = in.audioValue_16;
-    audioValue[17] = in.audioValue_17;
-    audioValue[18] = in.audioValue_18;
-    audioValue[19] = in.audioValue_19;
-    audioValue[20] = in.audioValue_20;
-    audioValue[21] = in.audioValue_21;
-    audioValue[22] = in.audioValue_22;
-    audioValue[23] = in.audioValue_23;
-    audioValue[24] = in.audioValue_24;
-    audioValue[25] = in.audioValue_25;
-    audioValue[26] = in.audioValue_26;
-    audioValue[27] = in.audioValue_27;
-    audioValue[28] = in.audioValue_28;
-    audioValue[29] = in.audioValue_29;
-    audioValue[30] = in.audioValue_30;
-    audioValue[31] = in.audioValue_31;
+    {
+        spvUnsafeArray<float, 32> audioData;
+        for (int ai = 0; ai < 32; ai++)
+        {
+            float amplitude = (_46.g_AudioSpectrum32Left[ai].x * 0.5) + (_46.g_AudioSpectrum32Right[ai].x * 0.5);
+            audioData[ai] = powr(amplitude + amplitude, _46.u_ampExponent + 0.001000000047497451305389404296875);
+        }
+        for (int ai = 0; ai < 32; ai += 4)
+        {
+            audioValue[ai >> 2] = float4(audioData[ai], audioData[ai + 1], audioData[ai + 2], audioData[ai + 3]);
+        }
+    }
     float2 ratio = float2(_46.g_Texture0Resolution.x / _46.g_Texture0Resolution.y, 1.0);
     float2 rotation = float2(sin(_46.u_direction), cos(_46.u_direction));
     float scope = round(_46.u_scope + _46.u_scope);

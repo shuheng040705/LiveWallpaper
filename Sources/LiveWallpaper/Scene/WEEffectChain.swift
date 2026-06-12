@@ -77,6 +77,12 @@ final class WEEffectChain {
     private let samplerNearest: MTLSamplerState        // clamp  + nearest(NoInterpolation + ClampUVs)
     private let samplerRepeatNearest: MTLSamplerState  // repeat + nearest(NoInterpolation,无 ClampUVs)
     private let manifest: [String: EffectDef]
+    /// basename(最后一段) → manifest 实际 key。用于 workshop 副本特效回退:WE 上传时把特效复制到
+    /// `workshop/<id>/…/<name>` 路径,manifest 里同名特效的 key 各带不同 workshop 前缀(甚至双层嵌套,
+    /// 如 audio_bars 的 `workshop/3299008209/workshop/2084198056/Simple_Audio_Bars`)。同 basename = 同一
+    /// 特效副本(shader 相同),按 basename 索引到任意已转译的同名 key → 一次性识别全库所有副本(尤其音频条)。
+    /// 取最短路径 key(最接近"通用"),排除 material/ 前缀(材质另走路径)。
+    private let basenameIndex: [String: String]
 
     /// 按 WE 纹理 flags 选采样器:ClampUVs→clamp 否则 repeat;NoInterpolation→nearest 否则 linear。
     /// flags=nil(无真实 flags 可用)→ 保守用 clamp+linear(改动前默认),不破坏现有渲染。
@@ -94,6 +100,7 @@ final class WEEffectChain {
     private var libCache: [String: MTLLibrary] = [:]          // metal 文件 → library
     private var pipeCache: [String: MTLRenderPipelineState] = [:]
     private var pipeFailed: Set<String> = []                 // 建管线失败的 key:负缓存,避免每帧重试+刷日志
+    private var diagLogged: Set<String> = []                 // 诊断:无变体/无manifest 每组合只打一行
     private var rtPool: [String: MTLTexture] = [:]            // 命名 FBO
     private let quadBuf: MTLBuffer                            // 全屏 quad: pos.xyz + uv.xy
     private let whiteTex: MTLTexture                          // 1x1 白:兜底
@@ -196,7 +203,11 @@ final class WEEffectChain {
         self.whiteTex = wt
 
         // manifest:优先 app bundle,回退到开发目录 Tools/generated。
+        // 诊断钩子 WP_MANIFEST_DIR=<dir>:强制从指定目录读 WEEffects.json + we_effects/(隔离 worktree 验证,
+        // 绕过 Bundle.main 落到 /Applications 的部署版)。未设=正常行为。
+        let envDir = ProcessInfo.processInfo.environment["WP_MANIFEST_DIR"]
         let candidates = [
+            envDir.map { URL(fileURLWithPath: $0).appendingPathComponent("WEEffects.json") },
             Bundle.main.resourceURL?.appendingPathComponent("WEEffects.json"),   // bundle: 与 we_effects/ 同级
             URL(fileURLWithPath: NSString(string: "~/Developer/LiveWallpaper/Tools/generated/WEEffects.json").expandingTildeInPath)
         ].compactMap { $0 }
@@ -206,6 +217,25 @@ final class WEEffectChain {
             Log.write("WEEffectChain: manifest 未找到/解析失败"); return nil
         }
         self.manifest = m
+        // basename → combo 覆盖最全的 key(排除 material/)。同 basename 多个 workshop 副本(WE 复制),
+        // 各自转译的变体集不同(某 Simple_Audio_Bars 副本含 TRANSPARENCY=4 变体、另一个全空)。选**变体里
+        // distinct combo 赋值最多**的,才能匹配壁纸 combo;否则退化默认 shader → 音频条白方块。平局取最短。
+        func comboCoverage(_ key: String) -> Int {
+            guard let d = m[key] else { return 0 }
+            var s = Set<String>()
+            for v in d.variants { for (ck, cv) in v.combos { s.insert("\(ck)=\(cv)") } }
+            return s.count
+        }
+        var idx: [String: String] = [:]
+        for k in m.keys where !k.hasPrefix("material/") {
+            let base = k.components(separatedBy: "/").last ?? k
+            if let cur = idx[base] {
+                let cc = comboCoverage(cur), kc = comboCoverage(k)
+                if cc > kc || (cc == kc && cur.count <= k.count) { continue }
+            }
+            idx[base] = k
+        }
+        self.basenameIndex = idx
         self.mslDir = mfURL.deletingLastPathComponent().appendingPathComponent("we_effects")
         // bundle 布局:WEEffects.json 与 we_effects/ 同级 or 内部?生成时 .metal 在 we_effects/ 子目录,
         // json 在 generated/ 根。开发路径:
@@ -213,12 +243,27 @@ final class WEEffectChain {
     }
 
     var availableEffects: Set<String> { Set(manifest.keys) }
-    func has(_ effect: String) -> Bool { manifest[effect] != nil }
+
+    /// 解析 effect 名到实际 manifest key。WE 把内置特效(tint/spin/blurprecise/opacity/blend…)上传时
+    /// **复制**到 `workshop/<id>/<name>` 路径(shader 与内置完全相同)。该副本若没单独转译进 manifest
+    /// (如山田 3741334342 的 workshop/2978738836/tint 红框/唱片特效全缺),回退到通用 `<name>` 转译。
+    /// **原 key 优先**(已转译的 workshop 副本不受影响)→ 零回归,只补缺失的内置副本。
+    /// 仅对 `workshop/<id>/<basename>` 形式回退;真自定义特效(basename 不在 manifest)仍判缺失。
+    func resolvedKey(_ effect: String) -> String? {
+        if manifest[effect] != nil { return effect }
+        if ProcessInfo.processInfo.environment["WP_NO_FX_FALLBACK"] != nil { return nil }   // A/B 诊断:关 basename 回退
+        // workshop 副本(含双层嵌套 wrapper)→ 按 basename 索引到已转译的同名特效。
+        // 仅对带路径的(workshop/… 或 effects 子路径)回退;裸名已在上面查过 manifest[effect]。
+        guard effect.contains("/") else { return nil }
+        let base = effect.components(separatedBy: "/").last ?? effect
+        return basenameIndex[base]
+    }
+    func has(_ effect: String) -> Bool { resolvedKey(effect) != nil }
 
     /// 该 effect 是否有采样器默认绑定 WE 渲染目标(_rt_*,如 frame_builder 的 _rt_FullFrameBuffer)。
     /// 命中则引擎需提供「该层之下已合成场景」底图喂 run(frameBuffer:),否则该槽退白 → 冲白。
     func needsFrameBuffer(_ effect: String) -> Bool {
-        guard let e = manifest[effect] else { return false }
+        guard let key = resolvedKey(effect), let e = manifest[key] else { return false }
         for v in e.variants {
             for p in v.passes {
                 for (_, m) in p.uniformMeta {
@@ -236,7 +281,7 @@ final class WEEffectChain {
     /// shader(2846660316 SHAPE 系、audioline、各 Simple_Audio_Bars)恒返回 false → 不采集音频 → 条恒 0 不绘制。
     /// 这是「很多壁纸音频条根本不出现」的系统性真因(对照 lwe:CPass 对每个 pass 无条件绑 g_AudioSpectrum)。
     func usesAudioSpectrum(_ effect: String) -> Bool {
-        guard let e = manifest[effect] else { return false }
+        guard let key = resolvedKey(effect), let e = manifest[key] else { return false }
         for v in e.variants {
             for p in v.passes {
                 for (name, _) in p.uniformMeta where name.hasPrefix("g_AudioSpectrum") { return true }
@@ -428,9 +473,12 @@ final class WEEffectChain {
         vd.attributes[1].format = .float2; vd.attributes[1].offset = 12; vd.attributes[1].bufferIndex = 1
         vd.layouts[1].stride = 20
         d.vertexDescriptor = vd
-        guard let ps = try? device.makeRenderPipelineState(descriptor: d) else {
+        let ps: MTLRenderPipelineState
+        do {
+            ps = try device.makeRenderPipelineState(descriptor: d)
+        } catch {
             pipeFailed.insert(key)   // 负缓存:只记一次,不再每帧重试/刷日志
-            Log.write("WEEffectChain: pipeline fail \(key)"); return nil
+            Log.write("WEEffectChain: pipeline fail \(key) ERROR: \(error)"); return nil
         }
         pipeCache[key] = ps; return ps
     }
@@ -536,7 +584,8 @@ final class WEEffectChain {
     private func buildUniforms(_ stage: StageDef, meta: [String: UniformMeta],
                                pkgParams: [String: Any], time: Float, cursor: SIMD2<Float>,
                                texW: Int, texH: Int, sceneW: Int, sceneH: Int,
-                               audio: AudioSpectrum) -> [UInt8] {
+                               audio: AudioSpectrum,
+                               auxResolutions: [String: SIMD4<Float>] = [:]) -> [UInt8] {
         // 数组 uniform 要把 offset+元素数×步长 都算进上界(否则数组尾巴越界)。
         var size = 16
         for u in stage.uniforms {
@@ -573,7 +622,10 @@ final class WEEffectChain {
                     vals = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]
                 } else if u.name == "g_PointerPosition" || u.name == "g_ParallaxPosition" {
                     // WE 交互 pointer / 视差位置,归一化 [0,1]。静止居中 = (0.5,0.5)(中性,无偏移)。
-                    vals = [cursor.x, cursor.y]
+                    // ⚠ Y 轴约定:lwe(CScene.cpp:387 `mouseY = 1.0 - normalizedMouseY`)把 g_PointerPosition.y 存成
+                    //   **y 向下**(屏幕顶=0);xray.vert 也假设 y 向下(自带 `pointer.y = 1.0 - pointer.y`)。本引擎
+                    //   cursor.y 是 y 向上 → 这里翻 Y 对齐 lwe,否则揭示框竖直镜像(鼠标往上→揭示往下)。居中仍 0.5。
+                    vals = [cursor.x, 1.0 - cursor.y]
                 } else if u.name == "g_Time" {
                     vals = [time]
                 } else if u.name == "g_TexelSize" {
@@ -583,7 +635,15 @@ final class WEEffectChain {
                 } else if u.name == "g_TexelSizeHalf" {
                     vals = [0.5 / Float(max(1, sceneW)), 0.5 / Float(max(1, sceneH))]
                 } else if u.name.hasSuffix("Resolution") {
-                    vals = [Float(texW), Float(texH), Float(texW), Float(texH)]
+                    // freeimage(内嵌 PNG)且容器≠内容的辅助贴图:按 .tex 头喂(容器w,h,内容w,h)= 真 WE 行为
+                    // (WE 的 GPU 纹理是 FreeImage 解的内容尺寸,但分辨率仍报头部 → 修正系数 内容/容器 把 UV
+                    //  压到内容上半部;lwe CTexture.cpp:127 对 FIF 特判修正=1 ≠ 真 WE。御剑「影子」遮罩
+                    //  4096×4096容器/4096×2296内容 → 遮罩只采上 56%(发顶)→ 身体音频条从发缘起、不上脸)。
+                    if let r = auxResolutions[u.name] {
+                        vals = [r.x, r.y, r.z, r.w]
+                    } else {
+                        vals = [Float(texW), Float(texH), Float(texW), Float(texH)]
+                    }
                 } else if u.name == "g_Screen" {
                     // 屏幕尺寸 vec3(w,h,aspect);depthparallax vert 声明但未用,给真实值无害。
                     vals = [Float(texW), Float(texH), Float(texW) / Float(max(1, texH))]
@@ -617,13 +677,26 @@ final class WEEffectChain {
             if let n = v as? NSNumber { return n.intValue == Int(n.doubleValue) ? "\(n.intValue)" : "\(n.floatValue)" }
             return "\(v)"
         }
-        // 精确匹配(变体 combos == 请求 combos 的交集)。
+        // 精确匹配(变体每个 combo 都被请求满足)优先,命中数越多越好。空变体作 score 0 兜底。
         var best: Variant? = nil; var bestScore = -1
         for v in def.variants {
             if v.combos.isEmpty { if bestScore < 0 { best = v; bestScore = 0 }; continue }
-            // 变体的每个 combo 都被请求满足才算命中,命中数越多越好。
             let ok = v.combos.allSatisfy { want[$0.key] == $0.value }
             if ok && v.combos.count > bestScore { best = v; bestScore = v.combos.count }
+        }
+        // 部分匹配兜底:精确匹配只剩空变体(bestScore==0,丢掉所有 combo 逻辑)时,与其退化到默认 shader
+        // (常使关键 combo 如 TRANSPARENCY 失效 → 音频条 composelayer 渲成**不透明白方块**盖住场景,黑猫 Bar2:
+        // SHAPE=1/TRANSPARENCY=4/无ANTIALIAS,而所有 TRANSPARENCY=4 变体都带 ANTIALIAS=1 → 精确不命中),
+        // 不如选「满足请求的 combo 数 − 违反的 combo 数」最高的变体:多余的次要 combo(ANTIALIAS)被忽略,
+        // 但关键 combo(TRANSPARENCY/BLENDMODE)保住 → 透明合成,白方块消失。WP_NO_PARTIAL_VARIANT=1 退回。
+        if bestScore <= 0, ProcessInfo.processInfo.environment["WP_NO_PARTIAL_VARIANT"] == nil {
+            var partial: Variant? = nil; var ps = 0
+            for v in def.variants where !v.combos.isEmpty {
+                let sat = v.combos.filter { want[$0.key] == $0.value }.count
+                let score = sat - (v.combos.count - sat)   // 满足 − 违反
+                if sat > 0 && score > ps { partial = v; ps = score }
+            }
+            if let p = partial { return p }
         }
         return best ?? def.variants.first
     }
@@ -670,6 +743,7 @@ final class WEEffectChain {
     /// nil(普通特效层 / 后处理链)→ 行为与改动前完全一致(input 即特效输入,FBO=input 尺寸,首 pass 全 [0,1])。
     func run(effect: String, input: MTLTexture, pkgParams: [String: Any],
              combos: [String: Any] = [:], auxTextures: [String: MTLTexture] = [:],
+             auxResolutions: [String: SIMD4<Float>] = [:],
              maskTexture: MTLTexture? = nil,
              texFlags: [String: TexFlags] = [:],
              paramsPerPass: [[String: Any]] = [], time: Float,
@@ -678,7 +752,19 @@ final class WEEffectChain {
              frameBuffer: MTLTexture? = nil,
              sceneFootprint: (mvp: simd_float4x4, outW: Int, outH: Int)? = nil,
              commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
-        guard let edef = manifest[effect], let def = selectVariant(edef, combos: combos) else { return nil }
+        guard let key = resolvedKey(effect), let edef = manifest[key], let def = selectVariant(edef, combos: combos) else {
+            // 一次性诊断:manifest 缺失或变体不命中(静默失败的头号嫌疑),打出请求 combos vs 可用变体。
+            let dk = "\(effect)|\(Self.comboInts(combos))"
+            if diagLogged.insert(dk).inserted {
+                if let edef = manifest[effect] {
+                    let avail = edef.variants.map { $0.combos }.prefix(8)
+                    Log.write("WEFX-DIAG no-variant effect=\(effect) 请求combos=\(combos) 可用=\(Array(avail))")
+                } else {
+                    Log.write("WEFX-DIAG no-manifest effect=\(effect)")
+                }
+            }
+            return nil
+        }
         // 特效链的工作输入 + 尺寸。frameBufferInput composelayer:先跑 composelayer copy pass(忠实 lwe 首
         // copy pass),把完整场景按该层 footprint 采样进层尺寸 FBO,作为后续特效链输入(named["previous"] 即它)。
         var input = input
@@ -807,10 +893,22 @@ final class WEEffectChain {
 
             // 逐 pass 参数优先(bloom 各 pass strength 可不同);否则合并版。
             let params: [String: Any] = (pi < paramsPerPass.count) ? paramsPerPass[pi] : pkgParams
-            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio)
-            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio)
-            enc.setVertexBytes(&vu, length: vu.count, index: vstage.ubuf)
-            enc.setFragmentBytes(&fu, length: fu.count, index: fstage.ubuf)
+            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio, auxResolutions: auxResolutions)
+            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio, auxResolutions: auxResolutions)
+            // 大 UBO 走 MTLBuffer:setVertex/FragmentBytes 适合小块常量数据,实测本机对 ~3.6KB 的 UBO 上传会丢数据
+            //   (audio_base 的 g_AudioSpectrum16/32/64 Left/Right 全段 → frag UBO 3664 字节,用 setFragmentBytes 后
+            //    shader 读到的频谱恒 0、音频线完全不动;改 makeBuffer+setBuffer 后正常响应)。audioline(2112 字节)
+            //   仍 OK,但统一以 2048 字节为界:超过即用 MTLBuffer(Metal 持有到命令缓冲完成,安全),小块仍走 setBytes 省分配。
+            if vu.count > 2048, let vb = device.makeBuffer(bytes: &vu, length: vu.count, options: .storageModeShared) {
+                enc.setVertexBuffer(vb, offset: 0, index: vstage.ubuf)
+            } else {
+                enc.setVertexBytes(&vu, length: vu.count, index: vstage.ubuf)
+            }
+            if fu.count > 2048, let fbuf = device.makeBuffer(bytes: &fu, length: fu.count, options: .storageModeShared) {
+                enc.setFragmentBuffer(fbuf, offset: 0, index: fstage.ubuf)
+            } else {
+                enc.setFragmentBytes(&fu, length: fu.count, index: fstage.ubuf)
+            }
 
             // 输入纹理:g_Texture0 = 主输入;g_TextureN(N>0)= 命名 bind(如 apply 的 g_Texture2=previous)
             // 或 auxTextures(mask 等);缺省 util 默认贴图,再缺省退白(效果全开)。

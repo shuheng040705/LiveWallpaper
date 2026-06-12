@@ -10,6 +10,7 @@ struct ParticleEmitterDesc {
     var distanceMin: Float
     var distanceMax: Float
     var startTime: Float
+    var sceneObjIndex: Int = .max   // scene.json objects 数组下标(粒子按场景序与图层交错绘制的锚点)
 
     // 发射器形状:boxrandom(盒内对称采样,沿 directions 喷)vs sphererandom(球面/圆盘散开)。
     var isBox: Bool = false
@@ -20,9 +21,14 @@ struct ParticleEmitterDesc {
     var distanceMaxVec: SIMD3<Float> = SIMD3(256, 256, 0)
     // directions 方向偏置(WE 默认 (1,1,0));box/sphere spawn 时乘进随机位移(box 额外翻 Y)。
     var directionsVec: SIMD3<Float> = SIMD3(1, 1, 0)
-    // 顶层粒子 flags(非发射器 flags):bit 2 (==4) 决定 sphere 用 3D 球壳(置位)还是 2D 圆盘(清零)。
-    // 对照 CParticle.cpp:599 (m_particle.flags & 4)。
+    // 顶层粒子 flags(非发射器 flags):bit 2 (==4) = 透视粒子系统。发射用 3D 球壳(置位)而非 2D 圆盘
+    // (CParticle.cpp:599),且**渲染换透视投影**:perspective(fov,aspect,near0,far1000)·lookAt(eye(0,0,1000)→
+    // 屏幕中心)替换正交 VP(CParticle.cpp:1883-1896),顶点在投影前扩展 → 近(z→1000)大且快、远小且慢
+    // =「透视雪」景深(snowperspective 预设的本体)。等效 CPU 公式见 instances()。
     var particleFlags: UInt32 = 0
+    // 画布像素尺寸 + 场景相机 fov(WallpaperParser.cpp:77 默认 50°):flags&4 透视换算屏幕居中坐标用。
+    var canvasSize = SIMD2<Float>(1920, 1080)
+    var cameraFov: Float = 50
     // emitter.sign(ivec3,默认 0):每轴强制正负。1→abs(只正)、-1→-abs(只负)、0→保持。
     // 仅 sphere spawn 用(照 CParticle.cpp:636-643)。
     var emitterSign: SIMD3<Int32> = .zero
@@ -141,11 +147,25 @@ struct ParticleEmitterDesc {
     var oscPositions: [OscPos] = []
     // controlpointattract 算子:阈值内朝控制点恒力吸引。threshold = thresholdRaw/2;
     // dist∈(0.001, threshold) 时 vel += (toCenter/dist)·scale·dt·speedOverride。scale<0 = 排斥。
-    // 中心 = controlpoint[index].offset + op.origin(WE 用 operator 的 `controlpoint` 整数索引指向粒子层
-    // controlpoint[] 数组的某项 offset;之前误用固定 emitterOrigin → 锚点错位)。一层可有 2~4 个 attract
-    // (各自不同 cp/scale/threshold)→ 用数组保真。默认 origin (0,0,0) / scale 100 / threshold 1000。
-    // 对照 CParticle.cpp:1462-1505 + ObjectParser.cpp:962-966。
-    struct CPAttract { var center: SIMD3<Float>; var scale: Float; var threshold: Float }
+    // ── 控制点语义(2026-06-11,Postscript 鸟群"贴顶飞"真因修复)──────────────────────────────
+    //   cp flags&1 = linkMouse(位置=光标,运行期解析);flags&2 = worldSpace(offset 是**场景世界坐标**,
+    //   lwe CParticle.cpp:152-163);scene 对象 instanceoverride 的 "controlpointN" = 该控制点的**世界坐标覆盖**
+    //   (作者摆的飞行路径锚点;lwe 的 instanceOverride 结构根本没有 controlpointN 字段 = lwe 缺口)。
+    //   优先级:io 覆盖 > worldSpace offset > 局部 offset。世界坐标 → 层局部:(world − layerOrigin)/layerScale。
+    //   旧实现忽略 io+flags → 把斥力点(Bird cp2/3/4 offset 全 (0,-500))叠在出生点旁,鸟被推着贴顶飞;
+    //   io 真值 (1032,1074)/(1754,1218)/(1644,99) = 封顶部+封右下 → 中部走廊 = WE 的鸟飞中间。
+    //   对照 CParticle.cpp:1462-1505 + ObjectParser.cpp:962-966。
+    struct CPAttract {
+        var cpId: Int = 0
+        var linkMouse: Bool = false
+        var worldSpace: Bool = false          // cp flags&2:offset 为场景世界坐标
+        var offset: SIMD3<Float> = .zero      // controlpoint[].offset(局部或世界,见 worldSpace)
+        var ioWorld: SIMD3<Float>? = nil      // instanceoverride.controlpointN(场景世界坐标,优先)
+        var originOff: SIMD3<Float> = .zero   // operator.origin(加到最终中心上)
+        var scale: Float
+        var threshold: Float
+        var center: SIMD3<Float> = .zero      // 解析后的层局部中心(applyObjectLayer 求好;linkMouse 运行期用光标)
+    }
     var cpAttracts: [CPAttract] = []
     // remapvalue 算子。**lwe 根本没有 remapvalue**(穷尽搜 src/WallpaperEngine:setupOperators 分发表无、
     // CParticle.cpp/.h/Data/Parsers 全无;唯一的 "remap" 命中是 TextureMap 与 External/spirv-remap,非粒子逻辑)。
@@ -193,6 +213,7 @@ struct ParticleEmitterDesc {
     var layerScale: SIMD2<Float> = SIMD2(1, 1)  // 图层各轴独立缩放(各向异性层如雨水花 (0.848,0.10))
     var layerAngleZ: Float = 0             // 图层 Z 旋转(WE angles,弧度);雨层 -0.145 → 雨丝斜下
     var layerAlpha: Float = 1              // instanceoverride.alpha(图层级整体透明度)
+    var parallaxDepth: SIMD2<Float> = SIMD2(1, 1)  // 鼠标视差深度(WE parallaxDepth);粒子层照图像层同公式平移投影
     var texturePath: String?    // pkg 内实际 .tex 路径(若存在)
     var textureName: String?    // 材质引用的纹理基名
     var normalTexturePath: String?  // 法线贴图 pkg 内路径(折射粒子 textures[1])
@@ -274,6 +295,10 @@ private struct Particle {
     var oscSFreq: Float = 0, oscSPhase: Float = 0
     // oscillateposition 逐粒子状态:**每个 oscPositions 配置一套**(支持多个 oscillateposition 各自独立摆动)。
     var oscPState: [OscPState] = []
+    // ropetrail 逐粒子位置历史(world 画布像素,index 0=最新)。WE ropetrail 真义:每粒子保留若干历史点
+    // 连成**自己的**独立拖尾(lwe Object.h:507「segments: number of history segments per particle」),
+    // 而非把全部活粒子连成一条链。仅 isRopeTrail 维护;其余渲染器恒空。
+    var hist: [SIMD2<Float>] = []
 }
 
 /// 单个 oscillateposition 配置的逐粒子随机状态(每个配置 spawn 时独立随机一次)。
@@ -375,28 +400,38 @@ final class ParticleSimulator {
         return startValue + t * (endValue - startValue)
     }
 
-    /// 精灵表当前帧(照 CParticle.cpp:304-328)。animSpeed = sequenceMultiplier(>0,否则 1)。
-    /// randomframe → 每粒子固定随机帧;once → floor(lifePos·n·speed) clamp 到 n-1(播一遍);
-    /// 默认 sequence → fmod(lifePos·n·speed, n) 循环播放。f = age/life = lifetimePos。
+    /// 精灵表当前帧。f = age/life = lifetimePos。
+    /// 【WE 真义(2026-06-11 shader 铁证)】帧 = floor(frac(生命比 × sequencemultiplier) × n):
+    /// 精灵表在粒子**一生中恰好循环 sequencemultiplier 次**,与 .tex 帧时长/实时 Hz 无关。
+    /// 证据:genericparticle.vert:94 `ComputeSpriteFrame(frac(in_ParticleLifeTime),…)` 对 lifetime 属性取
+    /// **frac()**——若 CPU 喂普通 [0,1) 生命比则 frac 是空操作;frac 存在的唯一理由=喂入值会超 1,
+    /// 即 生命比×seqMult(鸟:0→30),frac 逐圈回绕 → 整生命循环 30 次 = 25s/30 ≈ 1.2Hz 自然扇翅 ✓。
+    /// 曾两版皆错:①lwe 实时 age×seqMult/frameDuration(CParticle.cpp:279)→ 30Hz,60fps 下每渲染帧跳
+    /// 8 精灵帧=翅膀抖动(用户报「翅膀幅度不对」);②「原生帧率」忽略 seqMult(丢 pkg 字段,碰巧
+    /// 1Hz≈1.2Hz 近似对)。seqMult 缺省 1 = 整生命播一遍(水花等一次性动画的自然语义)。
+    /// WP_SEQ_LWE=1 退回 lwe 实时循环(A/B 诊断)。
     private func frameIndex(p: Particle, f: Float, n: Int) -> Int {
         if randomFrameMode || desc.animationMode == "randomframe" {
             return p.frame % n                      // spawn 时定的随机帧,整生命不变
         }
-        let animSpeed = desc.sequenceMultiplier > 0 ? desc.sequenceMultiplier : 1
-        if desc.animationMode == "once" {
-            return min(Int(f * Float(n) * animSpeed), n - 1)   // 播一遍并停在末帧(用 lifetimePos)
+        let seqMult = desc.sequenceMultiplier > 0 ? desc.sequenceMultiplier : 1
+        if ProcessInfo.processInfo.environment["WP_SEQ_LWE"] != nil {
+            let frame = p.age * seqMult / frameDuration
+            let idx = Int(frame.truncatingRemainder(dividingBy: Float(n)))
+            return idx < 0 ? idx + n : idx
         }
-        // 【审计修复 H1】默认 sequence 是**固定实时循环**(lwe CParticle.cpp:318-322 fmod(age×speed, 时长)),
-        // 不是按寿命拉伸。每帧 frameDuration 秒 → 帧号 = fmod(age×speed / frameDuration, n)。
-        // 旧实现用 age/life × n(整生命播一遍)→ 短命粒子狂闪、长命粒子爬行,与原版播放速度全错。
-        let frame = p.age * animSpeed / frameDuration
-        let idx = Int(frame.truncatingRemainder(dividingBy: Float(n)))
-        return idx < 0 ? idx + n : idx
+        if desc.animationMode == "once" {
+            return min(Int(f * Float(n) * seqMult), n - 1)   // 播一遍并停在末帧(用 lifetimePos)
+        }
+        let cycle = max(0, (f * seqMult).truncatingRemainder(dividingBy: 1))   // frac(生命比×seqMult)
+        return min(Int(cycle * Float(n)), n - 1)
     }
 
-    /// 推进 dt 秒。time = 自场景开始的总时间(用于 startTime 延迟)。
+    /// 推进 dt 秒。time = 自场景开始的总时间(turbVelRand 噪声相位用)。
+    /// starttime ≠ 延迟:WE 语义是「跳进模拟」(加载即呈现已运行 starttime 秒的稳态,由 warmup 实现),
+    /// 运行期不做任何延迟门控。曾在此 guard time>=startTime 提前 return → 雪(starttime=15)开局 15s 空屏
+    /// + 预热粒子被冻结,与 WE 开局满屏稳态雪完全不同(伊蕾娜夜莺「雪跟原版不同」主因之一)。
     func step(dt: Float, time: Float) {
-        guard time >= desc.startTime else { return }
         simTime = time
         let d = min(dt, 0.1)   // 防卡顿大跳
         animTime += d          // 精灵表帧动画时间(鸟扇翅膀等)
@@ -497,14 +532,27 @@ final class ParticleSimulator {
             }
             for attract in desc.cpAttracts {
                 // controlpointattract:阈值内朝控制点恒力吸引(照 CParticle.cpp:1492-1503)。
-                // center = controlpoint[op.controlpoint].offset + op.origin(解析时已合并存入 attract.center)。
+                // center 已按 io/worldSpace 解析为层局部(见 CPAttract);linkMouse 控制点 = 光标(运行期,
+                // lwe CParticle.cpp:152「Mouse-linked CPs will have their position updated in update()」)。
                 // threshold 取一半(CParticle.cpp:1476)。dist∈(0.001, threshold) 时 vel += dir·scale·dt·speedOverride。
-                // scale<0 = 排斥(Bird.json 用负 scale 把鸟推离控制点)。
-                let toCenter = attract.center - particles[i].pos
+                // scale<0 = 排斥(Bird.json cp1=鼠标:鸟群避开光标;cp2/3/4=世界路径锚点)。
+                var center = attract.center
+                if attract.linkMouse {
+                    guard let cur = cursorOrigin else { continue }   // 无光标(headless 未传)→ 该力不施加
+                    center = SIMD3((cur.x - desc.layerOrigin.x), (cur.y - desc.layerOrigin.y), 0) + attract.originOff
+                }
+                let toCenter = center - particles[i].pos
                 let dist = simd_length(toCenter)
                 let threshold = attract.threshold / 2
                 if dist > 0.001 && dist < threshold {
-                    particles[i].vel += (toCenter / dist) * attract.scale * d * desc.ioSpeed
+                    // 力 = scale·(1 − d/r)·dir:**线性衰减到边缘归零**,不是 lwe 的半径内恒力
+                    // (CParticle.cpp:1492 恒力 = lwe 逆向只摸到半径减半、漏了衰减)。
+                    // 证据(2026-06-11 Postscript 候鸟流,WE 实机观察「到最后聚成一条线」):
+                    // 数值模拟四种剖面,恒力 σ 28→68→111 发散(鸟被泡壁轰散=旧症状);线性衰减(r=threshold/2)
+                    // σ 29→28→16 末段**收敛**、出口高度 542 正中 WE 区间——上下斥力泡成"软弹簧墙",
+                    // 陷入多深推回多少 → 漏斗收束成单列。WP_CPATTRACT_CONST=1 退回 lwe 恒力(A/B)。
+                    let falloff = Self.cpAttractConstForce ? 1 : (1 - dist / threshold)
+                    particles[i].vel += (toCenter / dist) * attract.scale * falloff * d * desc.ioSpeed
                 }
             }
             if desc.hasRemap {
@@ -554,10 +602,16 @@ final class ParticleSimulator {
                 particles[i].angVel += desc.angularForceZ * d * desc.ioSpeed
                 if desc.angularDragZ != 0 { particles[i].angVel *= max(0, 1 - desc.angularDragZ * d) }
             }
-            // (ropetrail 不维护逐粒子历史轨迹:lwe 对 rope 与 ropetrail 走同一条 renderRope 路径
-            //  —— 把全部活粒子按生成序连成一条链,m_ropeSegments 写入后全文未再读取
-            //  CParticle.cpp:47/grep 确认,m_trailLength 仅作 renderVar0 透传 CParticle.cpp:1912。
-            //  原先的逐粒子快照/采样间隔/几何长度钳制是无 lwe 依据的自创结构,已删除。)
+            // ropetrail:逐粒子位置历史(WE 真义,lwe Object.h:507「segments = number of history segments
+            // per particle」)。每帧把当前 world 推入 hist 头部,保留最近 ropeSegments+1 个点 → 渲染期每粒子
+            // 用自己的 hist 连成**独立**短拖尾(雨=每滴一条雨丝)。lwe 把 rope/ropetrail 都退化成「全部活粒子
+            // 连一条链」(m_ropeSegments 写入后从未读取 CParticle.cpp:47),对 1000 个独立雨滴 → 全屏网格乱线;
+            // 故此处按 WE 真义维护逐粒子历史。纯 rope(非 trail)仍走全局连链,见 ropeVertices()。
+            if desc.isRopeTrail {
+                particles[i].hist.insert(visualState(particles[i]).world, at: 0)
+                let cap = max(2, desc.ropeSegments + 1)
+                if particles[i].hist.count > cap { particles[i].hist.removeLast(particles[i].hist.count - cap) }
+            }
             i += 1
         }
 
@@ -604,9 +658,14 @@ final class ParticleSimulator {
     /// seconds 非有限(NaN/Inf)时跳过(否则 Int(NaN) 直接 trap 崩溃)。
     func warmup(seconds: Float) {
         guard seconds.isFinite, seconds > 0 else { return }
+        // starttime>0(雪15/雾2/雨1 等天气预设)= WE「跳进模拟」:加载即呈现已运行 starttime 秒的稳态。
+        // 作者用它跳过填充期:snowperspective rate=25 × maxcount=360 填满恰需 ≈14.4s ≈ starttime 15。
+        // 此前误解为「延迟 15s 发射」并禁预热 → 开雪 15s 空屏再 15s 慢慢变密,与 WE 截然不同。
+        // lwe 解析了 starttime 但完全未用(Object.h:561),此处按 WE 真义实现(调用方保证 seconds ≥ startTime)。
+        // 步数上限 900(=30s):防 lifetimeMax 异常大的壁纸把加载拖死;真实预设(≤15s)足够。
         let step: Float = 1.0 / 30
-        var t: Float = desc.startTime
-        var n = min(300, Int((seconds / step).rounded()))
+        var t: Float = 0
+        var n = min(900, Int((seconds / step).rounded()))
         while n > 0 { self.step(dt: step, time: t); t += step; n -= 1 }
     }
 
@@ -704,7 +763,17 @@ final class ParticleSimulator {
             let fwd = normalize(desc.tvForward)
             let len = length(result)
             result = len < 0.0001 ? fwd : result / len
-            if desc.tvScale < 2 {
+            // 湍流方向:默认 lwe 钳制(scale 当 ±scale/2 锥角)。曾试 blend=normalize(forward+curl)(指标更接近
+            // WE 采集真值 H262 vs 钳制105/WE~200)但用户实机否决("乱飘"=逐粒子方向散导致 rope 抖动),已回滚。
+            // WP_TURB_BLEND=1 / WP_TURB_FREECONE=1 仅作诊断。眼焰形态与 WE 的残差(焰羽高度)留观。
+            let useBlend = ProcessInfo.processInfo.environment["WP_TURB_BLEND"] != nil
+            let freeCone = ProcessInfo.processInfo.environment["WP_TURB_FREECONE"] != nil
+            if useBlend {
+                let bl = fwd + result
+                let bln = length(bl)
+                if bln > 0.0001 { result = bl / bln }
+            }
+            if !useBlend && !freeCone, desc.tvScale < 2 {
                 let ang = acos(max(-1, min(1, dot(result, fwd)))) / .pi
                 let maxAng = desc.tvScale / 2
                 if ang > maxAng && maxAng > 0.0001 {
@@ -715,7 +784,13 @@ final class ParticleSimulator {
             if abs(desc.tvOffset) > 0.0001 { result = rotate(result, normalize(desc.tvRight), -desc.tvOffset) }
             result.z = 0                                  // 2D 粒子投影到 XY 平面
             let l2 = length(result); if l2 > 0.0001 { result /= l2 }
-            vel += result * rnd(desc.turbSpeedMin, desc.turbSpeedMax) * desc.ioSpeed   // ×speedOverride(CParticle.cpp:928)
+            // ⭐湍流初速**默认不乘** instanceoverride.speed(2026-06-10,御剑眼焰实测定):
+            //   lwe 乘(CParticle.cpp:928)→ 眼焰 0.6×250=150px/s,亮区缩在内眼角(用户报"偏左");
+            //   不乘(全速 250)→ 焰延伸 X[2166,2430] 亮区落眼尾、射向右上 = WE 实况(用户:"从右眼尾射向右上")。
+            //   判定 lwe 此处 ≠ 真 WE(同 ropetrail 先例:lwe 实现≠WE 真义)。WP_TURB_IOSPEED=1 退回 lwe 行为(A/B)。
+            //   ⚠️库级影响:所有 turbulentvelocityrandom + speed override 的粒子(烟/光等)初速回到 pkg 原值。
+            let turbSpeedScale = ProcessInfo.processInfo.environment["WP_TURB_IOSPEED"] != nil ? desc.ioSpeed : 1
+            vel += result * rnd(desc.turbSpeedMin, desc.turbSpeedMax) * turbSpeedScale
         }
         // 精灵朝向(WE ComputeParticleTangents,common_particles.h:21):普通精灵恒用 **rotation**
         // (rotationrandom 初始角 + angularvelocity 演化),**不对齐速度**。速度对齐只属 TRAILRENDERER
@@ -732,13 +807,24 @@ final class ParticleSimulator {
         let angVelInit: Float = desc.hasAngularVel
             ? (desc.angVelMin + pow(rnd(), desc.angVelExponent) * (desc.angVelMax - desc.angVelMin)) * desc.ioSpeed
             : 0
+        // colorrandom:WE 真义 = 单个随机 t 在 min→max 两色**连线**上取一点(同乘三通道)。
+        // lwe 逐通道独立随机(Maths::randomVec3)→ 雪 white(255,255,255)↔灰蓝(95,98,100) 会随机出
+        // 绿/紫/红「彩虹碎屑」,与 WE 白雪截然不同(伊蕾娜夜莺雪天实证)。两色同色相时两种算法无差;
+        // 异色时单参数=色带、逐通道=色立方体角,设计者语义是前者。lwe≠真WE 又一处(同 ropetrail 先例)。
+        // WP_COLORRAND_PERCH=1 退回 lwe 逐通道(A/B 诊断)。
+        let spawnColor: SIMD3<Float>
+        if ProcessInfo.processInfo.environment["WP_COLORRAND_PERCH"] != nil {
+            spawnColor = rnd3(desc.colorMin, desc.colorMax)
+        } else {
+            let t = rnd(); spawnColor = desc.colorMin + (desc.colorMax - desc.colorMin) * t
+        }
         var p = Particle(
             pos: pos,
             vel: vel,
-            color: rnd3(desc.colorMin, desc.colorMax),
+            color: spawnColor,
             alpha0: rnd(desc.alphaMin, desc.alphaMax),
-            // WE:size=(min+pow(t,exponent)·(max-min))·sizeOverride/2(/2=WE 把 size 当半径存,精灵全宽才=pkgsize;
-            // sizeOverride=instanceoverride.size,spawn 时乘入)。对照 CParticle.cpp:757 + common_particles.h:54。
+            // WE:size=(min+pow(t,exponent)·(max-min))·sizeOverride/2(照 lwe CParticle.cpp:738)。
+            // 此值即精灵 quad 全宽(WE 实测,见 instances() spriteHalfLegacy 注释);rope 带按 ±size 展开。
             size: (desc.sizeMin + pow(rnd(), desc.sizeExponent) * (desc.sizeMax - desc.sizeMin)) * desc.ioSize / 2,
             age: 0,
             // 【审计修复】life NaN 兜底:若 pkg 数据给 0(lifetimeMin=max=0),后续 age/life=NaN 会污染
@@ -851,9 +937,24 @@ final class ParticleSimulator {
     /// 走 appendRibbon:Catmull-Rom 细分 + 每子段两端 right=normalize(rot90(central-diff 切向))×size
     /// 居中展带(geometry-shader 真路径 start/end±trailRight)。切向退化(节点重合)时 right=0,带塌成零面积(无 NaN)。
     func ropeVertices() -> [RopeVertex] {
-        // 把全部活粒子按生成序连成一条链(rope 与 ropetrail 同路,CParticle.cpp:2105/2120/2139-2160)。
-        guard particles.count >= 2 else { return [] }
         var out: [RopeVertex] = []
+        if desc.isRopeTrail {
+            // ropetrail:**每粒子**用自己的位置历史连成一条独立拖尾(WE 真义,lwe Object.h:507 segments=每粒子
+            // 历史段数)。1000 个独立雨滴 → 1000 条独立短雨丝(而非把它们连成一条全屏乱线)。
+            // 沿 trail 各点用粒子当前 size/color;UV 沿长度由 appendRibbon + 纹理(halo)决定渐隐。
+            for p in particles {
+                let h = p.hist
+                guard h.count >= 2 else { continue }   // 刚 spawn(<2 历史点)不画,等积累
+                let vs = visualState(p)
+                let nodeSize = [Float](repeating: vs.size, count: h.count)
+                let nodeCol = [SIMD4<Float>](repeating: SIMD4(vs.col, vs.alpha), count: h.count)
+                appendRibbon(into: &out, nodePos: h, nodeSize: nodeSize, nodeCol: nodeCol)
+            }
+            return out
+        }
+        // 纯 rope(闪电/绳索类,常配 controlpoints):全部活粒子按生成序连成**一条**链
+        // (lwe renderRope,CParticle.cpp:2105/2120/2139-2160)。
+        guard particles.count >= 2 else { return [] }
         let n = particles.count
         var nodePos = [SIMD2<Float>](repeating: .zero, count: n)
         var nodeSize = [Float](repeating: 0, count: n)
@@ -957,11 +1058,41 @@ final class ParticleSimulator {
     }
 
     /// 输出当前所有粒子的渲染实例(世界像素坐标 + 当前 alpha/size/旋转/颜色)。
+    // controlpointattract 力学剖面退路:WP_CPATTRACT_CONST=1 退回 lwe 半径内恒力(无衰减)。
+    static let cpAttractConstForce = ProcessInfo.processInfo.environment["WP_CPATTRACT_CONST"] != nil
+
+    // 精灵宽度语义【2026-06-11 WE 实机截图裁决】:全宽 = pkg/2(= p.size 半径值直接当 quad 宽)。
+    // 曾推断「lwe /2 + shader ±0.5 两头减半=半大」并 ×2,但 Postscript 鸟 WE 实测(画布≈1:1 截图)
+    // 暗斑宽中位 ~6/主体 3-12px,半幅版中位 8/4-11 吻合、×2 版中位 17 恰好大一倍 → ×2 证伪回滚。
+    // 即 WE 的 CPU 喂给 shader 的 size 属性本身就是 pkg/2(lwe CParticle.cpp:738 是对的)。
+    // WP_SPRITE_FULL=1 = 诊断用全宽(pkg 值)。
+    static let spriteHalfLegacy = ProcessInfo.processInfo.environment["WP_SPRITE_FULL"] == nil
+
     func instances() -> [ParticleInstance] {
         particles.map { p in
             let f = p.age / p.life                  // 归一化生命比(精灵表帧索引用)
             let vs = visualState(p)
             let world = vs.world, s = vs.size, a = vs.alpha, col = vs.col
+            // p.size 是 pkg/2(lwe 存法 = WE CPU 喂 shader 的 size 属性;quad 全宽即此值,**不**再 ×2)。
+            // Postscript 鸟 WE 实机截图实测裁决(见 spriteHalfLegacy 注释):半幅吻合、×2 恰好大一倍。
+            var sFull = Self.spriteHalfLegacy ? abs(s) : abs(s) * 2
+            var center = world
+            if desc.particleFlags & 4 != 0 {
+                // flags&4 透视粒子:等效 lwe 的 perspective·lookAt——屏幕居中坐标与 size 同乘
+                // k(z) = cot(fov/2)·(H/2)/(1000−z)。z 由 3D 球壳发射给定(directions/sign 的 z 分量),
+                // z→1000(贴近相机)大且快、z→0 远小慢。z≥1000 在眼后,lwe 由 GPU w≤0 裁掉 → 置 0 跳过。
+                let denom = 1000 - p.pos.z
+                if denom > 0.001 {
+                    let half = desc.cameraFov * Float.pi / 360
+                    let k = (1 / tan(half)) * desc.canvasSize.y * 0.5 / denom
+                    let cx = world.x - desc.canvasSize.x * 0.5
+                    let cy = world.y - desc.canvasSize.y * 0.5
+                    center = SIMD2(cx * k + desc.canvasSize.x * 0.5, cy * k + desc.canvasSize.y * 0.5)
+                    sFull *= k
+                } else {
+                    sFull = 0
+                }
+            }
             // 精灵表 UV:
             let uvOffset: SIMD2<Float>
             let uvSc: SIMD2<Float>
@@ -985,7 +1116,7 @@ final class ParticleSimulator {
             //   5:1 竖条;正确应 0.8。方形贴图(trailTextureRatio=1)不变 → 零回归。
             let tr = desc.trailTextureRatio
             let aspect = (uvSc.x > 0 && uvSc.y > 0 && tr > 0) ? (uvSc.x / uvSc.y) / tr : 1
-            var instSize = abs(s)
+            var instSize = sFull
             var instRot = p.rotation
             var instAspect = aspect
             if desc.isSpriteTrail {
@@ -997,10 +1128,10 @@ final class ParticleSimulator {
                 let trailLen = max(desc.trailMinLength, min(speed * desc.trailLength, desc.trailMaxLength))
                 // 每帧 textureRatio = (uvSc.y/uvSc.x)·(texH/texW);单帧 uvSc=(1,1) ⇒ 即 texH/texW。
                 let texRatio = (uvSc.x > 0 ? uvSc.y / uvSc.x : 1) * desc.trailTextureRatio
-                let lenAxis = abs(s) * trailLen * texRatio        // 我们 local-y(长轴)的世界像素长度
+                let lenAxis = sFull * trailLen * texRatio         // 我们 local-y(长轴)的世界像素长度(全宽语义,同精灵)
                 instSize = lenAxis
                 // aspect = 短轴/长轴;lenAxis→0(速度≈0)时塌缩为 0(x 轴=lenAxis·aspect=size 不变,y=0 ⇒ 零面积、无 NaN),与 WE 退化一致。
-                instAspect = lenAxis > 1e-3 ? abs(s) / lenAxis : 0
+                instAspect = lenAxis > 1e-3 ? sFull / lenAxis : 0
                 // local +y 轴对齐速度方向:rotated(0,1)=(−sinθ,cosθ)=normalize(vel) ⇒ θ=atan2(−vx, vy)。
                 instRot = atan2(-vx, vy)
             }
@@ -1009,7 +1140,7 @@ final class ParticleSimulator {
             // 与 WE m_modelMatrix 把 quad 一并旋转一致。orientation=="upright"(水花)精灵 rotation 强制 0:
             // WE upright 精灵不随 modelMatrix 自旋(始终竖直),故此类不叠加层角。
             if desc.layerAngleZ != 0 && !desc.orientationUpright { instRot += desc.layerAngleZ }
-            return ParticleInstance(center: world,
+            return ParticleInstance(center: center,
                                     size: instSize,
                                     rotation: instRot,
                                     color: SIMD4(col, a),
@@ -1082,8 +1213,29 @@ enum ParticleParser {
                 desc.layerOrigin = SIMD2(layerOrigin.x, layerOrigin.y)
                 desc.layerScale = SIMD2(layerScale.x, layerScale.y)  // 逐轴各向异性缩放
                 desc.layerAngleZ = VecParse.f3(obj["angles"]).z   // 图层倾斜(雨丝斜下,WE 弧度)
+                // 鼠标视差深度:图像/文字层已做、粒子层原来漏了(眼焰 vapor 粒子 parallaxDepth=1.3 → 鼠标移动时
+                //   脸图层跟着视差移、眼焰粒子不动 → 火焰脱离眼睛偏移)。照图像层同 parallaxOffset 公式在 encode 平移投影。
+                let pd = VecParse.f3(obj["parallaxDepth"], default: SIMD3(1, 1, 1))
+                desc.parallaxDepth = SIMD2(pd.x, pd.y)
                 // instanceoverride:alpha(图层级整体透明度)+ colorn/color(实例染色乘子,乘进每粒子色;
                 // 如 2B 壁纸把玫瑰花瓣染暗红配红花田。漏掉 colorn → 花瓣显基色粉白被误认成"樱花")。
+                // controlpointattract 中心解析(见 CPAttract 注释):io "controlpointN"(世界)> worldSpace offset(世界)> 局部 offset。
+                // 世界 → 层局部:(world − layerOrigin) / layerScale(粒子 pos 是层局部,visualState 再乘回)。
+                let ioCP = obj["instanceoverride"] as? [String: Any]
+                for i in desc.cpAttracts.indices {
+                    var world: SIMD3<Float>? = nil
+                    if let v = ioCP?["controlpoint\(desc.cpAttracts[i].cpId)"] {
+                        let w = VecParse.f3(VecParse.unwrap(v) ?? v)
+                        desc.cpAttracts[i].ioWorld = w; world = w
+                    } else if desc.cpAttracts[i].worldSpace {
+                        world = desc.cpAttracts[i].offset
+                    }
+                    if let w = world {
+                        let sx = layerScale.x != 0 ? layerScale.x : 1, sy = layerScale.y != 0 ? layerScale.y : 1
+                        desc.cpAttracts[i].center = SIMD3((w.x - layerOrigin.x) / sx,
+                                                          (w.y - layerOrigin.y) / sy, 0) + desc.cpAttracts[i].originOff
+                    }
+                }
                 if let io = obj["instanceoverride"] as? [String: Any] {
                     if let a = VecParse.unwrap(io["alpha"]) as? NSNumber { desc.layerAlpha = a.floatValue }
                     // 【关键修复】场景**对象级** instanceoverride 的 count/size/speed/rate 乘子,过去只在粒子预设 JSON
@@ -1107,6 +1259,7 @@ enum ParticleParser {
                     let tint = SIMD3(arr[0], arr[1], arr[2]); desc.colorMin = tint; desc.colorMax = tint  // 对象级整体染色
                 }
                 desc.aboveBloom = objIndex > postLayerIndex   // 排在后处理层之上 → 不被 bloom
+                desc.sceneObjIndex = objIndex   // 场景对象序(粒子在图层间插画的锚点;WE 按对象序绘制一切)
             }
             if var desc = build(from: pj, source: source) {
                 applyObjectLayer(&desc); result.append(desc)
@@ -1279,18 +1432,29 @@ enum ParticleParser {
                 // Bird:cp2="0 -500 0" 等)。一层可有多个 attract → 累进数组。
                 let cpIndex = (op["controlpoint"] as? NSNumber)?.intValue ?? 0
                 var cpOffset = SIMD3<Float>.zero
+                var cpFlags = 0
                 if let cps = pj["controlpoint"] as? [[String: Any]] {
-                    if let cp = cps.first(where: { ($0["id"] as? NSNumber)?.intValue == cpIndex }) {
+                    let cp = cps.first(where: { ($0["id"] as? NSNumber)?.intValue == cpIndex })
+                        ?? ((cpIndex >= 0 && cpIndex < cps.count) ? cps[cpIndex] : nil)   // 退化:按下标取
+                    if let cp {
                         cpOffset = VecParse.f3(cp["offset"])
-                    } else if cpIndex >= 0 && cpIndex < cps.count {
-                        cpOffset = VecParse.f3(cps[cpIndex]["offset"])   // 退化:无匹配 id 时按数组下标取
+                        cpFlags = (cp["flags"] as? NSNumber)?.intValue ?? 0
                     }
                 }
-                let center = cpOffset + VecParse.f3(op["origin"], default: .zero)
+                let originOff = VecParse.f3(op["origin"], default: .zero)
                 d.cpAttracts.append(ParticleEmitterDesc.CPAttract(
-                    center: center,
+                    cpId: cpIndex,
+                    linkMouse: (cpFlags & 1) != 0,
+                    worldSpace: (cpFlags & 2) != 0,
+                    offset: cpOffset,
+                    ioWorld: nil,
+                    originOff: originOff,
                     scale: num(op["scale"], 100),
-                    threshold: num(op["threshold"], 1000)))
+                    // threshold 缺省 1000(ObjectParser.cpp:966)。曾一度改 0(判"缺失=不生效"),被 WE 实机
+                    // 「鸟末段**收敛**成一条线」推翻:正解=缺省 1000 照常生效 + 力**线性衰减**(见 step() 的
+                    // falloff 注释)——衰减软墙才能既不轰散又收束;恒力下 1000 默认确实会轰散(当时误归因于默认值)。
+                    threshold: num(op["threshold"], 1000),
+                    center: cpOffset + originOff))   // 局部兜底(=旧行为;applyObjectLayer 再按 io/world 解析)
             case "turbulence":
                 // curl-noise 流动力场。speed/phase 每发射器随机一次(照 CParticle.cpp:1265-1266 用 m_rng)。
                 d.hasTurbulence = true
@@ -1396,37 +1560,41 @@ enum ParticleParser {
         d.animationMode = (pj["animationmode"] as? String) ?? "sequence"
         d.sequenceMultiplier = num(pj["sequencemultiplier"], 1)
         d.randomFrame = d.animationMode == "randomframe"
-        // spritetrail 渲染器:照 renderer.length/maxlength/minlength(ObjectParser.cpp:1004-1006 默认)。
-        // 字段名小写(实测 pkg:{"maxlength":6,"name":"spritetrail"})。粒子将按速度拉伸成拖尾。
-        if let rends = pj["renderer"] as? [[String: Any]],
-           let r = rends.first(where: { ($0["name"] as? String) == "spritetrail" }) {
+        // 渲染器分派:lwe **只看 renderers[0]**(CParticle.cpp:34-56 `const auto& renderer = m_particle.renderers[0]`),
+        // 据它的 name 决定 rope/ropetrail/spritetrail/(否则)sprite。pkg 里一个粒子可带多个 renderer
+        // (如 snowperspective.json renderer=[sprite, spritetrail]),WE/lwe 取第一个 = sprite(圆 bokeh 雪点),
+        // **不是** spritetrail(拖尾)。旧实现用 `first(where: name=="spritetrail")` 在整列里搜——会把第二个
+        // spritetrail 误当渲染模式,把本该圆点的 chromaticdot 雪渲成「彩色小条」(Misty Valley 雨束彩色 bug 真因)。
+        // 改为严格取 renderers[0],与 lwe 一致,全库通用、零硬编码。
+        let r0 = (pj["renderer"] as? [[String: Any]])?.first
+        let r0name = (r0?["name"] as? String) ?? ""
+        if r0name == "spritetrail" {
+            // spritetrail:照 renderer.length/maxlength/minlength(ObjectParser.cpp:1004-1006 默认)。
+            // 字段名小写(实测 pkg:{"maxlength":6,"name":"spritetrail"})。粒子将按速度拉伸成拖尾。
             d.isSpriteTrail = true
-            d.trailLength = num(r["length"], 0.05)
-            d.trailMaxLength = num(r["maxlength"], 10)
-            d.trailMinLength = num(r["minlength"], 0)
-        }
-        // sprite 渲染器的 orientation=="upright"(水花):精灵竖直站立,spawn 强制 rotation=0、禁用自转。
-        // 实测 Rain_Splash_copy2.json:{"name":"sprite","orientation":"upright"}。
-        if let rends = pj["renderer"] as? [[String: Any]],
-           rends.contains(where: { ($0["name"] as? String) == "sprite" && ($0["orientation"] as? String) == "upright" }) {
-            d.orientationUpright = true
-        }
-        // rope/ropetrail 渲染器(genericropeparticle):粒子连成 Catmull-Rom 样条带。
-        // subdivision 默认 4(CParticle.h:240);uvscale/uvscrolling/uvsmoothing 取 renderer 字段(默认 1/false/true)。
-        if let rends = pj["renderer"] as? [[String: Any]],
-           let r = rends.first(where: { let nm = ($0["name"] as? String) ?? ""; return nm == "rope" || nm == "ropetrail" }) {
+            d.trailLength = num(r0?["length"], 0.05)
+            d.trailMaxLength = num(r0?["maxlength"], 10)
+            d.trailMinLength = num(r0?["minlength"], 0)
+        } else if r0name == "rope" || r0name == "ropetrail" {
+            // rope/ropetrail 渲染器(genericropeparticle):粒子连成 Catmull-Rom 样条带。
+            // subdivision 默认 4(CParticle.h:240);uvscale/uvscrolling/uvsmoothing 取 renderer 字段(默认 1/false/true)。
             d.isRope = true
-            d.ropeSubdivision = max(1, (r["subdivision"] as? NSNumber)?.intValue ?? 4)
-            d.ropeUVScale = num(r["uvscale"], 1)
-            d.ropeUVScrolling = ((r["uvscrolling"] as? NSNumber)?.boolValue) ?? false
-            d.ropeUVSmoothing = ((r["uvsmoothing"] as? NSNumber)?.boolValue) ?? true
+            d.ropeSubdivision = max(1, (r0?["subdivision"] as? NSNumber)?.intValue ?? 4)
+            d.ropeUVScale = num(r0?["uvscale"], 1)
+            d.ropeUVScrolling = ((r0?["uvscrolling"] as? NSNumber)?.boolValue) ?? false
+            d.ropeUVSmoothing = ((r0?["uvsmoothing"] as? NSNumber)?.boolValue) ?? true
             // ropetrail:在 lwe 里与 rope 走同一条 renderRope(CParticle.cpp:36-48 m_useRopeRenderer 都 true)。
             // 仅记录标记 + 透传 segments/length(均不影响几何,见 ParticleEmitterDesc.isRopeTrail 注释)。
-            if (r["name"] as? String) == "ropetrail" {
+            if r0name == "ropetrail" {
                 d.isRopeTrail = true
-                d.ropeSegments = max(2, (r["segments"] as? NSNumber)?.intValue ?? 4)
-                d.ropeTrailLength = num(r["length"], 2)
+                d.ropeSegments = max(2, (r0?["segments"] as? NSNumber)?.intValue ?? 4)
+                d.ropeTrailLength = num(r0?["length"], 2)
             }
+        }
+        // sprite 渲染器的 orientation=="upright"(水花):精灵竖直站立,spawn 强制 rotation=0、禁用自转。
+        // 实测 Rain_Splash_copy2.json:{"name":"sprite","orientation":"upright"}。仅 renderers[0]=sprite 时判定。
+        if r0name == "sprite", (r0?["orientation"] as? String) == "upright" {
+            d.orientationUpright = true
         }
         return d
     }

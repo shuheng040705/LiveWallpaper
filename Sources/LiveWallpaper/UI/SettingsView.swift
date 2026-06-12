@@ -183,6 +183,8 @@ struct SettingsForm: View {
     @State private var metalFX = PreferencesStore.shared.metalFXEnabled
     @State private var renderScale = PreferencesStore.shared.renderScale
     @State private var fxaa = PreferencesStore.shared.fxaaEnabled
+    @State private var scaleMode = PreferencesStore.shared.wallpaperScaleMode
+    @State private var syncPresent = PreferencesStore.shared.syncPresent
     @State private var compositeMaxFrames = PreferencesStore.shared.compositeMaxFrames
     @State private var textureQuality = PreferencesStore.shared.textureQuality
 
@@ -244,6 +246,20 @@ struct SettingsForm: View {
             }
             switchRow("FXAA 抗锯齿", "呈现时做一次快速抗锯齿,边缘更平滑(开销很低)", divider: true, $fxaa) {
                 PreferencesStore.shared.fxaaEnabled = $0
+            }
+            row("屏幕适配", "屏幕长宽比≠壁纸时:填满=裁切边缘(WE 默认)/黑边=全可见留黑边/拉伸=全屏无黑边但变形。内屏 16:10 看 16:9 壁纸边缘特效被裁时换「黑边」或「拉伸」", divider: true) {
+                Picker("", selection: $scaleMode) {
+                    Text("填满").tag(0); Text("黑边").tag(1); Text("拉伸").tag(2)
+                }
+                .pickerStyle(.segmented).labelsHidden().frame(width: 200)
+                .onChange(of: scaleMode) { v in
+                    PreferencesStore.shared.wallpaperScaleMode = v
+                    actions.onAssetsPathChanged()   // 重载让 ndcScale 即时生效
+                }
+            }
+            switchRow("同步呈现(修内屏撕裂)", "Mac 内屏(120Hz ProMotion)上连续动画壁纸出现横向分带/撕裂时开启(同步 present)。若开启后壁纸变黑请关掉", divider: true, $syncPresent) {
+                PreferencesStore.shared.syncPresent = $0
+                actions.onAssetsPathChanged()   // 重载重建图层让 presentsWithTransaction 生效
             }
             row("合成层最大帧数", "带特效的层渲满 N 帧后冻结省 GPU;∞=不限(音频/水波等持续动画需 ∞)", divider: true) {
                 Picker("", selection: $compositeMaxFrames) {

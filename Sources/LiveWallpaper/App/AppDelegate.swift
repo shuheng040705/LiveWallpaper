@@ -26,6 +26,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMainMenu()
         desktop.start()
         power.start()
+        NowPlayingProvider.shared.start()   // 系统正在播放的音乐(喂 Now Playing widget 歌名/艺术家)
         WorkshopDownloader.shared.prewarm()   // 后台预热 steamcmd → 首次下载跳过冷启动等待
         library.scan { [weak self] in
             self?.restoreOrOpenLibrary()
@@ -39,6 +40,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func observeDownloads() {
         NotificationCenter.default.addObserver(
             self, selector: #selector(openDownloads), name: .showDownloads, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(onUnsubscribeWallpaper(_:)), name: .unsubscribeWallpaper, object: nil)
         WorkshopDownloader.shared.$jobs
             .receive(on: DispatchQueue.main)
             .sink { [weak self] jobs in self?.handleCancelledJobs(jobs) }
@@ -46,6 +49,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openDownloads() { downloadsWindow.show() }
+
+    /// 网页里取消订阅 → 删除对应本地壁纸(移到废纸篓,与右键删除同一路径,处理正在播放/库刷新)。
+    @objc private func onUnsubscribeWallpaper(_ note: Notification) {
+        guard let id = note.userInfo?["id"] as? String, let item = library.item(id: id) else { return }
+        deleteWallpaper(item)
+    }
 
     /// 出现「已取消」的下载 → 弹应用级询问:保留已下内容还是删除。
     private func handleCancelledJobs(_ jobs: [WorkshopDownloader.Job]) {

@@ -683,6 +683,59 @@ def preprocess(path, stage, combos, vary_locs, search_dirs=None, link_src=None, 
     header = f"#version 450\n{PRELUDE}\n{combo_defs}\n{ubo}\n{samplers}\n{out_decl}\n"
     return header + body
 
+def _fix_agx_oscilloscope(msl):
+    """AGX Metal 后端崩溃后处理(audio_responsive_oscilloscope 等音频频谱 shader)。
+
+    spirv-cross 把 32 路 audio varying 重建成 `spvUnsafeArray<float4, 32> audioValue`,在循环里
+    用循环变量动态索引这个模板结构体的「返回引用的 operator[]」并消费整个 float4
+    (`audioValue[i >> 2][i & 3]`)。macOS 的 AGX(Apple GPU)Metal 后端在
+    makeRenderPipelineState 时把这种构造 lowering 到机器码会崩(XPC_ERROR_CONNECTION_INTERRUPTED,
+    多次重试后失败)——注意:前端 makeLibrary(源码→AIR)和离线 `metal -c` 都成功,只崩后端。
+
+    修复:在循环前把 spvUnsafeArray 拷进一个普通 C 数组 `float4 _av4[N]`,循环里改成动态索引这个
+    普通数组。语义完全相同,但普通数组的动态索引能被 AGX 干净 lowering(已用最小复现实测确认:
+    spvUnsafeArray 动态索引崩、普通 float4[] 动态索引不崩)。
+
+    实测进一步定位(最小复现二分):真正的崩点是「对 spvUnsafeArray<float4,32> 做**大范围**动态
+    下标索引」——`audioValue[i>>2]`(i=0..31 → 索引 0..7,但 spirv-cross 把它当满 32 长度模板)
+    以及拷贝循环 `for(_k<32) tmp[_k]=audioValue[_k]` 都会崩;把拷贝改成**静态完全展开**
+    (`tmp[0]=audioValue[0]; … tmp[7]=audioValue[7];`,零动态 spvUnsafeArray 索引)最稳,3/3 通过。
+
+    精确匹配:只命中 `spvUnsafeArray<float4, N> NAME` 且别处出现 `NAME[<dynamic>][...]` 的场景。
+    其余 shader 不含该模式 → 全库无副作用(no-op)。
+    """
+    # 找形如:spvUnsafeArray<float4, 32> audioValue = {};
+    m = re.search(r'spvUnsafeArray<\s*float4\s*,\s*(\d+)\s*>\s+(\w+)\s*=\s*\{\}\s*;', msl)
+    if not m:
+        return msl
+    count = int(m.group(1)); name = m.group(2)
+    # 只有当该名字在某处被「动态(非纯数字)下标」索引时才需要修(静态展开的赋值 audioValue[0]=… 不算)。
+    dyn = re.search(re.escape(name) + r'\[\s*[^\]\d][^\]]*\]\s*\[', msl)
+    if not dyn:
+        return msl
+    fixed_name = '_av4_' + name
+    # 拷贝槽数 copy_n:动态下标 `NAME[i >> 2]`(i=0..count-1)只能触达 0..count/4-1。**关键**:实测
+    # 中「被动态索引的 float4 数组若全 32 槽都初始化」也会崩(不是 spvUnsafeArray 独有);只有当被
+    # 动态索引的普通数组**只填到实际可达的少数槽**(此例 8)时 AGX 才能正常 lowering。因此这里只
+    # 静态拷贝可达的 copy_n 槽,数组也只声明 copy_n 大,避免大宽度动态索引数组进后端。
+    copy_n = (count + 3) // 4
+    # 注入点:紧跟最后一个静态展开赋值 `NAME[count-1] = ...;` 之后(此时 spvUnsafeArray 已填满)。
+    last_assign = re.search(re.escape(name) + r'\[\s*' + str(count - 1) + r'\s*\]\s*=\s*[^;]+;', msl)
+    if not last_assign:
+        return msl
+    pos = last_assign.end()
+    # 步骤 1:先把所有对 NAME 的「动态下标」用法改成 FIXED(静态数字下标=填充赋值,保持指向原数组)。
+    #         必须先做,且只作用于已有正文,避免改到下面注入的拷贝里 NAME[k]/FIXED[k]。
+    msl = re.sub(re.escape(name) + r'(\[\s*[^\]\d][^\]]*\])', fixed_name + r'\1', msl)
+    # 步骤 2:在填充完成处注入**静态完全展开**的普通 C 数组拷贝(零动态索引,注入文本不再被步骤 1 触碰)。
+    copies = ''.join(f'\n    {fixed_name}[{k}] = {name}[{k}];' for k in range(copy_n))
+    inject = ('\n    // AGX-FIX(_fix_agx_oscilloscope): hoist the dynamically-indexed audio float4s into a\n'
+              '    // small plain C array (statically unrolled, only the reachable slots) so the dynamic\n'
+              '    // index in the loop lowers cleanly on the macOS AGX Metal backend (see function doc).\n'
+              f'    float4 {fixed_name}[{copy_n}];' + copies)
+    msl = msl[:pos] + inject + msl[pos:]
+    return msl
+
 def transpile(path, stage, combos, vary_locs, verbose=False, link_src=None):
     glsl = preprocess(path, stage, combos, vary_locs, link_src=link_src)
     with tempfile.NamedTemporaryFile("w", suffix=f".{stage}", delete=False) as f:
@@ -697,7 +750,7 @@ def transpile(path, stage, combos, vary_locs, verbose=False, link_src=None):
                         capture_output=True, text=True)
     if r2.returncode != 0:
         raise RuntimeError(f"spirv-cross FAILED ({stage}):\n{r2.stderr}")
-    return r2.stdout
+    return _fix_agx_oscilloscope(r2.stdout)
 
 def main():
     path = sys.argv[1]

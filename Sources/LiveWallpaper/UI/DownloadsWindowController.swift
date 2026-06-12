@@ -4,6 +4,8 @@ import SwiftUI
 extension Notification.Name {
     /// 请求打开「下载管理」窗口(由 UI 发出,AppDelegate 监听)。
     static let showDownloads = Notification.Name("LiveWallpaper.showDownloads")
+    /// 网页里取消订阅 → 请求删除对应本地壁纸(userInfo["id"]=workshop id;AppDelegate 监听)。
+    static let unsubscribeWallpaper = Notification.Name("LiveWallpaper.unsubscribeWallpaper")
 }
 
 /// 用 NSWindow 托管「下载管理」SwiftUI 界面。独立小窗,可与主窗口同时存在。

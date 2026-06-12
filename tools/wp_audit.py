@@ -127,11 +127,11 @@ KNOWN_GAPS = """
   ⚠️ 图层遮挡:头发等不透明层按渲染序盖在脸上(faithful),眼睛靠贴图 alpha 缝隙+puppet warp 精确对位才露出。
   ⚠️ 音频条:渲染对,但靠 ScreenCaptureKit 系统音频驱动;采集守护进程坏(callback 不触发)→ 重启 Mac;壁纸自带音乐默认静音(isMuted,lwe 默认播——未改)。
   ⚠️ 关键帧动画贝塞尔手柄:WEKeyframeAnimation 线性插值,缺 front/back 切线手柄(头发/发饰摇摆缓动机械)。lwe 不实现关键帧,需照 WE 数据补。
-  ⚠️ cropoffset:解析存下但未应用——贴图裁剪重定位,影响 puppet 部件/面具/发饰对位。lwe 无 cropoffset,需照 WE 补。
-  ⚠️ remapvalue+fbmnoise(Gouttes 玻璃水珠):只实现 velocity+simplex,缺 speed+fbm(lwe 本身也没 remapvalue,需照 WE 补)。
+  ✅ cropoffset:**已实现**——按主贴图 .tex 容器是否 POT 判定,POT→origin+cropoffset(经父链scale/angle)应用,非POT→跳过(2026-06,WP_NO_CROPOFFSET 可关)。
+  ✅ remapvalue+fbmnoise:**已实现** velocity+simplex **和** speed+fbm(ParticleSystem remapSourceSpeed/remapFbm/fbm(),带 WE 语义假设标注 octaves4/lacunarity2/gain0.5;lwe 无 remapvalue,按真 WE 移植)。
   ⚠️ 多个 oscillateposition(雪的双摆):单字段只留最后一个。
   ⚠️ 3D 透视相机 eye≠0:未应用(lwe Camera.cpp:50 有透视 eye;正交等价已对,透视待补)。
-  ⚠️ puppet inter-puppet attachment(头挂身体颈骨):数据不在文件→多部件错位;离体UV岛(眼睛)精度待校。lwe 不做 puppet 动画。
+  ✅ puppet inter-puppet attachment:**已实现**(数据在父 .mdl 的 MDAT0001 具名挂点;quad+puppet 统一锚点 attachPos+子origin;眼/睑/耳跟随父骨动画含旋转放大;眨眼)。2026-06-07,凯尔希。lwe 不做。
   ⏭️ VolumeLight/light/shape、camerashake:跳过(lwe 同样未实现,非我方独缺)。
   ⏭️ visible=false / instanced 占位 / projectlayer 容器:合法跳过(faithful)。
 """

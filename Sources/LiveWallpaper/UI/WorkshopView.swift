@@ -176,19 +176,48 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
     private static let subscribeHookJS = """
     (function(){
       if (window.__wpSubHook) return; window.__wpSubHook = true;
-      function post(id){ try { if (id && window.webkit && webkit.messageHandlers && webkit.messageHandlers.wpSubscribe) webkit.messageHandlers.wpSubscribe.postMessage(String(id)); } catch(_){} }
-      function idFrom(b){ var m = (typeof b === 'string') ? b.match(/(?:^|&)id=(\\d+)/) : null; return m ? m[1] : null; }
-      function isSub(u){ u = u || ''; return /\\/sharedfiles\\/subscribe(\\?|$|\\b)/.test(u) && !/unsubscribe/.test(u); }
+      function send(name, v){ try { var h=window.webkit&&webkit.messageHandlers; if (v && h && h[name]) h[name].postMessage(String(v)); } catch(_){} }
+      function bodyStr(b){
+        if (!b) return '';
+        if (typeof b === 'string') return b;
+        try { if (window.URLSearchParams && b instanceof URLSearchParams) return b.toString(); } catch(_){}
+        try { if (window.FormData && b instanceof FormData){ var a=[]; b.forEach(function(v,k){ a.push(k+'='+v); }); return a.join('&'); } } catch(_){}
+        return '';
+      }
+      // 解 protobuf(WebAPI 订阅的 input_protobuf_encoded):取 field 1 varint = publishedfileid
+      function idFromProto(b64){
+        try {
+          var bin = atob(decodeURIComponent(b64).replace(/-/g,'+').replace(/_/g,'/'));
+          var i = 0;
+          while (i < bin.length){
+            var tag = bin.charCodeAt(i++), field = tag >> 3, wire = tag & 7;
+            if (wire === 0){ var val=0, sh=0, by; do { by=bin.charCodeAt(i++); val += (by & 0x7f) * Math.pow(2, sh); sh += 7; } while ((by & 0x80) && i < bin.length); if (field === 1 && val > 1000000) return String(val); }
+            else if (wire === 2){ var len = bin.charCodeAt(i++); i += len; }
+            else if (wire === 5){ i += 4; } else if (wire === 1){ i += 8; } else break;
+          }
+        } catch(_){}
+        return null;
+      }
+      // 端点:WebAPI(主页/浏览,protobuf)+ 社区(详情页,明文 id)。订阅 vs 取消订阅分别处理。
+      function isUnsub(u){ u = u || ''; return /IPublishedFileService\\/Unsubscribe/i.test(u) || /\\/sharedfiles\\/unsubscribe/i.test(u); }
+      function isSub(u){ u = u || ''; return (/IPublishedFileService\\/Subscribe/i.test(u) || /\\/sharedfiles\\/subscribe/i.test(u)) && !isUnsub(u); }
+      function handle(url, body){
+        url = url || '';
+        var unsub = isUnsub(url) || isUnsub(body);
+        var sub = !unsub && (isSub(url) || isSub(body));
+        if (!unsub && !sub) return;
+        var s = body + '&' + url;
+        var m = s.match(/(?:^|&|\\?)(?:id|publishedfileid)=(\\d+)/i);
+        var id = m ? m[1] : null;
+        if (!id){ var p = s.match(/input_protobuf_encoded=([^&\\s]+)/); if (p) id = idFromProto(p[1]); }
+        if (!id) return;
+        send(unsub ? 'wpUnsubscribe' : 'wpSubscribe', id);   // 取消订阅→删本地;订阅→下载
+      }
       var O = XMLHttpRequest.prototype.open, S = XMLHttpRequest.prototype.send;
       XMLHttpRequest.prototype.open = function(m, u){ this.__wu = u; return O.apply(this, arguments); };
-      XMLHttpRequest.prototype.send = function(b){ if (isSub(this.__wu)) { var id = idFrom(b); if (id) post(id); } return S.apply(this, arguments); };
-      if (window.fetch){
-        var F = window.fetch;
-        window.fetch = function(i, init){
-          try { var u = (typeof i === 'string') ? i : (i && i.url) || ''; if (isSub(u)) { var id = idFrom(init && init.body); if (id) post(id); } } catch(_){}
-          return F.apply(this, arguments);
-        };
-      }
+      XMLHttpRequest.prototype.send = function(b){ try { handle(this.__wu, bodyStr(b)); } catch(_){} return S.apply(this, arguments); };
+      if (window.fetch){ var F = window.fetch; window.fetch = function(i, init){ try { var u=(typeof i==='string')?i:(i&&i.url)||''; handle(u, bodyStr(init&&init.body)); } catch(_){} return F.apply(this, arguments); }; }
+      if (navigator.sendBeacon){ var B = navigator.sendBeacon.bind(navigator); navigator.sendBeacon = function(u, d){ try { handle(u, bodyStr(d)); } catch(_){} return B(u, d); }; }
     })();
     """
 
@@ -210,7 +239,9 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
         cfg.userContentController = ucc
         wkWebView = WKWebView(frame: .zero, configuration: cfg)
         super.init()
-        ucc.add(self, name: "wpSubscribe")   // 接收 JS 发回的订阅事件
+        ucc.add(self, name: "wpSubscribe")     // 网页订阅 → 同步下载
+        ucc.add(self, name: "wpUnsubscribe")   // 网页取消订阅 → 同步删除本地壁纸
+        ucc.add(self, name: "wpDebug")         // 诊断(保留,正式版 JS 不再发)
         wkWebView.navigationDelegate = self
         wkWebView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
     }
@@ -218,10 +249,22 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
     /// 收到网页「订阅」事件 → 同步用 SteamCMD 下载该壁纸(已在库则跳过)。
     /// 详情页订阅:用页面标题 + 抓文件大小;浏览网格订阅:用 id 当标题(抓不到大小,进度走块数不受影响)。
     func userContentController(_ ucc: WKUserContentController, didReceive message: WKScriptMessage) {
-        guard message.name == "wpSubscribe", let id = message.body as? String,
-              id.allSatisfy(\.isNumber), id.count >= 6 else { return }
+        if message.name == "wpDebug" { Log.write("WS-DBG \(message.body)"); return }
+        guard let id = message.body as? String, id.allSatisfy(\.isNumber), id.count >= 6 else { return }
+        // 网页取消订阅 → 删除对应本地壁纸(交给 AppDelegate,以便处理正在播放/库刷新)。
+        if message.name == "wpUnsubscribe" {
+            let dest = PreferencesStore.shared.libraryRoot.appendingPathComponent(id)
+            guard FileManager.default.fileExists(atPath: dest.path) else { return }   // 本地没有就不管
+            Log.write("Unsubscribe→delete: 网页取消订阅 \(id),删除本地壁纸")
+            NotificationCenter.default.post(name: .unsubscribeWallpaper, object: nil, userInfo: ["id": id])
+            return
+        }
+        guard message.name == "wpSubscribe" else { return }
         let dest = PreferencesStore.shared.libraryRoot.appendingPathComponent(id)
-        if FileManager.default.fileExists(atPath: dest.path) { return }   // 已在库,不重复下
+        if FileManager.default.fileExists(atPath: dest.path) {   // 已在库,不重复下
+            Log.write("Subscribe→download: \(id) 已在库,跳过"); return
+        }
+        Log.write("Subscribe→download: 捕获订阅 \(id),加入下载队列")
         let onDetail = currentURL?.absoluteString.contains("id=\(id)") ?? false
         if onDetail {
             let title = pageTitle.isEmpty ? id : pageTitle

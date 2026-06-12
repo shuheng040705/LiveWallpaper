@@ -12,11 +12,27 @@ struct WallpaperProperty: Identifiable {
     let order: Int          // 显示顺序
     var condition: String = ""   // 显示条件(如 "clock.value == true"),空=总是显示
     var supported: Bool = true   // 当前渲染是否真支持(否则面板里标灰)
+    // 所属分组标题(WE 的 type='group' 标记):nil=顶层。pkg 用 group 分组时按 order 归组;
+    // pkg 无分组(全库 138 张里 126 张如此)→ 全部 nil → 面板扁平,与 WE 一致(不强行分组)。
+    var group: String? = nil
+    // type=None 的说明文本(作者头/分节说明 HTML 文本):只显示不可交互,渲染为次要文字。
+    var isText: Bool = false
     // 各类型的取值约束
     var sliderMin: Double = 0
     var sliderMax: Double = 1
     var sliderStep: Double = 0.01
     var comboOptions: [(label: String, value: String)] = []
+
+    /// SwiftUI 的 `Slider(in:)` 要求 lowerBound <= upperBound,且零宽区间会异常。
+    /// 某些壁纸的 slider 属性 min/max 反了(或缺 max 默认 1 < min)→ 直接用 `min...max`
+    /// 会触发 "Range requires lowerBound <= upperBound" 致整个 app 崩溃(打不开/黑屏)。
+    /// 这里始终返回一个合法、非零宽的闭区间,任何脏数据都不再崩。
+    var sliderRange: ClosedRange<Double> {
+        let lo = Swift.min(sliderMin, sliderMax)
+        var hi = Swift.max(sliderMin, sliderMax)
+        if !(hi > lo) { hi = lo + Swift.max(abs(sliderStep), 0.0001) }   // 零宽/相等 → 撑开一点
+        return lo...hi
+    }
 
     enum Kind: String {
         case color, bool, slider, combo, textinput
@@ -55,17 +71,45 @@ final class WallpaperPropertyStore: ObservableObject {
         return props
     }
 
-    /// 读取某壁纸的全部可调属性(含当前值)。folderURL 下的 project.json。
+    /// 读取某壁纸的全部可调属性(含当前值),**按 WE 的 order 排序并归组**。
+    /// 归组规则(对齐 WE 属性面板):按 order 升序走查;遇到 `type='group'` 标记开启新分组,
+    /// 其后的属性都归该组,直到下一个 group 标记;首个 group 之前的属性是顶层(group=nil)。
+    /// pkg 没有 group 标记 → 全部顶层 → 面板扁平(满足「pkg 没分类我们也不分类」)。
+    /// type=None 的 HTML 文本(作者头/分节说明)保留为 isText 标签显示;纯分隔条/图片横幅跳过。
     func properties(forID id: String, folderURL: URL) -> [WallpaperProperty] {
         let props = cachedProps(folderURL)
         guard !props.isEmpty else { return [] }
 
+        // 先按 order 排好序再走查(归组依赖顺序)。
+        let entries = props.compactMap { (k, raw) -> (key: String, p: [String: Any], order: Int)? in
+            guard let p = raw as? [String: Any] else { return nil }
+            return (k, p, (p["order"] as? NSNumber)?.intValue ?? 999)
+        }.sorted { $0.order < $1.order }
+
         var out: [WallpaperProperty] = []
-        for (key, raw) in props {
-            guard let p = raw as? [String: Any] else { continue }
+        var currentGroup: String? = nil
+        for e in entries {
+            let p = e.p
             let typeRaw = (p["type"] as? String) ?? ""
-            let order = (p["order"] as? NSNumber)?.intValue ?? 999
-            let label = Self.cleanLabel((p["text"] as? String) ?? key)
+            let rawText = (p["text"] as? String) ?? ""
+
+            // 分组标记:开启新分组(本身不作为可渲染属性)。
+            if typeRaw == "group" {
+                let title = Self.cleanLabel(rawText)
+                currentGroup = title.isEmpty ? nil : title
+                continue
+            }
+
+            // type=None:作者头 / 分节说明文本。纯分隔条(只有装饰符)/纯图片横幅跳过,其余作文本显示。
+            if typeRaw.isEmpty {
+                let plain = Self.plainText(rawText)
+                if plain.isEmpty || Self.isDecorativeOnly(plain) || (rawText.contains("<img") && plain.isEmpty) { continue }
+                var t = WallpaperProperty(id: e.key, type: .label, label: plain, order: e.order)
+                t.group = currentGroup
+                t.isText = true
+                out.append(t)
+                continue
+            }
 
             let kind: WallpaperProperty.Kind
             switch typeRaw {
@@ -74,22 +118,15 @@ final class WallpaperPropertyStore: ObservableObject {
             case "slider": kind = .slider
             case "combo": kind = .combo
             case "textinput": kind = .textinput
-            default: kind = .label   // text/group/scenetexture 等:仅标签
+            default: continue   // scenetexture / usershortcut 等:暂不渲染
             }
-            // 只保留可交互的 + 有意义的标签(纯 HTML 横幅跳过)。
-            guard kind != .label else { continue }
-            // 纯 HTML 横幅/作者推广(关注/赞赏/链接):跳过。
-            // 判据:原文本含 <a>/<img>/http 链接,或清理后为空,或标签过长(说明是段文案不是属性名)。
-            let rawText = (p["text"] as? String) ?? ""
-            let isBanner = rawText.contains("<a ") || rawText.contains("<img") ||
-                           rawText.contains("http") || rawText.contains("space.bilibili")
-            // 只跳过真正的横幅(含链接/图片)或清理后为空的标签。**不再按长度砍** ——
-            // 标签现在取第一段(短),旧的 `label.count > 24` 会把双语控件标签全误杀。
-            if label.isEmpty || isBanner { continue }
+            let label = Self.cleanLabel(rawText.isEmpty ? e.key : rawText)
+            if label.isEmpty { continue }
 
-            var prop = WallpaperProperty(id: key, type: kind, label: label, order: order)
+            var prop = WallpaperProperty(id: e.key, type: kind, label: label, order: e.order)
+            prop.group = currentGroup
             prop.condition = (p["condition"] as? String) ?? ""
-            prop.supported = Self.isSupported(key: key, kind: kind, label: label)
+            prop.supported = Self.isSupported(key: e.key, kind: kind, label: label)
             if kind == .slider {
                 prop.sliderMin = (p["min"] as? NSNumber)?.doubleValue ?? 0
                 prop.sliderMax = (p["max"] as? NSNumber)?.doubleValue ?? 1
@@ -107,7 +144,31 @@ final class WallpaperPropertyStore: ObservableObject {
             }
             out.append(prop)
         }
-        return out.sorted { $0.order < $1.order }
+        return out   // 已按 order 顺序
+    }
+
+    /// 该壁纸是否用 WE 的 type='group' 做了分组(决定面板是否分组渲染)。
+    func hasGroups(forID id: String, folderURL: URL) -> Bool {
+        properties(forID: id, folderURL: folderURL).contains { $0.group != nil }
+    }
+
+    /// 去 HTML 标签 + 解实体 + 压空白,得纯文本(用于 type=None 说明文本整段显示)。
+    /// 与 cleanLabel 不同:不只取第一段,保留整段可读文字(作者头是多语整块)。
+    static func plainText(_ s: String) -> String {
+        var t = s.replacingOccurrences(of: "(?i)<br\\s*/?>", with: " ", options: .regularExpression)
+        t = t.replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+        t = t.replacingOccurrences(of: "&nbsp;", with: " ")
+             .replacingOccurrences(of: "&amp;", with: "&")
+             .replacingOccurrences(of: "&lt;", with: "<").replacingOccurrences(of: "&gt;", with: ">")
+        // 压多余空白
+        t = t.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
+        return t.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 是否只由装饰/分隔符组成(WE 作者常用 ━─│┃═= 等画分隔线 → 我们用折叠分组,分隔线是噪点)。
+    static func isDecorativeOnly(_ plain: String) -> Bool {
+        let decorative = Set("━─│┃═=-_~·•＝＿※*▪▫◆◇■□●○☆★ ")
+        return !plain.isEmpty && plain.allSatisfy { decorative.contains($0) }
     }
 
     /// 当前渲染是否真支持这个属性。

@@ -137,6 +137,68 @@ enum TexDecoder {
         return decodeFirstMipWithFlags(blob)?.tex
     }
 
+    /// 只读 .tex 头(TEXV/TEXI 前 7 个 int),不解码像素。返回:
+    ///   texW/texH = 容器尺寸(POT,如 2048×2048);imgW/imgH = 真实内容尺寸(如 1198×1200)。
+    /// 用途:cropoffset 判定。容器≠内容(texW≠imgW)⇒ 贴图被裁进 POT 容器、内容相对原图发生位移,
+    /// cropoffset 是真实重定位偏移,须应用;texW==imgW(未裁,如 Postscript 五官 680×836 原样存)⇒
+    /// cropoffset 是编辑器残留元数据,套用会让本已正确的裸 origin 散开,**不应用**。
+    /// 头布局与 decodeFirstMipWithFlags:160-167 一致(2 个 C 串 magic + format,flags,texW,texH,imgW,imgH,unk)。
+    static func headerWH(_ blob: Data) -> (texW: Int, texH: Int, imgW: Int, imgH: Int)? {
+        let bytes = [UInt8](blob)
+        var p = 0
+        func readCString() -> String? {
+            guard let nul = bytes[p...].firstIndex(of: 0) else { return nil }
+            let s = String(bytes: bytes[p..<nul], encoding: .ascii)
+            p = nul + 1
+            return s
+        }
+        func readI32() -> Int? {
+            guard p + 4 <= bytes.count else { return nil }
+            let v = UInt32(bytes[p]) | (UInt32(bytes[p+1]) << 8) | (UInt32(bytes[p+2]) << 16) | (UInt32(bytes[p+3]) << 24)
+            p += 4
+            return Int(Int32(bitPattern: v))
+        }
+        guard let m1 = readCString(), m1.hasPrefix("TEXV") else { return nil }
+        guard readCString() != nil else { return nil }                            // TEXI0001
+        guard readI32() != nil, readI32() != nil,                                 // format, flags
+              let texW = readI32(), let texH = readI32(),
+              let imgW = readI32(), let imgH = readI32() else { return nil }
+        return (texW, texH, imgW, imgH)
+    }
+
+    /// .tex 头 + freeimage 判定:返回 (容器 texW/texH, 内容 imgW/imgH, 是否 freeimage 内嵌图片(PNG/JPG/...))。
+    /// 用途:**真 WE 对 freeimage 纹理的 g_TextureNResolution 仍按头部(容器,内容)喂**,而实际 GPU 纹理是
+    /// FreeImage 解码的内容尺寸 → 修正系数 imgH/texH 把 UV 压到内容上半部 = "错位采样"是 WE 的真实行为
+    /// (御剑「影子」遮罩 4096×4096 容器/4096×2296 内容 → 遮罩只用上 56%(发顶区)→ 身体音频条从发缘起、不上脸)。
+    /// lwe 对 FIF 特判成 (内容,内容)=修正1(CTexture.cpp:127-134)→ lwe≠真 WE;我们按真 WE。
+    static func headerInfo(_ blob: Data) -> (texW: Int, texH: Int, imgW: Int, imgH: Int, freeImage: Bool)? {
+        let bytes = [UInt8](blob)
+        var p = 0
+        func readCString() -> String? {
+            guard let nul = bytes[p...].firstIndex(of: 0) else { return nil }
+            let s = String(bytes: bytes[p..<nul], encoding: .ascii)
+            p = nul + 1
+            return s
+        }
+        func readI32() -> Int? {
+            guard p + 4 <= bytes.count else { return nil }
+            let v = UInt32(bytes[p]) | (UInt32(bytes[p+1]) << 8) | (UInt32(bytes[p+2]) << 16) | (UInt32(bytes[p+3]) << 24)
+            p += 4
+            return Int(Int32(bitPattern: v))
+        }
+        guard let m1 = readCString(), m1.hasPrefix("TEXV") else { return nil }
+        guard readCString() != nil else { return nil }                            // TEXI0001
+        guard readI32() != nil, readI32() != nil,                                 // format, flags
+              let texW = readI32(), let texH = readI32(),
+              let imgW = readI32(), let imgH = readI32(), readI32() != nil else { return nil }
+        guard let m3 = readCString(), m3.hasPrefix("TEXB") else { return nil }
+        let ver = Int(String(m3.suffix(1))) ?? 0
+        guard readI32() != nil else { return nil }                                // imageCount
+        var fif = -1
+        if ver >= 3 { fif = readI32() ?? -1 }                                     // freeImageFormat(0003/0004)
+        return (texW, texH, imgW, imgH, fif != -1)
+    }
+
     /// 解码 + 带出 WE 纹理 flags(.tex 头第 2 个 int)。draw 时按 flags 选采样器(repeat/clamp、linear/nearest)。
     /// dataTexture=true:把双通道格式(RG88)当**数据贴图**解(R→R、G→G,如 waterflow 流向场 R=水平/G=垂直、
     /// 法线 RG=xy),而非默认的「亮度 R + alpha G」(精灵/颜色贴图用)。仅特效辅助槽(flowmask/法线/相位)传 true。
