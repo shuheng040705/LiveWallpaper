@@ -79,6 +79,11 @@ final class WEEffectChain {
     struct EffectDef: Codable { let variants: [Variant] }
 
     private let device: MTLDevice
+    // material-key 查找大小写不敏感开关(缓存避免热路径每帧查 env)。修「bloom 过曝整人」类 bug:
+    //   部分转译特效 uniformMeta.material 用大写(bloom 2822917890 的 "Threshold"),pkg constantshadervalues
+    //   小写("threshold")→ 精确查找 miss → 回退 WE 注解默认(threshold 0.1)→ bright-pass 把整个角色纳入泛光。
+    //   全库验证 0 例仅大小写不同的 key 碰撞,且仅精确 miss 时才走小写兜底=原本命中零变化。WP_NO_CASE_INSENSITIVE_PARAM 退。
+    private let caseInsensitiveParams = ProcessInfo.processInfo.environment["WP_NO_CASE_INSENSITIVE_PARAM"] == nil
     private let sampler: MTLSamplerState          // clamp + linear(默认/兜底)
     private let samplerRepeat: MTLSamplerState    // repeat + linear:WE 默认 wrap(无 ClampUVs flag);平铺噪声等
     private let samplerNearest: MTLSamplerState        // clamp  + nearest(NoInterpolation + ClampUVs)
@@ -442,7 +447,8 @@ final class WEEffectChain {
                 default:
                     // 材质常量驱动(g_Roughness/Metallic/SpecularTint/EmissiveColor/g_Overbright/...):
                     // meta.material → 材质 constantshadervalues 真值,缺则退 WE shader 注解默认,再缺留 0。
-                    if let mk = meta[u.name]?.material, let cv = constants[mk] { vals = cv }
+                    if let mk = meta[u.name]?.material,
+                       let cv = constants[mk] ?? (caseInsensitiveParams ? constants.first(where: { $0.key.lowercased() == mk.lowercased() })?.value : nil) { vals = cv }
                     else if let def = meta[u.name]?.default?.value { vals = Self.parseFloats(def) }
                     else { vals = [] }
                 }
@@ -751,8 +757,9 @@ final class WEEffectChain {
                 } else if u.name == "g_Screen" {
                     // 屏幕尺寸 vec3(w,h,aspect);depthparallax vert 声明但未用,给真实值无害。
                     vals = [Float(texW), Float(texH), Float(texW) / Float(max(1, texH))]
-                } else if let mk = meta[u.name]?.material, let pv = pkgParams[mk] {
-                    vals = Self.parseFloats(pv)                       // pkg 用户设的真实值
+                } else if let mk = meta[u.name]?.material,
+                          let pv = pkgParams[mk] ?? (caseInsensitiveParams ? pkgParams.first(where: { $0.key.lowercased() == mk.lowercased() })?.value : nil) {
+                    vals = Self.parseFloats(pv)                       // pkg 用户设的真实值(大小写不敏感兜底)
                 } else if let def = meta[u.name]?.default?.value {
                     vals = Self.parseFloats(def)                      // WE 默认值
                 } else if u.name == "g_Brightness" || u.name == "g_Alpha" || u.name == "g_UserAlpha" {
