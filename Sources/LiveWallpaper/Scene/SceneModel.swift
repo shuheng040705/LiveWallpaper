@@ -495,6 +495,13 @@ struct SceneDocument {
     var cameraShakeAmplitude: Float = 0
     var cameraShakeRoughness: Float = 0   // lwe WallpaperParser.cpp:63 缺省 0
     var cameraShakeSpeed: Float = 0       // lwe WallpaperParser.cpp:64 缺省 0
+    // 用户在「壁纸设置」里改过(覆盖值 ≠ project.json 默认)的属性名集合(project.json key)。
+    //   跨层写回的控制器脚本(土星 Dock)在首帧据此派发 applyUserProperties,触发其重置派生状态
+    //   (隐藏图标);无改动 = 空集 → 脚本走默认值、行为同 pkg(零回归)。
+    var changedUserPropertyNames: [String] = []
+    // 跨层逻辑控制器脚本(applyUserProperties / Dock 显隐):挂在无 image 容器对象 visible 字段、用 getLayer
+    //   写其它层显隐的脚本(土星 Dock 主控)。引擎每帧跑 update + readLayerWrites 回灌目标层。空集 → 零影响。
+    var logicScripts: [WEScript] = []
     // 后处理(fullscreenlayer 上的 bloom/filmgrain/localcontrast 等):真 WE 转译特效链,
     // 按 scene 顺序、仅可见者。在最终合成帧上依次跑 WEEffectChain(替代旧的手写假 bloom)。
     var postChain: [LayerEffect] = []
@@ -518,6 +525,8 @@ struct SceneDocument {
         // 载入该壁纸的属性覆盖(user-key → 值),供 VecParse.unwrap 在解析时套用。
         VecParse.overrides = Self.loadOverrides(item)
         defer { VecParse.overrides = [:] }   // 解析完清掉,避免影响下一个场景
+        // 用户改过(覆盖值 ≠ project.json 默认)的属性名 —— 供跨层控制器脚本(Dock)首帧派发 applyUserProperties。
+        let changedUserPropertyNames = Self.changedUserProperties(item)
 
         // scene.json 可能在根或 scene/ 下。
         let sceneJSON = source.json(for: "scene.json") ?? source.json(for: "scene/scene.json")
@@ -738,6 +747,11 @@ struct SceneDocument {
 
         var layers: [LayerDesc] = []
         var sounds: [SoundDesc] = []
+        // 跨层逻辑控制器脚本(applyUserProperties / Dock 显隐):挂在**无 image 的容器对象** visible 字段、
+        //   用 getLayer 写其它层显隐的脚本(土星 Dock 主控 id=425「Sykm dock」就是这种——无美术内容,纯
+        //   据 scriptProperties.enableDock 每帧写各图标层 alpha/visible)。这类对象会被下方 image guard 丢弃,
+        //   故此处单独收集;引擎安装真实层注册表 + 每帧跑其 update + readLayerWrites 回灌目标层。
+        var logicScripts: [WEScript] = []
         var projectLayers: [ProjectLayerDesc] = []
         var hasCursorRipple = false
         var cursorRippleCutoff = 0
@@ -871,10 +885,6 @@ struct SceneDocument {
                 Log.write("scene: shape/VolumeLight object not supported (id=\(sid), name=\(sname))")
                 continue
             }
-            // 相机路径对象(WE 编辑器 camera track):带 `camera:"default"` 字段、无 image、无 text/sound/light/shape,
-            // 承载 origin/zoom 关键帧 = 2D 场景**运镜**(开场推近再回弹等)。lwe 完全不读此对象(见 CameraPathAnim 注释)。
-            // 只在**确有 origin 或 zoom 关键帧动画**时建 cameraAnim(无 → 不启用,相机静态,零回归)。取首个即可
-            //(scene 一般只一个 camera 路径对象)。WP_NO_CAMERA_ANIM=1 整体退回静态相机(A/B 诊断/逃生开关)。
             // 3D 透视场景的运行时相机对象(camera:"default"、**静态** origin=eye,String 而非关键帧 dict):
             // 取它当真正的相机眼位(看 -z),替代顶层编辑器残留 scene.camera(土星 id=243 origin=(0,0,2.3)→土星居中;
             // 顶层 eye=(3.66,...)→土星左偏)。WP_NO_CAMERA_OBJ=1 退回顶层 scene.camera。
@@ -886,6 +896,8 @@ struct SceneDocument {
                 Log.write("scene: 3D runtime camera object (id=\((obj["id"] as? NSNumber)?.intValue ?? -1)) " +
                           "eye=\(camera.objEye!) fov=\(camera.objFov ?? camera.fov) (替代顶层编辑器残留 scene.camera eye=\(camera.eye))")
             }
+            // 相机路径对象(WE 编辑器 camera track):带 `camera:"default"`、无 image,承载 origin/zoom 关键帧 = 2D 运镜。
+            // 只在**确有 origin/zoom 关键帧动画**时建 cameraAnim(静态相机对象只取上面的 objEye)。WP_NO_CAMERA_ANIM 退。
             if obj["image"] == nil, obj["camera"] != nil,
                ProcessInfo.processInfo.environment["WP_NO_CAMERA_ANIM"] == nil,
                cameraAnim == nil {
@@ -907,6 +919,21 @@ struct SceneDocument {
                               "origin0=\(ca.originAtZero) zoom0=\(ca.zoomAtZero)")
                 }
                 continue   // 相机对象不画美术内容
+            }
+            // 跨层逻辑控制器(applyUserProperties / Dock 显隐):无 image 容器对象,visible 挂用 getLayer 写**其它**层的
+            //   脚本(土星 Dock 主控 id=425:据 scriptProperties.enableDock 每帧写各图标层 alpha/visible)。会被下方
+            //   image guard 丢弃,但正是「关任务栏后隐藏图标」的控制逻辑。收集成 logicScript 由引擎安装层注册表+每帧
+            //   跑 update + readLayerWrites 回灌目标层。仅 {script}+getLayer token+update() 才进 → 零影响。WP_NO_APPLY_USERPROPS 关。
+            if obj["image"] == nil,
+               ProcessInfo.processInfo.environment["WP_NO_APPLY_USERPROPS"] == nil,
+               let vdict = obj["visible"] as? [String: Any], let vsrc = vdict["script"] as? String,
+               vsrc.contains("getLayer") || vsrc.contains("getObjectByName") || vsrc.contains("getObjectById"),
+               let ls = Self.parseVectorScript(obj["visible"],
+                            tag: "logic:\((obj["name"] as? String) ?? "?")", canvas: canvas),
+               ls.usesLayerAPI {
+                logicScripts.append(ls)
+                Log.write("xlayer: collected logic controller '\(obj["name"] as? String ?? "?")' (id=\((obj["id"] as? NSNumber)?.intValue ?? -1))")
+                continue   // 容器对象本身不渲染(无 image),逻辑由 logicScript 承载
             }
             guard let imageRef = obj["image"] as? String else { continue }  // 只取 image 图层
 
@@ -1499,6 +1526,8 @@ struct SceneDocument {
         doc.cameraShakeAmplitude = cameraShakeAmplitude
         doc.cameraShakeRoughness = cameraShakeRoughness
         doc.cameraShakeSpeed = cameraShakeSpeed
+        doc.changedUserPropertyNames = changedUserPropertyNames   // 跨层控制器首帧 applyUserProperties 用
+        doc.logicScripts = logicScripts                           // 无 image 容器上的 Dock 等跨层控制器脚本
         doc.postChain = postChain
         doc.postChainLayerCutoff = postChainLayerCutoff
         doc.postBloom = postBloom; doc.postBloomThreshold = postBloomTh; doc.postBloomStrength = postBloomStr
@@ -2484,12 +2513,17 @@ struct SceneDocument {
         var out: [String: Any] = [:]
         for (k, v) in dict {
             let resolved = VecParse.unwrap(v)
+            // ⚠ NSNumber 必须**先**判 CFBoolean 类型(再决定 Bool/Double),不能用 `case let b as Bool` 兜头:
+            //   JSONSerialization 把 `1`/`0` 解成普通 __NSCFNumber,而 Swift 的 `NSNumber as? Bool` 对 0/1 **会成功**
+            //   (返回 true/false)→ 整数标量 scriptproperty(如 Dock 的 `layoutMode: 1`)会被错当 Bool=true,
+            //   导致脚本里 `config.layoutMode === 1` 恒 false → 布局分支全不跑 → idealTargetalpha 留 undefined →
+            //   target_opa=NaN → 图标 alpha 恒 NaN → Dock 启用时图标也不显示。先按 CFBoolean 判型即可正确区分:
+            //   真布尔(true/false)→ CFBoolean → boolValue;数字(1/0/0.3)→ 普通 NSNumber → doubleValue。
             switch resolved {
-            case let b as Bool: out[k] = b
             case let n as NSNumber:
-                // Bool 经 NSNumber 包装(CFBoolean)时 objCType 是 "c";其余按 Double。
-                if CFGetTypeID(n) == CFBooleanGetTypeID() { out[k] = n.boolValue }
-                else { out[k] = n.doubleValue }
+                if CFGetTypeID(n) == CFBooleanGetTypeID() { out[k] = n.boolValue }   // 真 Bool(CFBoolean)
+                else { out[k] = n.doubleValue }                                       // 数字标量(含整数 1/0)
+            case let b as Bool: out[k] = b                                            // 兜底(理论上 NSNumber 已覆盖)
             case let s as String: out[k] = s
             default: break
             }
@@ -2542,6 +2576,44 @@ struct SceneDocument {
             }
         }
         return out
+    }
+
+    /// 用户在「壁纸设置」里**改过**(有效值 ≠ project.json 默认)的属性名(project.json key)。
+    /// 跨层控制器脚本(土星 Dock)首帧据此派发 applyUserProperties(changed),触发其重置派生状态(隐藏图标)。
+    /// WE 真义:applyUserProperties 在属性**变化**时被调用,changed 是变化的属性集;壁纸加载时已被用户改过的
+    ///   属性(如关掉的 dock=0)也算「相对默认的变化」,故首帧派发它们让脚本立即生效。未改的属性不入集 →
+    ///   脚本走 pkg 默认(零回归)。无 item / 无属性 → 空集。
+    /// 与 loadOverrides 同源(WP_OVERRIDE 诊断通道注入的覆盖也计入「改过」,便于 headless 验证)。
+    private static func changedUserProperties(_ item: WallpaperItem?) -> [String] {
+        guard let item else { return [] }
+        let store = WallpaperPropertyStore.shared
+        let props = store.properties(forID: item.id, folderURL: item.folderURL)
+        // WP_OVERRIDE 诊断键(headless 无 UserDefaults 时):这些显式视为「改过」。
+        var forced = Set<String>()
+        if let ov = ProcessInfo.processInfo.environment["WP_OVERRIDE"], !ov.isEmpty {
+            for pair in ov.split(separator: ";") {
+                let kv = pair.split(separator: "=", maxSplits: 1)
+                if let k = kv.first { forced.insert(String(k).trimmingCharacters(in: .whitespaces)) }
+            }
+        }
+        var changed: [String] = []
+        for p in props where p.type != .label {   // label 是说明文本,无值,跳过
+            let eff = store.value(forID: item.id, property: p, folderURL: item.folderURL)
+            let def = store.defaultValue(forID: item.id, property: p, folderURL: item.folderURL)
+            if forced.contains(p.id) || !Self.valuesEqual(eff, def) { changed.append(p.id) }
+        }
+        return changed
+    }
+
+    /// 比较两个属性值是否相等(判定用户是否改过)。数值用小容差;颜色逐分量容差;布尔/串精确。
+    private static func valuesEqual(_ a: WallpaperProperty.Value, _ b: WallpaperProperty.Value) -> Bool {
+        switch (a, b) {
+        case let (.bool(x), .bool(y)): return x == y
+        case let (.number(x), .number(y)): return abs(x - y) < 1e-6
+        case let (.string(x), .string(y)): return x == y
+        case let (.color(x), .color(y)): return abs(x.x - y.x) < 1e-4 && abs(x.y - y.y) < 1e-4 && abs(x.z - y.z) < 1e-4
+        default: return false
+        }
     }
 
     /// visible 字段:可能是 Bool,或 {"value": Bool, "user": ...}(用户可控属性)。

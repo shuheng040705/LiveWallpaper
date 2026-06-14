@@ -133,6 +133,7 @@ private func textQuad(texW: Float, texH: Float, box: SIMD2<Float>,
 
 private struct GPULayer {
     var id: Int = 0   // pkg 对象 id(诊断:WP_HIDE_IDS 按 id 隐藏图层,定位遮挡者)
+    var name: String = ""   // pkg 对象 name(跨层写回:控制器脚本 getLayer(name) 按名命中目标层,如 Dock 图标 r1/o/l1)
     var sceneObjIndex: Int = .max   // scene.json objects 数组下标(粒子按场景序插画的锚点用)
     var texture: MTLTexture
     var baseModel: simd_float4x4 // 世界变换(不含投影、不含视差)
@@ -1386,6 +1387,7 @@ final class SceneRenderEngine {
                 baseAngleZ: layer.anglesDeg.z
             ))
             result[result.count - 1].id = layer.id   // 诊断用:按 pkg id 隐藏图层(WP_HIDE_IDS)
+            result[result.count - 1].name = layer.name   // 跨层写回:控制器脚本 getLayer(name) 命中目标层
             result[result.count - 1].sceneObjIndex = layer.sceneObjIndex   // 场景对象序(粒子插画锚点)
             result[result.count - 1].puppetAnimLayers = puppetAnimLayers   // 全部可见 animationlayers(additive 叠加)
             result[result.count - 1].puppetCull = eyeCull   // 眼睛层背面剔除(转背虹膜剔掉=闭眼);非眼=.none
@@ -1733,6 +1735,40 @@ final class SceneRenderEngine {
                 Log.write("composeChildFBO: particle group \(gi) (parent=\(pid)) → composelayer id=\(pid) layerIndex=\(L) (child FBO, 不进主场景)")
             }
         }
+        // 跨层写回(applyUserProperties / Dock 显隐):把含 getLayer 的**对象级 visibleScript**(控制器脚本)
+        //   收集起来,给每个安装真实层注册表(setSceneLayers),令其 `thisScene.getLayer(name).visible/alpha=…`
+        //   命中记脏层;每帧 runBool 跑完后 readLayerWrites 回灌目标层(见 update())。土星 Dock 主控脚本据
+        //   scriptProperties.enableDock(已链接用户属性 'dock')每帧写各图标层 alpha/visible —— 用户关任务栏
+        //   (dock=0)→ enableDock=false → 图标 alpha→0、visible=false。配套**首帧**派发 applyUserProperties:
+        //   把**与 pkg 默认不同**的用户属性名告知脚本,触发其 reinitializeCurrentIcons/hideInactiveIcons 立即重置。
+        //   仅含 getLayer token 的 visibleScript 才安装 → 普通自层脚本(时钟/秒/now-playing/音频条)零影响。
+        //   WP_NO_APPLY_USERPROPS=1 整体关闭(退回旧行为)。3D 场景同样启用(Dock 是 2D 覆盖层,在 layers[] 上)。
+        crossLayerScripts.removeAll(keepingCapacity: true)
+        logicScripts.removeAll(keepingCapacity: true)
+        layerIndexById.removeAll(keepingCapacity: true)
+        if ProcessInfo.processInfo.environment["WP_NO_APPLY_USERPROPS"] == nil {
+            for i in layers.indices { layerIndexById[layers[i].id] = i }
+            var seen = Set<ObjectIdentifier>()
+            func collect(_ s: WEScript?) {
+                guard let s = s, s.usesLayerAPI else { return }
+                if seen.insert(ObjectIdentifier(s)).inserted { crossLayerScripts.append(s) }
+            }
+            // ① 无 image 容器上的逻辑控制器(土星 Dock 主控:据 enableDock 写各图标层显隐)。不在 layers[],
+            //    引擎每帧主动跑其 update()(见 update() 跨层读回段)。
+            logicScripts = document.logicScripts
+            for s in logicScripts { collect(s) }
+            // ② 普通图层 visible 字段上的 getLayer 控制器(伊蕾娜昼夜切换等:挂在自身渲染层上)。
+            for i in layers.indices { collect(layers[i].visibleScript) }
+            if !crossLayerScripts.isEmpty {
+                let defs = layers.map { (name: $0.name, id: $0.id) }
+                let changed = document.changedUserPropertyNames   // 用户改过(≠pkg默认)的属性名(如 dock/newproperty10)
+                for s in crossLayerScripts {
+                    s.setSceneLayers(defs)
+                    s.applyUserProperties(changed)   // 首帧派发变更(无导出此函数 → no-op)
+                }
+                Log.write("xlayer: \(crossLayerScripts.count) controller(s) (\(logicScripts.count) logic-layer); \(layerIndexById.count) targets; changed=\(changed)")
+            }
+        }
         lastUpdateTime = -1
         let cbmLayers = layers.filter { $0.colorBlendMode > 0 }
         let cbmInfo = cbmLayers.isEmpty ? "" : " colorBlendMode=\(cbmLayers.map { $0.colorBlendMode })(pipe=\(pipelineColorBlend != nil ? "Y" : "N"))"
@@ -1959,6 +1995,13 @@ final class SceneRenderEngine {
     private var hasKeyframeAnim = false
     private var hasAudioReactiveFX = false   // 任一图层/后处理特效请求 AUDIOPROCESSING(pulse 等)
     private var hasAudioReactiveScript = false  // 任一 origin/scale/angle 脚本用音频(registerAudioBuffers)
+    // 跨层写回(applyUserProperties / Dock 显隐):含 getLayer 的控制器脚本(土星壁纸 Dock 主控:据
+    //   scriptProperties.enableDock 写各图标层 visible/alpha)安装了真实层注册表;每帧 runBool 跑完后
+    //   readLayerWrites → 按 id 把 visible/alpha 应用到目标层。空集(无此类脚本)→ 零开销零影响。
+    //   WP_NO_APPLY_USERPROPS=1 整体关闭(退回旧行为:控制器脚本的跨层写丢弃,Dock 恒显)。
+    private var crossLayerScripts: [WEScript] = []      // 已安装记脏层的控制器脚本(每帧读回其写入)
+    private var logicScripts: [WEScript] = []           // 无 image 容器上的控制器(Dock 主控):不在 layers[],每帧主动跑 update
+    private var layerIndexById: [Int: Int] = [:]        // 目标层 id → layers 下标
     private var currentAudio = WEEffectChain.AudioSpectrum()  // 本帧三套原生频谱(16/32/64),供 WEEffectChain 的音频 uniform
     /// 壁纸自带音频播放(BGM/雨声);与系统声采集(usesAudio,音频条用)无关。默认随 isMuted 静音。
     private let audioPlayback = AudioPlayback()
@@ -2331,6 +2374,61 @@ final class SceneRenderEngine {
             // 视频纹理:每帧拉取当前帧替换图层纹理。
             if let vt = layers[i].video {
                 layers[i].texture = vt.currentTexture()
+            }
+        }
+
+        // 跨层写回(applyUserProperties / Dock 显隐):上面的 per-layer 循环已跑过所有 visibleScript(含 Dock
+        //   主控脚本的 update() 副作用 —— 经 thisScene.getLayer(name).visible/alpha = … 写了**别的**层的记脏 stub)。
+        //   此处读回脚本写过的字段,按 id 应用到目标层。默认只回灌 **visible / alpha**(显隐信号:Dock 关时把图标
+        //   alpha→0、visible=false,这是用户要的「图标隐藏」),不回灌 origin/scale/angles/color —— 后者是脚本在
+        //   3840×2160 假想屏空间算的布局坐标,与 pkg 1920×1080 画布静态布局口径不同,贸然回灌会移位(回归)。
+        //   开 WP_XLAYER_TRANSFORM=1 才额外回灌变换(诊断/激进)。无控制器脚本 → crossLayerScripts 空 → 整段跳过(零影响)。
+        if !crossLayerScripts.isEmpty {
+            // 默认回灌**变换**(origin/scale/angles):Dock 主控脚本把图标排成一行需要这些坐标 —— 只回灌
+            //   visible/alpha 会让图标停在 pkg 静态原点(挤在画布原点几乎不可见)。脚本算的是 3840×2160 屏空间
+            //   坐标,直接作为目标层 origin 落进画布(渲染器再统一缩放到屏幕),实测 Dock 正确排在底部一行。
+            //   WP_NO_XLAYER_TRANSFORM=1 退回「只 visible/alpha」(诊断:控制器写的变换坐标若与某壁纸口径不符可关)。
+            let applyTransform = ProcessInfo.processInfo.environment["WP_NO_XLAYER_TRANSFORM"] == nil
+            let dbg = ProcessInfo.processInfo.environment["WP_DBG_XLAYER"] != nil
+            // 无 image 容器上的逻辑控制器(Dock 主控)不在 layers[] → 此处主动跑其 update()(void;触发
+            //   thisScene.getLayer(name).visible/alpha=… 副作用)。runBool 兼跑首帧 init + intervals。
+            for s in logicScripts { _ = s.runBool(current: true, simTime: time, frametime: dt) }
+            for s in crossLayerScripts {
+                let writes = s.readLayerWrites()
+                if dbg, !writes.isEmpty {
+                    let desc = writes.compactMap { (id, w) -> String? in
+                        guard let ti = layerIndexById[id] else { return nil }
+                        var f: [String] = []
+                        if let v = w.visible { f.append("vis=\(v)") }
+                        if let a = w.alpha { f.append(String(format: "a=%.2f", a)) }
+                        return "\(layers[ti].name)[\(f.joined(separator: ","))]"
+                    }.joined(separator: " ")
+                    if !desc.isEmpty { Log.write("xlayer writes: \(desc)") }
+                }
+                for (id, w) in writes {
+                    guard let ti = layerIndexById[id] else { continue }
+                    if let v = w.visible { layers[ti].visible = v }
+                    if let a = w.alpha, a.isFinite { layers[ti].color.w = a }   // Dock 图标透明度淡入淡出
+                    if applyTransform {
+                        if let c = w.color { layers[ti].color = SIMD4(c.x, c.y, c.z, layers[ti].color.w) }
+                        if w.origin != nil || w.scale != nil || w.angles != nil {
+                            if let o = w.origin { layers[ti].origin = SIMD2(o.x, o.y) }
+                            if let an = w.angles { layers[ti].baseAngleZ = SceneDocument.scriptAngleZToRadians(an.z) }
+                            var sz = layers[ti].sizePx
+                            if let sc = w.scale, layers[ti].baseSize != .zero {
+                                sz = SIMD2(layers[ti].baseSize.x * sc.x, layers[ti].baseSize.y * sc.y); layers[ti].sizePx = sz
+                            }
+                            let off = parallaxOffset(depth: layers[ti].parallax)
+                            layers[ti].baseModel = matModel(centerPx: layers[ti].origin, sizePx: sz, angleDegZ: layers[ti].baseAngleZ)
+                            layers[ti].mvp = proj * matTranslate(off.x, off.y) * layers[ti].baseModel
+                        }
+                    }
+                }
+            }
+            if dbg {
+                let dockState = layers.enumerated().filter { ["r1","o","l1","l8","do","dl1","dr1"].contains($1.name) }
+                    .map { "\($1.name):\($1.visible ? "V" : "h")a\(String(format: "%.2f", $1.color.w))" }.joined(separator: " ")
+                if !dockState.isEmpty { Log.write("xlayer APPLIED: \(dockState)") }
             }
         }
 

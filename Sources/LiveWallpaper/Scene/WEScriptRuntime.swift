@@ -52,6 +52,12 @@ final class WEScript {
     /// 脚本是否在 init 里调 thisScene.createLayer(运行时动态建层,如音频条 64 根 bar)。
     /// 引擎据此走「多实例渲染同一模型」路径(runDynamicBars),不把它当普通 visible/scale 脚本(其 update void)。
     let createsLayers: Bool
+    /// 脚本是否用跨层 API(thisScene.getLayer / engine.getObjectBy*):控制器脚本写**其它**层的
+    /// visible/alpha/origin/scale/…(土星壁纸 Dock 主控脚本据 scriptProperties.enableDock 写各图标层
+    /// `getLayer(name).visible/alpha=…`;伊蕾娜昼夜、夜莺视频时段切换同类)。引擎据此对**此脚本**安装
+    /// 真实层注册表(setSceneLayers)并每帧 readLayerWrites 回灌目标层。仅含此 token 的脚本才安装记脏
+    /// 层 → 普通自层脚本(时钟/秒/now-playing)零影响。
+    let usesLayerAPI: Bool
     /// 上次派发的签名,用于 lwe 式去重:仅在变化时再派发,避免每帧重复触发脚本回调。
     private var lastMediaPropertiesSig: String? = nil
     private var lastMediaTimelineSig: String? = nil
@@ -71,6 +77,8 @@ final class WEScript {
         self.usesAudio = script.contains("registerAudioBuffers") || script.contains("__audio")
         // 纯局部检查:脚本是否运行时建层(thisScene.createLayer,音频条 64 根 bar)。
         self.createsLayers = script.contains("createLayer")
+        // 纯局部检查:脚本是否用跨层 API(getLayer/getObjectBy*)→ 控制器脚本写**其它**层(Dock 显隐等)。
+        self.usesLayerAPI = script.contains("getLayer") || script.contains("getObjectByName") || script.contains("getObjectById")
 
         // JS 异常 → 记一笔并标记失败(update() 仍可能返回 undefined,调用方据 didFail/nil 回退)。
         // 只捕获引用盒(非 self),避免在所有存储属性初始化完成前引用 self。
@@ -160,6 +168,9 @@ final class WEScript {
         self.mediaPropertiesChangedFn = grabFn(context, "mediaPropertiesChanged")
         self.mediaTimelineChangedFn = grabFn(context, "mediaTimelineChanged")
         self.mediaPlaybackChangedFn = grabFn(context, "mediaPlaybackChanged")
+        // applyUserProperties(WE 生命周期:用户改属性时回调):Dock 等控制器脚本导出。有则记下,引擎在场景
+        //   加载后(scriptProperties 已注入用户值)派发已变化的属性名,触发脚本重置派生状态。
+        self.hasApplyUserProperties = hasGlobalFn(context, "applyUserProperties")
         // 纯 media 驱动文本(歌名/艺术家):无 update(),只有 mediaPropertiesChanged 把 now-playing 写进
         // thisLayer.text。这类层"当前字符串"由 dispatchMediaState 设、runString 读回 thisLayer.text,
         // 失败时**不可**回退成时钟(它不是时钟层,见 TextLayerRenderer.currentString)。
@@ -393,10 +404,72 @@ final class WEScript {
         let defs: [[String: Any]] = layers.map { ["name": $0.name, "id": $0.id] }
         context.setObject(defs, forKeyedSubscript: "__weLayerDefs" as NSString)
         context.evaluateScript(WEScript.installLayersSource)
-        // TODO(属性写回 / applyLayerUpdates):lwe 在 evaluate 后会把脚本对层对象的写改(visible/
-        //   alpha/origin/scale/color 等)回灌到引擎 Object(syncLayerObjectProperties 的反向)。
-        //   本轮只做「getLayer 能命中、读属性不抛错」;脚本对返回层对象的修改目前不回灌引擎。
-        //   调用方接入时需:每帧/按需读 __layers[id] 的属性,diff 后应用到对应渲染层。
+        // 跨层写回:installLayersSource 已用 defineProperty 把每个层对象的 visible/alpha/color/origin/
+        //   scale/angles 做成「getter 返默认/脚本写过的值、setter 记脏(_v/_al/...)」。脚本经
+        //   `thisScene.getLayer(name).visible = false`(Dock 据 enableDock 隐藏图标)写入后,引擎每帧调
+        //   readLayerWrites() 读回**仅被脚本写过**的字段、按 id 应用到目标层(见调用方)。
+    }
+
+    /// 一层被脚本写过的属性(跨层写回)。只含脚本**确实写过**的字段(其余 nil → 不动目标层)。
+    struct LayerWrite {
+        var visible: Bool? = nil
+        var alpha: Float? = nil
+        var color: SIMD3<Float>? = nil
+        var origin: SIMD3<Float>? = nil
+        var scale: SIMD3<Float>? = nil
+        var angles: SIMD3<Float>? = nil
+    }
+
+    /// 读回控制器脚本经 `thisScene.getLayer(name).<prop> = …` 写过的属性(跨层写回)。
+    /// 返回 id → 该层被写过的属性集(只含脚本动过的字段)。无 getLayer 写入 / 未安装记脏层 → 空 → 零影响。
+    /// 调用方(SceneRenderEngine 每帧 runBool 跑完脚本后)据此把 visible/alpha 等应用到目标层。
+    func readLayerWrites() -> [Int: LayerWrite] {
+        guard usesLayerAPI,
+              let s = context.evaluateScript(WEScript.readWritesSource)?.toString(),
+              let data = s.data(using: .utf8),
+              let obj = (try? JSONSerialization.jsonObject(with: data)) as? [String: [String: Any]] else { return [:] }
+        var out: [Int: LayerWrite] = [:]
+        func vec3(_ a: Any?) -> SIMD3<Float>? {
+            guard let arr = a as? [Any], arr.count == 3,
+                  let x = (arr[0] as? NSNumber)?.floatValue,
+                  let y = (arr[1] as? NSNumber)?.floatValue,
+                  let z = (arr[2] as? NSNumber)?.floatValue,
+                  x.isFinite, y.isFinite, z.isFinite else { return nil }
+            return SIMD3(x, y, z)
+        }
+        for (k, e) in obj {
+            guard let id = Int(k) else { continue }
+            var w = LayerWrite()
+            if let b = e["v"] as? NSNumber { w.visible = b.boolValue }
+            if let a = e["al"] as? NSNumber, a.floatValue.isFinite { w.alpha = a.floatValue }
+            w.color = vec3(e["c"])
+            w.origin = vec3(e["o"])
+            w.scale = vec3(e["s"])
+            w.angles = vec3(e["an"])
+            if w.visible != nil || w.alpha != nil || w.color != nil || w.origin != nil || w.scale != nil || w.angles != nil {
+                out[id] = w
+            }
+        }
+        return out
+    }
+
+    /// 是否导出了 applyUserProperties(WE 生命周期:用户在设置里改属性时调用,传 changedUserProperties)。
+    private(set) var hasApplyUserProperties: Bool = false
+
+    /// 把「已变化的用户属性」按用户属性名(project.json key,如 'dock')派发给脚本的 applyUserProperties。
+    /// WE 真义:scriptProperties 已经过 {user:'dock'} 链接拿到用户的当前值(本引擎在构造时由 unwrap/overrides
+    /// 完成注入,故 enableDock 已是 false);applyUserProperties(changed) 让脚本据变化**立即重置/更新**派生状态
+    /// (Dock 的 reinitializeCurrentIcons/setAllLayerProperties)。无导出此函数 → no-op(多数脚本在 update 首帧
+    /// init 已读 scriptProperties,不依赖此回调)。
+    /// - Parameter changedUserNames: 已变化的**用户属性名**(project.json key)集合。空集 → no-op。
+    func applyUserProperties(_ changedUserNames: [String]) {
+        guard hasApplyUserProperties, !changedUserNames.isEmpty,
+              let fn = context.objectForKeyedSubscript("applyUserProperties"), fn.isObject else { return }
+        // changedUserProperties:WE 传 {userName: value} 形;脚本(Dock)只用 hasOwnProperty(name)/startsWith('show_'),
+        // 不读 value → 这里传值为 true 的占位对象即可触发其 needsReset/needsIconVisibilityUpdate 分支。
+        var changed: [String: Any] = [:]
+        for n in changedUserNames { changed[n] = true }
+        _ = fn.call(withArguments: [changed])
     }
 
     // MARK: - 媒体事件派发(审计修复 #3)
@@ -648,6 +721,11 @@ final class WEScript {
     };
     globalThis.input = globalThis.input || {
       cursorPosition: new Vec2(0, 0),
+      // cursorScreenPosition:WE 提供的「光标在屏幕的归一化位置 [0,1]」(土星 Dock 主控读它算触发区:
+      //   `3840 * input.cursorScreenPosition.x / engine.screenResolution.x`)。缺它则 Dock update() 读
+      //   `cursorScreenPosition.x` 抛 TypeError → 整段 update 中断 → 图标显隐永不更新(任务栏关不掉)。
+      //   headless 无真实光标 → 给 (0,0) 合理桩(光标在左上角,远离 Dock → isMouseInZone=false,Dock 不悬停)。
+      cursorScreenPosition: new Vec2(0, 0),
       cursorWorldPosition: new Vec3(0, 0, 0)
     };
     globalThis.console = globalThis.console || {
@@ -764,20 +842,39 @@ final class WEScript {
     /// __layerList(有序),并把 thisScene.getLayer/enumerateLayers 指向它们(覆盖 prelude 死桩)。
     /// 层对象在 JS 侧构造,getMaterial 是真正的 JS 函数;属性与 thisLayer/__missingLayer 同构,
     /// 脚本读 name/id/origin/scale/... 均不抛错。对标 lwe installSceneLayers 的双键登记。
+    ///
+    /// 跨层写回:visible/alpha/color/origin/scale/angles 用 defineProperty 记脏(_v/_al/_c/_o/_s/_an),
+    ///   getter 返当前值(默认或脚本写过的)、setter 记脏 → readLayerWrites() 只读回脚本写过的字段。
+    ///   play()/pause()/getVideoTexture()/getTextureAnimation() 给 no-op 桩(Dock 图标的点击/悬停音效层
+    ///   `getLayer("v1").play()` 不抛错;播放真由引擎控)。
     private static let installLayersSource = """
     (function() {
       var defs = globalThis.__weLayerDefs || [];
       var layers = {};
       var list = [];
+      var videoStub = { isPlaying: true, rate: 1, duration: 1e9,
+        play: function(){}, pause: function(){}, stop: function(){},
+        setRate: function(){}, setCurrentTime: function(){}, getCurrentTime: function(){ return 0; } };
+      var animStub = { pause: function(){}, play: function(){}, setFrame: function(){}, getFrame: function(){ return 0; } };
+      function mk(d) {
+        var o = { id: d.id, name: String(d.name || ''), text: '',
+                  _v: null, _al: null, _c: null, _o: null, _s: null, _an: null,
+                  parallaxDepth: new Vec2(0, 0),
+                  getMaterial: function(){ return null; },
+                  getVideoTexture: function(){ return videoStub; },
+                  getTextureAnimation: function(){ return animStub; },
+                  play: function(){}, pause: function(){}, stop: function(){} };
+        Object.defineProperty(o, 'visible', { get: function(){ return this._v === null ? true : this._v; }, set: function(v){ this._v = !!v; }, configurable: true, enumerable: true });
+        Object.defineProperty(o, 'alpha',   { get: function(){ return this._al === null ? 1 : this._al; }, set: function(v){ this._al = +v; }, configurable: true, enumerable: true });
+        Object.defineProperty(o, 'color',   { get: function(){ return this._c || new Vec4(1,1,1,1); }, set: function(v){ this._c = v; }, configurable: true, enumerable: true });
+        Object.defineProperty(o, 'origin',  { get: function(){ return this._o || new Vec3(0,0,0); }, set: function(v){ this._o = v; }, configurable: true, enumerable: true });
+        Object.defineProperty(o, 'scale',   { get: function(){ return this._s || new Vec3(1,1,1); }, set: function(v){ this._s = v; }, configurable: true, enumerable: true });
+        Object.defineProperty(o, 'angles',  { get: function(){ return this._an || new Vec3(0,0,0); }, set: function(v){ this._an = v; }, configurable: true, enumerable: true });
+        return o;
+      }
       for (var i = 0; i < defs.length; i++) {
         var d = defs[i] || {};
-        var obj = {
-          id: d.id, name: String(d.name || ''),
-          visible: true, alpha: 1, text: '',
-          origin: new Vec3(0, 0, 0), scale: new Vec3(1, 1, 1), angles: new Vec3(0, 0, 0),
-          color: new Vec4(1, 1, 1, 1), parallaxDepth: new Vec2(0, 0),
-          getMaterial: function() { return null; }
-        };
+        var obj = mk(d);
         layers[String(d.id)] = obj;          // id 键(字符串化,同 lwe std::to_string(id))
         if (obj.name) layers[obj.name] = obj; // name 键(非空时)
         list.push(obj);
@@ -801,6 +898,26 @@ final class WEScript {
         return 0;
       };
     })();
+    """
+
+    /// 读回**仅被脚本写过**的层属性(跨层写回):遍历 __layers,导出脏字段。Swift 侧按 id 应用到目标层。
+    /// 每 id 去重(name 键与 id 键指向同一对象)。无 __layers / 无写入 → 返回 {} → 引擎不动任何层。
+    private static let readWritesSource = """
+    (function(){
+      var out={}; var L=globalThis.__layers||{}; var seen={};
+      function v3(o){ return o ? [+o.x||0,+o.y||0,+o.z||0] : null; }
+      for(var k in L){ var o=L[k]; if(!o||o.id==null||seen[o.id])continue; seen[o.id]=1;
+        var e={};
+        if(o._v!==null)  e.v = o._v ? 1 : 0;
+        if(o._al!==null) e.al = +o._al;
+        if(o._c!==null)  e.c = [+o._c.x||0,+o._c.y||0,+o._c.z||0];
+        if(o._o!==null)  e.o = v3(o._o);
+        if(o._s!==null)  e.s = v3(o._s);
+        if(o._an!==null) e.an = v3(o._an);
+        if(e.v!==undefined||e.al!==undefined||e.c||e.o||e.s||e.an) out[String(o.id)]=e;
+      }
+      return JSON.stringify(out);
+    })()
     """
 
     /// Swift 字典 → JS 对象(供 __wePropOverrides)。仅处理 Bool/Double/Int/String。
