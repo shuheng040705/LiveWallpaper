@@ -949,6 +949,16 @@ final class SceneRenderEngine {
                    let inv = Self.invertEncodedRGBA(edata) {
                     decTex = inv
                 }
+                // 视频辅助贴图(如 x-ray 的 reveal 是 .tex 内嵌 MP4):取首帧作静态采样源。
+                // 否则 makeTexture(.video) 退 nil → 该辅助槽落 util/white → x-ray 揭示出白雾(实测 3605892961)。
+                // 镜像图层路径(line 892-901)的首帧兜底;全帧 reveal 用首帧即可,1.0 UV 缩放正确。
+                if case .video(let mp4) = decTex {
+                    guard let frame = VideoFrame.firstFrameRGBA8(mp4) else {
+                        Log.write("scene: aux video first-frame failed ref=\(ref)")
+                        return nil
+                    }
+                    decTex = .rgba8(pixels: frame.pixels, width: frame.width, height: frame.height)
+                }
                 guard let t = makeTexture(decTex, loader: loader) else {
                     Log.write("scene: aux texture upload failed ref=\(ref)")
                     return nil
