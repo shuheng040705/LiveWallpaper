@@ -319,8 +319,8 @@ private func matScale2(_ s: Float) -> simd_float4x4 {
 ///   · pan:相机眼位 origin.xy 相对帧0 移动 dp → content 反向平移 −dp(相机右移=画面左移),并随 zoom 同步缩放
 ///     (相机移动量在放大后的画面里也放大,WE 编辑器约定)。
 /// 组合:M = T(c) · S(zoom) · T(−c) · T(−dp·zoom) = T(c) · S(zoom) · T(−c − dp)。
-/// 当 zoom=1 且 dp=0(帧0 / 无运镜)→ M = T(c)·I·T(−c) = identity → proj 逐位不变(零回归)。
-/// center 取**帧0 眼位**(originAtZero):该壁纸帧0 = establishing shot,运镜围绕它推拉。
+/// 当 zoom=1 且 dp=0(静止态 / 无运镜)→ M = T(c)·I·T(−c) = identity → proj 逐位不变(零回归)。
+/// 枢轴 center = 画布中心;pan 相对静止态(末关键帧)= establishing shot,intro 飞入后落到它。
 private func cameraAnimMatrix(center c: SIMD2<Float>, zoom: Float, pan dp: SIMD2<Float>) -> simd_float4x4 {
     let z = max(0.0001, zoom)
     // T(c) · S(z) · T(−c − dp)
@@ -1540,7 +1540,7 @@ final class SceneRenderEngine {
             && ProcessInfo.processInfo.environment["WP_NO_CAMERA_ANIM"] == nil
         if hasCameraAnim, let ca = document.cameraAnim {
             Log.write("scene: camera-path anim ENABLED (origin=\(ca.origin != nil) zoom=\(ca.zoom != nil) " +
-                      "len=\(ca.lengthFrames)f origin0=\(ca.originAtZero) zoom0=\(ca.zoomAtZero))")
+                      "len=\(ca.lengthFrames)f originRest=\(ca.originAtRest) zoomRest=\(ca.zoomAtRest))")
         }
         // lwe 视差含 (depth+amount) 项 → amount≠0 时连 depth=0 的层也随相机平移(CImage.cpp:1104)。
         // 故相机视差开启即视为「有动画」(否则纯背景视差场景被当静态图、鼠标移动不重绘)。
@@ -2133,14 +2133,14 @@ final class SceneRenderEngine {
         // 无运镜对象(hasCameraAnim=false,绝大多数壁纸)→ proj 恒 = baseProj(此分支不进,逐位不变,零回归)。
         if hasCameraAnim, let ca = cameraAnim {
             // 求值 zoom(标量,非 relative)与 origin.xy(已含 base 偏移)。
-            let zoom = ca.zoom?.evaluate(time: t).first ?? ca.zoomAtZero
+            let zoom = ca.zoom?.evaluate(time: t).first ?? ca.zoomAtRest
             var dp = SIMD2<Float>(0, 0)
             if let oa = ca.origin {
                 let ov = oa.evaluate(time: t)
-                let ox = ov.count > 0 ? ov[0] : ca.originAtZero.x
-                let oy = ov.count > 1 ? ov[1] : ca.originAtZero.y
-                // pan = 相机眼位相对帧0 的移动量(画布像素)。帧0 → dp=0。
-                dp = SIMD2(ox - ca.originAtZero.x, oy - ca.originAtZero.y)
+                let ox = ov.count > 0 ? ov[0] : ca.originAtRest.x
+                let oy = ov.count > 1 ? ov[1] : ca.originAtRest.y
+                // pan = 相机眼位相对**静止态(末关键帧)**的移动量(画布像素)。稳态 → dp=0(内容居中)。
+                dp = SIMD2(ox - ca.originAtRest.x, oy - ca.originAtRest.y)
                 // WP_NO_CAMERA_PAN=1:只做 zoom 推近(不平移),A/B 诊断(zoom 是已验证的主运镜分量)。
                 if ProcessInfo.processInfo.environment["WP_NO_CAMERA_PAN"] != nil { dp = .zero }
             }

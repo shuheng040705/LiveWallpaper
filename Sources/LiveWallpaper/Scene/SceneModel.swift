@@ -450,9 +450,12 @@ struct CameraPathAnim {
     var zoom: WEKeyframeAnimation?     // 缩放因子标量关键帧(非 relative)
     var lengthFrames: Float = 180      // 一个 cycle 总帧数(origin.options.length;@30fps)
     var fps: Float = 30
-    // 帧0(中性/establishing)取景值,作 pan/zoom 的参考基准(运镜矩阵在 t=帧0 时 = identity)。
-    var originAtZero: SIMD2<Float> = .zero   // origin.xy(frame 0)
-    var zoomAtZero: Float = 1                // zoom(frame 0)
+    // 静止态(末关键帧 = establishing/resting shot)取景值,作 pan/zoom 的参考基准。
+    // 运镜矩阵在稳态时 = identity → 内容居中;intro 从帧0(俯冲/拉远)飞入、落到此静止态。
+    // ⚠ 必须取静止态而非帧0:Lucy 这类 intro 从帧0 落到 (0,0),取帧0 作基准会让稳态永久偏
+    //   (末关键帧 − 帧0)之差(Lucy = -1470px 竖偏 → 内容顶到上方、下方露灰底)。
+    var originAtRest: SIMD2<Float> = .zero   // origin.xy(末关键帧/静止)
+    var zoomAtRest: Float = 1                // zoom(末关键帧/静止)
     /// 该相机对象是否真带可驱动运镜的关键帧(origin 或 zoom 任一有动画且非恒定)。无 → 不启用(零回归)。
     var hasAnimation: Bool { origin != nil || zoom != nil }
 }
@@ -907,16 +910,17 @@ struct SceneDocument {
                     var ca = CameraPathAnim(origin: originAnim, zoom: zoomAnim)
                     if let oa = originAnim {
                         ca.lengthFrames = oa.length; ca.fps = oa.fps
-                        let v0 = oa.evaluate(time: 0)   // 帧0 中性取景眼位(已含 base 偏移)
-                        ca.originAtZero = SIMD2(v0.count > 0 ? v0[0] : 0, v0.count > 1 ? v0[1] : 0)
+                        // 静止态眼位 = 末关键帧(mode:single 在 length 之后 clamp 到最后一帧)。已含 base 偏移。
+                        let vr = oa.evaluate(time: oa.length / max(1, oa.fps))
+                        ca.originAtRest = SIMD2(vr.count > 0 ? vr[0] : 0, vr.count > 1 ? vr[1] : 0)
                     } else if let za = zoomAnim {
                         ca.lengthFrames = za.length; ca.fps = za.fps
                     }
-                    if let za = zoomAnim { ca.zoomAtZero = za.evaluate(time: 0).first ?? 1 }
+                    if let za = zoomAnim { ca.zoomAtRest = za.evaluate(time: za.length / max(1, za.fps)).first ?? 1 }
                     cameraAnim = ca
                     Log.write("scene: camera-path anim (id=\((obj["id"] as? NSNumber)?.intValue ?? -1)) " +
                               "origin=\(originAnim != nil) zoom=\(zoomAnim != nil) len=\(ca.lengthFrames)f@\(ca.fps) " +
-                              "origin0=\(ca.originAtZero) zoom0=\(ca.zoomAtZero)")
+                              "originRest=\(ca.originAtRest) zoomRest=\(ca.zoomAtRest)")
                 }
                 continue   // 相机对象不画美术内容
             }
