@@ -163,6 +163,193 @@ final class WEEffectChain {
         return try? device.makeRenderPipelineState(descriptor: d)
     }()
 
+    // ───────────────────────────────────────────────────────────────────────────
+    // 忠实 bloom(workshop/2822917890,WE 内建 "Bloom" 特效)——修「开 bloom 冲白皮肤」。
+    //
+    // 根因(从 pkg shader 逐 pass + 转译 .metal 对照):tools/generated 里 2822917890 的 4 个转译
+    //   .metal(light_map/blur_gaussian/apply)是从**另一(更早)版本**的 bloom shader 转译来的,
+    //   与本壁纸 pkg 内 shaders/workshop/2822917890/effects/*.frag **算法不同**,且四处放大:
+    //   ① light_map(转译版):luma=dot(pow(color,gamma),1) 二值阈值后把**整块亮色原样**纳入(无
+    //      `saturate(avg-threshold)` 的「只取超出阈值的部分」),且**漏乘** `strength*radius*0.25`,
+    //      改成乘 weight(=4 tap 通道和,数值很大)再 /4 → 亮皮肤全幅能量都进辉光。
+    //   ② blur_gaussian(转译版):`albedo = albedo * u_strength / divisor`——**多乘了一次 strength**
+    //      (1.48);真 pkg blur 只做归一化均值 `albedo /= 2*iter+1`,不放大。两道 blur → 1.48² 再放大。
+    //   ③ apply(转译版):只取 **1 tap**、且**漏乘 0.4** 衰减;真 pkg apply 取 5 tap 求和 `* 0.4 * tint`。
+    //   合计:辉光被放大到远超 WE → additive blend 把亮皮肤区叠成泛白。仅调 threshold/gamma 治标不治本。
+    //
+    // 修法:用本内联 MSL **忠实重写** pkg 的 light_map / blur_gaussian / apply 三 shader(算法/缩放
+    //   逐行对齐 pkg .frag),按单尺度 /4 近似 pyramid(与原 4-pass manifest 同结构,只是数学正确):
+    //     light_map → blurH → blurV → apply。参数取 pkg constantshadervalues 真值(threshold/gamma/
+    //     strength/radius/Tint/opacity),缺则 WE 注解默认。不自创降强度。
+    //   WP_NO_BLOOM_FIX=1 退回原转译 .metal 链(A/B 对照)。
+    private static let bloomShaderSrc = """
+    #include <metal_stdlib>
+    using namespace metal;
+    struct VIn  { float3 pos [[attribute(0)]]; float2 uv [[attribute(1)]]; };
+    struct VOut { float4 position [[position]]; float2 uv; };
+    vertex VOut bloom_vertex(VIn in [[stage_in]]) {
+        VOut o; o.position = float4(in.pos, 1.0); o.uv = in.uv; return o;
+    }
+    // light_map(对应 pkg light_map.frag,MODE=0 Brightness):4 个邻域 tap 求(带 alpha 权重的)均值,
+    //   saturate(avg - threshold) 只保留超出阈值的部分,pow(·, gamma) 陡峭衰减,× strength*radius*0.25。
+    //   texel = 1/分辨率(对齐 pkg light_map.vert 的 offsets=1/g_Texture0Resolution)。
+    struct LMArgs { float strength; float gamma; float threshold; float radius; float texelX; float texelY; };
+    fragment float4 bloom_lightmap(VOut in [[stage_in]],
+                                   constant LMArgs& a [[buffer(0)]],
+                                   texture2d<float> g_Texture0 [[texture(0)]],
+                                   sampler smp [[sampler(0)]]) {
+        float2 off = float2(a.texelX, a.texelY);
+        float3 lightMap = float3(0.0);
+        float weight = 0.0;
+        // 与 pkg 一致:strength 太小则不产生辉光。
+        if (a.strength > 0.001) {
+            float2 taps[4] = {
+                in.uv - off,
+                in.uv + float2(off.x, -off.y),
+                in.uv + float2(-off.x, off.y),
+                in.uv + off,
+            };
+            for (int i = 0; i < 4; ++i) {
+                float4 s = g_Texture0.sample(smp, taps[i]);
+                lightMap += s.rgb * s.a;
+                weight   += s.a;
+            }
+            float3 avg = (weight > 0.0001) ? (lightMap / weight) : float3(0.0);
+            lightMap = pow(saturate(avg - float3(a.threshold)), float3(a.gamma));
+        }
+        return float4(lightMap * a.strength * a.radius * 0.25, 1.0);
+    }
+    // 可分离高斯模糊(对应 pkg blur_gaussian.frag,LOW quality iterations=2):±2 tap 求**算术均值**,
+    //   绝不乘 strength。step = (radius*2)*1.5*texel(对齐 pkg blur_gaussian.vert v_SizeMultiplier,
+    //   ANAMORPHIC=0 → aRatio=1)。vertical=0 横向、=1 纵向。
+    struct BlurArgs { float radius; float texelX; float texelY; float vertical; };
+    fragment float4 bloom_blur(VOut in [[stage_in]],
+                               constant BlurArgs& a [[buffer(0)]],
+                               texture2d<float> g_Texture0 [[texture(0)]],
+                               sampler smp [[sampler(0)]]) {
+        const int iters = 2;
+        float2 sm = (a.vertical > 0.5)
+            ? float2(0.0, (a.radius + a.radius) * 1.5 * a.texelY)
+            : float2((a.radius + a.radius) * 1.5 * a.texelX, 0.0);
+        float3 acc = float3(0.0);
+        for (int i = -iters; i <= iters; ++i) {
+            acc += g_Texture0.sample(smp, in.uv + sm * float(i)).rgb;
+        }
+        acc /= float(iters + iters) + 1.0;
+        return float4(acc, 1.0);
+    }
+    // apply(对应 pkg apply.frag,BLENDMODE=31 additive bloom):5 tap 求和 × 0.4 × tint,
+    //   结果 = base + bloom*(alpha)。stepSize = 1/分辨率(对齐 pkg apply.vert v_StepSize)。
+    struct ApplyArgs { float alpha; float3 tint; float stepX; float stepY; };
+    fragment float4 bloom_apply(VOut in [[stage_in]],
+                                constant ApplyArgs& a [[buffer(0)]],
+                                texture2d<float> g_Bloom [[texture(0)]],
+                                texture2d<float> g_Base  [[texture(1)]],
+                                sampler smp [[sampler(0)]]) {
+        float4 base = g_Base.sample(smp, in.uv);
+        float3 outc = base.rgb;
+        if (a.alpha > 0.001) {
+            float4 ss = float4(-a.stepX, -a.stepY, a.stepX, a.stepY);
+            float3 b = g_Bloom.sample(smp, in.uv).rgb;
+            b += g_Bloom.sample(smp, in.uv + ss.xy).rgb;
+            b += g_Bloom.sample(smp, in.uv + ss.zy).rgb;
+            b += g_Bloom.sample(smp, in.uv + ss.xw).rgb;
+            b += g_Bloom.sample(smp, in.uv + ss.zw).rgb;
+            b *= 0.4 * a.tint;
+            outc = base.rgb + b * a.alpha;   // ApplyBlending(31) = A + B*opacity(additive)
+        }
+        return float4(outc, base.a);
+    }
+    """
+    private lazy var bloomPipelines: (lightmap: MTLRenderPipelineState,
+                                      blur: MTLRenderPipelineState,
+                                      apply: MTLRenderPipelineState)? = {
+        guard let lib = try? device.makeLibrary(source: Self.bloomShaderSrc, options: nil),
+              let vfn = lib.makeFunction(name: "bloom_vertex") else { return nil }
+        func make(_ frag: String) -> MTLRenderPipelineState? {
+            guard let ffn = lib.makeFunction(name: frag) else { return nil }
+            let d = MTLRenderPipelineDescriptor()
+            d.vertexFunction = vfn; d.fragmentFunction = ffn
+            d.colorAttachments[0].pixelFormat = .bgra8Unorm
+            let vd = MTLVertexDescriptor()
+            vd.attributes[0].format = .float3; vd.attributes[0].offset = 0;  vd.attributes[0].bufferIndex = 1
+            vd.attributes[1].format = .float2; vd.attributes[1].offset = 12; vd.attributes[1].bufferIndex = 1
+            vd.layouts[1].stride = 20
+            d.vertexDescriptor = vd
+            return try? device.makeRenderPipelineState(descriptor: d)
+        }
+        guard let lm = make("bloom_lightmap"), let bl = make("bloom_blur"), let ap = make("bloom_apply") else { return nil }
+        return (lm, bl, ap)
+    }()
+
+    /// 忠实 bloom 链(单尺度 /4 近似)。input = 该层(已 composelayer copy 进层空间的)纹理;返回叠加辉光后的层纹理。
+    /// 参数取 pkg 合并版 pkgParams(threshold/gamma/strength/radius/Tint/opacity,大小写不敏感),缺则 WE 默认。
+    private func runFaithfulBloom(input: MTLTexture, pkgParams: [String: Any], commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
+        guard let pl = bloomPipelines else { return nil }
+        // 大小写不敏感取参(pkg "Threshold"/"Gamma"/"Tint" 等);缺则 WE shader 注解默认。
+        func p(_ key: String, _ def: Float) -> Float {
+            for (k, v) in pkgParams where k.lowercased() == key.lowercased() {
+                let f = Self.parseFloats(v); if let first = f.first { return first }
+            }
+            return def
+        }
+        func tint() -> SIMD3<Float> {
+            for (k, v) in pkgParams where k.lowercased() == "tint" {
+                let f = Self.parseFloats(v); if f.count >= 3 { return SIMD3(f[0], f[1], f[2]) }
+            }
+            return SIMD3(1, 1, 1)
+        }
+        let strength = p("strength", 1.0)   // pkg light_map default 注解 = 1
+        let gamma    = p("gamma", 2.4)
+        let threshold = p("threshold", 0.1)
+        let radius   = p("radius", 4.0)
+        let alpha    = p("opacity", 1.0)
+        let tnt = tint()
+        let fullW = input.width, fullH = input.height
+        // /4 尺度的辉光缓冲(对齐 manifest targetScale=4,= pyramid 中间尺度的代表)。
+        let bw = max(1, fullW / 4), bh = max(1, fullH / 4)
+        guard let buf1 = renderTarget("_bloomfix_b1", width: bw, height: bh),
+              let buf2 = renderTarget("_bloomfix_b2", width: bw, height: bh),
+              let outTex = makeTarget(width: fullW, height: fullH) else { return nil }
+
+        func encode(_ ps: MTLRenderPipelineState, target: MTLTexture,
+                    tex0: MTLTexture, tex1: MTLTexture? = nil,
+                    args: UnsafeRawPointer, argLen: Int) {
+            let pass = MTLRenderPassDescriptor()
+            pass.colorAttachments[0].texture = target
+            pass.colorAttachments[0].loadAction = .clear
+            pass.colorAttachments[0].storeAction = .store
+            pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
+            guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return }
+            enc.setRenderPipelineState(ps)
+            enc.setVertexBuffer(quadBuf, offset: 0, index: 1)
+            enc.setFragmentBytes(args, length: argLen, index: 0)
+            enc.setFragmentTexture(tex0, index: 0)
+            enc.setFragmentSamplerState(sampler, index: 0)
+            if let t1 = tex1 { enc.setFragmentTexture(t1, index: 1); enc.setFragmentSamplerState(sampler, index: 1) }
+            enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
+            enc.endEncoding()
+        }
+
+        // pass0 light_map:input(全尺寸)→ buf1(/4)。texel 用 buf1 的尺寸(采样输入时邻域偏移按目标格点)。
+        var lm = (Float(strength), Float(gamma), Float(threshold), Float(radius),
+                  Float(1.0 / Float(max(1, bw))), Float(1.0 / Float(max(1, bh))))
+        withUnsafeBytes(of: &lm) { encode(pl.lightmap, target: buf1, tex0: input, args: $0.baseAddress!, argLen: $0.count) }
+        // pass1 blurH:buf1 → buf2。pass2 blurV:buf2 → buf1。texel = /4 缓冲尺寸。
+        let texX = Float(1.0 / Float(max(1, bw))), texY = Float(1.0 / Float(max(1, bh)))
+        var bH = (Float(radius), texX, texY, Float(0.0))
+        withUnsafeBytes(of: &bH) { encode(pl.blur, target: buf2, tex0: buf1, args: $0.baseAddress!, argLen: $0.count) }
+        var bV = (Float(radius), texX, texY, Float(1.0))
+        withUnsafeBytes(of: &bV) { encode(pl.blur, target: buf1, tex0: buf2, args: $0.baseAddress!, argLen: $0.count) }
+        // pass3 apply:buf1(辉光)+ input(底)→ outTex(全尺寸)。stepSize = 1/辉光缓冲尺寸(5-tap 邻域)。
+        // ApplyArgs std140:float alpha; float3 tint(16B 对齐)→ tint 在 offset 16;stepX/Y 在 28/32。
+        var ap = (Float(alpha), Float(0), Float(0), Float(0),   // alpha + 3 pad(对齐 float3)
+                  tnt.x, tnt.y, tnt.z,                          // tint(offset 16)
+                  texX, texY)                                   // stepX/Y(offset 28/32)
+        withUnsafeBytes(of: &ap) { encode(pl.apply, target: outTex, tex0: buf1, tex1: input, args: $0.baseAddress!, argLen: $0.count) }
+        return outTex
+    }
+
     /// 该层屏幕投影 footprint 的复制 quad 顶点(pos.xyz 单位 NDC[-1,1] 填满 FBO + uv=屏幕投影 UV)。
     /// 顶点序/UV 与 quadVerts 一致(triangle strip 4 顶点),pos 不变;uv 由单位 quad 角点经 mvp 投到屏幕得到。
     /// 单位 quad 角点取自 quadVerts 的 uv:uv(u,v) ↔ 单位 quad 位置 (u-0.5, 0.5-v),与 encode 末 pass
@@ -900,6 +1087,14 @@ final class WEEffectChain {
                 cenc.endEncoding()
                 input = layerTex
             }
+        }
+        // 忠实 bloom 短路(workshop/2822917890):该 effect 的转译 .metal 链是另一(更早)版本、四处放大 →
+        // 开 bloom 把亮皮肤冲白。改跑 runFaithfulBloom(逐行对齐 pkg shader,见上方 bloomShaderSrc 注释),
+        // 用合并版 pkgParams 取真值参数(threshold/gamma/strength/radius/Tint/opacity)。WP_NO_BLOOM_FIX=1 退回原链。
+        if key == "workshop/2822917890/bloom",
+           ProcessInfo.processInfo.environment["WP_NO_BLOOM_FIX"] == nil,
+           let out = runFaithfulBloom(input: input, pkgParams: pkgParams, commandBuffer: cmd) {
+            return out
         }
         let w = input.width, h = input.height
         // 审计修复 #2:把本次 run 的 combos 归一成整数,供 bind.conditions 判定(在 pass 循环外算一次)。
