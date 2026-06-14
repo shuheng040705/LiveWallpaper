@@ -420,6 +420,37 @@ struct CameraDesc {
     var isPerspective: Bool = false
 }
 
+/// 2D 场景**相机运镜**(per-object camera path 的 origin/zoom 关键帧动画)。
+/// === 来源与机制(WE 真义,lwe 未实现)===
+/// 部分壁纸的 scene.json objects 里有一个特殊对象带 `camera:"default"` 字段(无 image/text/sound/light/shape),
+/// 它是**相机路径对象**(WE 编辑器的 camera track):
+///   · `origin`:相机眼位(canvas 像素空间),`{animation:{c0,c1,c2}, value:base}` 三通道(x/y/z),`relative:true`
+///     → 关键帧值是相对 base 的偏移(已在 WEKeyframeAnimation.evaluate 里 +base)。base 通常 = 画布中心 z=500。
+///   · `zoom`:标量缩放因子,`{animation:{c0}, value:1}`,**非 relative**。1=原始取景,>1=推近(content 放大)。
+///   · `path`:指向 scripts/camera_paths_*.json(实测多为 `{"paths":[]}` 空 → 仅靠 origin/zoom 关键帧驱动)。
+/// === lwe 是否实现 ===
+/// **否**(穷尽确认):lwe Camera 只 setOrthogonalProjection(eye/center/up 静态),CScene.cpp:34/74 读的是
+/// scene 顶层 `camera` 子节(center/eye/up),从不读 objects 里的 camera-path 对象,没有 origin/zoom 关键帧求值,
+/// `zoom` 在 lwe 仅指**纹理 UV 填充模式**(ZoomFit/ZoomFill,与运镜无关)。故照真 WE 数据语义自实现。
+/// === 投影映射(正交场景)===
+/// 静态正交 proj 把画布像素映到 NDC。相机运镜 = 在 proj **之前**对世界(画布像素)做仿射:
+///   1) zoom:绕**取景中心**(base.xy=画布中心)缩放 zoom 倍(zoom=3 → content 3× 放大 = 推近);
+///   2) pan:相机眼位 origin.xy 相对**帧0值**移动 → content 反向平移(相机右移=画面左移)。
+///      用帧0(非 base)作中性参考:frame0 的 origin/zoom = establishing shot(本壁纸 origin(0)=(0,0)、zoom=1)。
+/// origin.z 在正交投影下不改变取景尺寸(ortho 无透视),推近完全由 zoom 表达(WE 正交场景的运镜约定)。
+/// 引擎据此每帧重算等效 proj(无相机动画的壁纸 = identity 运镜矩阵 → proj 逐位不变,零回归)。
+struct CameraPathAnim {
+    var origin: WEKeyframeAnimation?   // 相机眼位 xyz 关键帧(canvas 像素;relative→已含 base)
+    var zoom: WEKeyframeAnimation?     // 缩放因子标量关键帧(非 relative)
+    var lengthFrames: Float = 180      // 一个 cycle 总帧数(origin.options.length;@30fps)
+    var fps: Float = 30
+    // 帧0(中性/establishing)取景值,作 pan/zoom 的参考基准(运镜矩阵在 t=帧0 时 = identity)。
+    var originAtZero: SIMD2<Float> = .zero   // origin.xy(frame 0)
+    var zoomAtZero: Float = 1                // zoom(frame 0)
+    /// 该相机对象是否真带可驱动运镜的关键帧(origin 或 zoom 任一有动画且非恒定)。无 → 不启用(零回归)。
+    var hasAnimation: Bool { origin != nil || zoom != nil }
+}
+
 /// 解析后的场景文档:画布尺寸 + 背景色 + 图层列表(按绘制顺序,后画的在上)。
 struct SceneDocument {
     var canvasWidth: Float
@@ -434,6 +465,9 @@ struct SceneDocument {
     var sounds: [SoundDesc] = []
     // 完整相机(WallpaperParser.cpp:46-78)。渲染仍只用 ortho w/h(=画布);其余存下供未来透视相机。
     var camera = CameraDesc()
+    // 2D 场景相机**运镜**(objects 里 camera:"default" 路径对象的 origin/zoom 关键帧):开场推近再回弹等。
+    // nil(绝大多数壁纸无此对象)→ 相机完全静态(零回归)。非 nil → 引擎每帧按求值的 zoom/pan 重算等效投影。
+    var cameraAnim: CameraPathAnim? = nil
     // projectlayer / FBO 组合层(ObjectParser 的 projectlayer + EffectParser 的 fbos/command)。
     // 解析建模存下,FBO 链的实际搭建/渲染由 SceneRenderEngine 负责(本任务不渲染)。
     var projectLayers: [ProjectLayerDesc] = []
@@ -538,6 +572,9 @@ struct SceneDocument {
         let cameraShakeSpeed = gf("camerashakespeed", 0)          // lwe WallpaperParser.cpp:64 缺省 0
 
         let objects = scene["objects"] as? [[String: Any]] ?? []
+
+        // 2D 场景相机运镜(camera:"default" 路径对象的 origin/zoom 关键帧);在主对象循环里检测填充,末尾写回 doc。
+        var cameraAnim: CameraPathAnim? = nil
 
         // 父子图层:child 的 origin 是相对 parent 的偏移。先建 id→局部origin / id→parent 表,
         // 再算每个图层的累积绝对 origin(沿 parent 链相加)。11/43 场景用到(如咕咕嘎嘎企鹅各部件)。
@@ -827,6 +864,32 @@ struct SceneDocument {
                 }
                 Log.write("scene: shape/VolumeLight object not supported (id=\(sid), name=\(sname))")
                 continue
+            }
+            // 相机路径对象(WE 编辑器 camera track):带 `camera:"default"` 字段、无 image、无 text/sound/light/shape,
+            // 承载 origin/zoom 关键帧 = 2D 场景**运镜**(开场推近再回弹等)。lwe 完全不读此对象(见 CameraPathAnim 注释)。
+            // 只在**确有 origin 或 zoom 关键帧动画**时建 cameraAnim(无 → 不启用,相机静态,零回归)。取首个即可
+            //(scene 一般只一个 camera 路径对象)。WP_NO_CAMERA_ANIM=1 整体退回静态相机(A/B 诊断/逃生开关)。
+            if obj["image"] == nil, obj["camera"] != nil,
+               ProcessInfo.processInfo.environment["WP_NO_CAMERA_ANIM"] == nil,
+               cameraAnim == nil {
+                let originAnim = WEKeyframeAnimation.parse(obj["origin"])
+                let zoomAnim = WEKeyframeAnimation.parse(obj["zoom"])
+                if originAnim != nil || zoomAnim != nil {
+                    var ca = CameraPathAnim(origin: originAnim, zoom: zoomAnim)
+                    if let oa = originAnim {
+                        ca.lengthFrames = oa.length; ca.fps = oa.fps
+                        let v0 = oa.evaluate(time: 0)   // 帧0 中性取景眼位(已含 base 偏移)
+                        ca.originAtZero = SIMD2(v0.count > 0 ? v0[0] : 0, v0.count > 1 ? v0[1] : 0)
+                    } else if let za = zoomAnim {
+                        ca.lengthFrames = za.length; ca.fps = za.fps
+                    }
+                    if let za = zoomAnim { ca.zoomAtZero = za.evaluate(time: 0).first ?? 1 }
+                    cameraAnim = ca
+                    Log.write("scene: camera-path anim (id=\((obj["id"] as? NSNumber)?.intValue ?? -1)) " +
+                              "origin=\(originAnim != nil) zoom=\(zoomAnim != nil) len=\(ca.lengthFrames)f@\(ca.fps) " +
+                              "origin0=\(ca.originAtZero) zoom0=\(ca.zoomAtZero)")
+                }
+                continue   // 相机对象不画美术内容
             }
             guard let imageRef = obj["image"] as? String else { continue }  // 只取 image 图层
 
@@ -1426,6 +1489,7 @@ struct SceneDocument {
         doc.postLocalContrast = postLC; doc.postLocalContrastStrength = postLCStr
         doc.sounds = sounds
         doc.camera = camera
+        doc.cameraAnim = cameraAnim
         doc.projectLayers = projectLayers
 
         // 渲染覆盖清单:逐 scene 对象列出【已渲染/未渲染 + 原因】,写日志(/tmp/coverage_<id>.log)。
@@ -1501,6 +1565,12 @@ struct SceneDocument {
                     : "文本层父链隐藏(父对象 visible=false,lwe 同样不渲)"
             } else if (image.contains("solidlayer") || mdlSolid), Self.dependsOnUnsupportedEffect(obj) {
                 reason = "🔴 solidlayer 挂未实现的音频可视化特效(如 audioline)被 dependsOnUnsupportedEffect 跳过"
+            } else if image.isEmpty, obj["camera"] != nil {
+                // 相机路径对象(camera:"default" + origin/zoom 关键帧)= 2D 场景运镜(开场推近等)。
+                let hasAnim = WEKeyframeAnimation.parse(obj["origin"]) != nil || WEKeyframeAnimation.parse(obj["zoom"]) != nil
+                status = hasAnim ? "已处理" : "未渲染"
+                reason = hasAnim ? "相机路径对象 → 场景运镜(origin/zoom 关键帧驱动投影,见 cameraAnim)"
+                                 : "相机路径对象(无 origin/zoom 关键帧 → 相机静态,不影响投影)"
             } else if image.isEmpty {
                 reason = "无 image 且非 text/sound/light/particle → 跳过"
             } else {

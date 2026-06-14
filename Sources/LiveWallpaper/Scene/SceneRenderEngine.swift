@@ -286,6 +286,30 @@ private func matTranslate(_ x: Float, _ y: Float) -> simd_float4x4 {
     ))
 }
 
+/// 2D 等比缩放矩阵(绕原点)。
+private func matScale2(_ s: Float) -> simd_float4x4 {
+    simd_float4x4(columns: (
+        SIMD4(s, 0, 0, 0),
+        SIMD4(0, s, 0, 0),
+        SIMD4(0, 0, 1, 0),
+        SIMD4(0, 0, 0, 1)
+    ))
+}
+
+/// 2D 场景相机**运镜**仿射矩阵(在静态正交 proj **之前**乘进 mvp,即 mvp = proj · cameraAnim · model)。
+/// 工作在画布像素空间:
+///   · zoom:绕取景中心 c 缩放 zoom 倍 → content 放大 zoom 倍(zoom=1 → 恒等;>1 = 推近)。
+///   · pan:相机眼位 origin.xy 相对帧0 移动 dp → content 反向平移 −dp(相机右移=画面左移),并随 zoom 同步缩放
+///     (相机移动量在放大后的画面里也放大,WE 编辑器约定)。
+/// 组合:M = T(c) · S(zoom) · T(−c) · T(−dp·zoom) = T(c) · S(zoom) · T(−c − dp)。
+/// 当 zoom=1 且 dp=0(帧0 / 无运镜)→ M = T(c)·I·T(−c) = identity → proj 逐位不变(零回归)。
+/// center 取**帧0 眼位**(originAtZero):该壁纸帧0 = establishing shot,运镜围绕它推拉。
+private func cameraAnimMatrix(center c: SIMD2<Float>, zoom: Float, pan dp: SIMD2<Float>) -> simd_float4x4 {
+    let z = max(0.0001, zoom)
+    // T(c) · S(z) · T(−c − dp)
+    return matTranslate(c.x, c.y) * matScale2(z) * matTranslate(-c.x - dp.x, -c.y - dp.y)
+}
+
 private struct VertexUniforms { var mvp: simd_float4x4; var color: SIMD4<Float> }
 
 /// 一组粒子(一个发射器):模拟器 + 纹理 + 实例缓冲。
@@ -1454,6 +1478,15 @@ final class SceneRenderEngine {
         compositeFramesRendered = 0   // 新场景:合成层帧计数归零(重新渲满 compositeMaxFrames 帧)
         fxDiagLogged.removeAll()      // 新场景:特效链诊断重打一遍
         self.proj = proj
+        // 相机运镜:存基投影 + 运镜数据。无运镜对象(绝大多数)→ cameraAnim=nil → proj 恒 = baseProj(零回归)。
+        self.baseProj = proj
+        self.cameraAnim = document.cameraAnim
+        self.hasCameraAnim = (document.cameraAnim?.hasAnimation ?? false)
+            && ProcessInfo.processInfo.environment["WP_NO_CAMERA_ANIM"] == nil
+        if hasCameraAnim, let ca = document.cameraAnim {
+            Log.write("scene: camera-path anim ENABLED (origin=\(ca.origin != nil) zoom=\(ca.zoom != nil) " +
+                      "len=\(ca.lengthFrames)f origin0=\(ca.originAtZero) zoom0=\(ca.zoomAtZero))")
+        }
         // lwe 视差含 (depth+amount) 项 → amount≠0 时连 depth=0 的层也随相机平移(CImage.cpp:1104)。
         // 故相机视差开启即视为「有动画」(否则纯背景视差场景被当静态图、鼠标移动不重绘)。
         hasParallax = (document.cameraParallax && document.cameraParallaxAmount != 0)
@@ -1737,7 +1770,7 @@ final class SceneRenderEngine {
     }
 
     /// 是否需要持续动画(有视差、粒子、视频纹理、effect、文本时钟、scale 脚本、音频条或鼠标水波)。
-    var isAnimated: Bool { hasParallax || !particleGroups.isEmpty || hasVideo || hasEffects || hasText || hasScaleScript || hasOriginScript || hasAngleScript || hasAudioBars || hasInstancedBars || hasCursorRipple || has3DScene || hasKeyframeAnim }
+    var isAnimated: Bool { hasParallax || !particleGroups.isEmpty || hasVideo || hasEffects || hasText || hasScaleScript || hasOriginScript || hasAngleScript || hasAudioBars || hasInstancedBars || hasCursorRipple || has3DScene || hasKeyframeAnim || hasCameraAnim }
     private var hasScaleScript = false
     /// 是否含 origin 脚本图层(鼠标指针等动态 origin → 需每帧重算)。容器/时钟的 origin 脚本虽静态,
     /// 设此标志也无妨:每帧重算得同值,baseModel 不变,代价极小。
@@ -1981,6 +2014,32 @@ final class SceneRenderEngine {
         frameIndex = (frameIndex + 1) % Self.kBufferRing
         let t = Float(time)
         currentTime = t
+        // 2D 场景相机**运镜**(开场推近再回弹等):每帧按 camera-path 对象的 zoom/origin 关键帧求值,在静态基投影
+        // 之前乘运镜矩阵 → 本帧 proj。下方所有用 proj 的地方(图层 mvp/粒子 proj/主 pass)自动随相机推拉/平移。
+        // 无运镜对象(hasCameraAnim=false,绝大多数壁纸)→ proj 恒 = baseProj(此分支不进,逐位不变,零回归)。
+        if hasCameraAnim, let ca = cameraAnim {
+            // 求值 zoom(标量,非 relative)与 origin.xy(已含 base 偏移)。
+            let zoom = ca.zoom?.evaluate(time: t).first ?? ca.zoomAtZero
+            var dp = SIMD2<Float>(0, 0)
+            if let oa = ca.origin {
+                let ov = oa.evaluate(time: t)
+                let ox = ov.count > 0 ? ov[0] : ca.originAtZero.x
+                let oy = ov.count > 1 ? ov[1] : ca.originAtZero.y
+                // pan = 相机眼位相对帧0 的移动量(画布像素)。帧0 → dp=0。
+                dp = SIMD2(ox - ca.originAtZero.x, oy - ca.originAtZero.y)
+                // WP_NO_CAMERA_PAN=1:只做 zoom 推近(不平移),A/B 诊断(zoom 是已验证的主运镜分量)。
+                if ProcessInfo.processInfo.environment["WP_NO_CAMERA_PAN"] != nil { dp = .zero }
+            }
+            // 缩放枢轴 = **画布中心**(WE 相机看向画布中心;base 眼位 1920 1080 即画布中心)。运镜围绕画面中心
+            // 推拉,而非围绕帧0 眼位(=(0,0) 画布角落,会把内容钉在角上放大 → 错)。pan 仍取眼位相对帧0 的移动量。
+            let pivot = SIMD2<Float>(canvas.x * 0.5, canvas.y * 0.5)
+            let camMat = cameraAnimMatrix(center: pivot, zoom: zoom, pan: dp)
+            self.proj = baseProj * camMat
+            if ProcessInfo.processInfo.environment["WP_DBG_CAMERA"] != nil {
+                let fr = t * ca.fps
+                FileHandle.standardError.write("WP_DBG_CAMERA t=\(String(format:"%.2f",t))s f\(String(format:"%.0f",fr)) zoom=\(String(format:"%.3f",zoom)) pan=(\(String(format:"%.1f",dp.x)),\(String(format:"%.1f",dp.y))) pivot=(\(Int(pivot.x)),\(Int(pivot.y)))\n".data(using: .utf8)!)
+            }
+        }
         // puppet 骨骼蒙皮动画(MDLS/MDLA):每帧求值动画 → 蒙皮顶点 → 就地更新该层 puppetVB(真 WE 角色待机
         // 摇摆/形变;lwe 无此功能)。skin() 失败/无骨返回 nil → 不更新 → 维持静态 bind 姿态(零回归)。
         // 默认启用(转置修复后 rest=I 已验证;版本保护只对 MDLS0004/MDLA0006 蒙皮)。WP_NO_PUPPET_ANIM 可临时关。
@@ -2377,6 +2436,7 @@ final class SceneRenderEngine {
         let alwaysAnimating = !particleGroups.isEmpty || hasVideo || hasEffects || hasText
             || hasScaleScript || hasOriginScript || hasAngleScript || hasAudioBars || hasCursorRipple
             || hasKeyframeAnim
+            || hasCameraAnim   // 相机运镜:proj 每帧在变 → 必须帧帧重渲(否则只画首帧静止)
         let parallaxMoved = cameraParallax
             && (simd_distance(parallaxDisplacement, dispBefore) > 1e-5 || mouseNorm != lastMouseForChange)
         frameDidChange = alwaysAnimating || parallaxMoved
@@ -2393,8 +2453,14 @@ final class SceneRenderEngine {
     var debugCursorInfo: (aspect: SIMD2<Float>, cursorUV: SIMD2<Float>, canvas: SIMD2<Float>) {
         (aspectMouse, cursorUV, canvas)
     }
-    /// 正交投影矩阵(load 时算好,每帧视差更新复用)。
+    /// 正交投影矩阵(load 时算好)。无相机运镜时 proj 恒 = baseProj(每帧复用);有运镜时 proj 每帧 = camAnim·baseProj。
     private var proj = matrix_identity_float4x4
+    /// 静态基投影(load 时的 ortho/perspective)。相机运镜每帧在它之前乘运镜矩阵得本帧 proj。
+    private var baseProj = matrix_identity_float4x4
+    /// 2D 场景相机运镜(camera:"default" 路径对象的 origin/zoom 关键帧);nil = 静态相机(绝大多数壁纸)。
+    private var cameraAnim: CameraPathAnim? = nil
+    /// 是否有相机运镜(开场推近等)→ 每帧重算 proj + 视为「有动画」每帧重渲。
+    private(set) var hasCameraAnim = false
 
     /// 主 pass 的合成 uniform。特效已在 effectedTexture 里;这里只配鼠标水波折射 combine。
     private func makeEffectUniforms(hasMask: Bool, cursorRipple: Bool) -> EffectUniforms {
