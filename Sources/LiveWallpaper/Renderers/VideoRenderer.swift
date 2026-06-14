@@ -63,6 +63,7 @@ final class VideoRenderer: WallpaperRenderer {
     private var looper: AVPlayerLooper?
     private var itemObs: NSKeyValueObservation?
     private var presObs: NSKeyValueObservation?
+    private var itemID: String = ""
 
     func attach(to host: NSView) {
         let v = VideoPlayerView(frame: host.bounds)
@@ -73,13 +74,16 @@ final class VideoRenderer: WallpaperRenderer {
     }
 
     func load(_ item: WallpaperItem) {
+        itemID = item.id
         guard let url = item.fileURL else { Log.write("VideoRenderer: nil fileURL"); return }
         let exists = FileManager.default.fileExists(atPath: url.path)
         Log.write("VideoRenderer.load url=\(url.lastPathComponent) exists=\(exists)")
         let playerItem = AVPlayerItem(url: url)
         let queue = AVQueuePlayer()
+        let g = GeneralWallpaperSettings.shared
         queue.isMuted = PreferencesStore.shared.isMuted
-        queue.volume = Float(PreferencesStore.shared.volume)
+        // 音量:全局 × per-wallpaper(0–100)。
+        queue.volume = Float(PreferencesStore.shared.volume * g.volume(item.id) / 100.0)
         queue.actionAtItemEnd = .none
         looper = AVPlayerLooper(player: queue, templateItem: playerItem)
         view?.playerLayer.player = queue
@@ -97,12 +101,30 @@ final class VideoRenderer: WallpaperRenderer {
                 }
             }
         }
+        applyGeneralProps()
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak playerItem, weak queue] in
             Log.write("VideoRenderer status: item=\(playerItem?.status.rawValue ?? -9) err=\(String(describing: playerItem?.error)) rate=\(queue?.rate ?? -1) pres=\(queue?.currentItem?.presentationSize ?? .zero)")
         }
     }
 
-    func start() { player?.play() }
+    /// WE「属性」通用区(视频侧):翻转(水平镜像图层)+ 播放速度(rate 倍率)+ 音量(已在 load 设)。
+    /// WP_NO_GENERAL_PROPS 退回:不翻转、1.0×。默认值 = 现状,零回归。
+    func applyGeneralProps() {
+        let off = ProcessInfo.processInfo.environment["WP_NO_GENERAL_PROPS"] != nil
+        let g = GeneralWallpaperSettings.shared
+        let flip = off ? false : g.flip(itemID)
+        let speed = off ? 1.0 : g.speedMultiplier(itemID)
+        if let v = view {
+            CATransaction.begin(); CATransaction.setDisableActions(true)
+            // 水平镜像:绕图层中心 X 翻转(scale x=-1)。默认不翻转 → identity → 零回归。
+            v.playerLayer.transform = flip ? CATransform3DMakeScale(-1, 1, 1) : CATransform3DIdentity
+            CATransaction.commit()
+        }
+        // 播放速度:正在播时直接设 rate(0=暂停);否则记到 start 时用。
+        if let p = player, p.rate != 0 { p.rate = Float(speed) }
+    }
+
+    func start() { player?.rate = Float(ProcessInfo.processInfo.environment["WP_NO_GENERAL_PROPS"] != nil ? 1.0 : GeneralWallpaperSettings.shared.speedMultiplier(itemID)) }
 
     func stop() {
         presObs = nil
@@ -115,8 +137,18 @@ final class VideoRenderer: WallpaperRenderer {
         view = nil
     }
 
+    /// 通用区设置改动后(翻转/速度/音量)即时生效,无需重载视频。
+    func reloadInPlace() {
+        let g = GeneralWallpaperSettings.shared
+        player?.volume = Float(PreferencesStore.shared.volume * g.volume(itemID) / 100.0)
+        applyGeneralProps()
+    }
+
     func pause() { player?.pause() }
-    func resume() { player?.play() }
+    func resume() {
+        let speed = ProcessInfo.processInfo.environment["WP_NO_GENERAL_PROPS"] != nil ? 1.0 : GeneralWallpaperSettings.shared.speedMultiplier(itemID)
+        player?.rate = Float(speed)
+    }
     func setMuted(_ muted: Bool) { player?.isMuted = muted }
     func setVolume(_ v: Double) { player?.volume = Float(v) }
     /// 屏幕适配模式变化:重新按 wallpaperScaleMode 布局(参数保留兼容旧 videoFill 调用,实际读 scaleMode)。

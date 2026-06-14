@@ -386,6 +386,7 @@ final class SceneRenderEngine {
     private var pipelineBlitFXAA: MTLRenderPipelineState?          // FXAA 呈现(画质设置开时用)
     private var pipelineBlitAspect: MTLRenderPipelineState?        // 屏幕适配呈现(uvScale 居中裁切/留黑边,= lwe updateTextureUVs)
     private var pipelineCursorMark: MTLRenderPipelineState?        // 诊断(WP_CURSOR_MARK):在引擎认为的 cursorUV 处画十字+环,核对 vs 物理光标
+    private var pipelineBlitPresent: MTLRenderPipelineState?       // 通用区呈现:翻转 + 图片筛选器(仅启用时用)
     // MARK: 3D 透视场景(太阳系3662790108/土星3589454154 等;.mdl 几何模型 + 透视相机 + 深度缓冲)
     private struct Material3DGPU { let tex: MTLTexture?; let color: SIMD3<Float>; let brightness: Float; let alpha: Float; let translucent: Bool; let lighting: Bool }
     private struct Submesh3DGPU { let mat: Material3DGPU; let start: Int; let count: Int }
@@ -688,6 +689,13 @@ final class SceneRenderEngine {
                 a.sourceRGBBlendFactor = .sourceAlpha; a.destinationRGBBlendFactor = .oneMinusSourceAlpha
                 a.sourceAlphaBlendFactor = .one; a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
                 pipelineCursorMark = try? device.makeRenderPipelineState(descriptor: dc)
+            }
+            // 通用区呈现管线(翻转 + 图片筛选器)。仅在 flip/filter 启用时用,默认走 pipelineBlit 不变。
+            if let pf = lib.makeFunction(name: "fullscreen_present") {
+                let dp = MTLRenderPipelineDescriptor()
+                dp.vertexFunction = fsv; dp.fragmentFunction = pf
+                dp.colorAttachments[0].pixelFormat = .bgra8Unorm
+                pipelineBlitPresent = try? device.makeRenderPipelineState(descriptor: dp)
             }
         }
         // 3D 透视场景模型管线(深度测试 + 透视 MVP);不透明(写深度)+ 透明(alpha 混合、只读深度)两条。
@@ -2038,6 +2046,24 @@ final class SceneRenderEngine {
     /// 壁纸自带音频播放(BGM/雨声);与系统声采集(usesAudio,音频条用)无关。默认随 isMuted 静音。
     private let audioPlayback = AudioPlayback()
 
+    // MARK: - WE「属性」通用区(每壁纸固定 7 控件中由引擎实现的几项)。默认值 = 现状行为(零回归)。
+    /// 音频监听(audio responsive)。关时不喂系统音频频谱(音频条/oscilloscope 静默)。默认开。
+    private var generalAudioListen = true
+    /// 翻转(flip horizontal):最终呈现把 uv.x 镜像。默认关。
+    private var generalFlip = false
+    /// 图片筛选器:0=无、1=灰度、2=棕褐、3=反相、4=暖、5=冷。最终画面过一个轻量后处理滤镜。默认 0=无。
+    private var generalFilter = 0
+    /// SceneRenderer 据 loadedItem 推入这 4 项(load/reloadInPlace 时调一次)。播放速度/音量在外层(时钟累积/audioPlayback)处理。
+    /// WP_NO_GENERAL_PROPS 总退路:置 1 时引擎忽略这些通用项,完全走旧行为。
+    func setGeneralProps(audioListen: Bool, flip: Bool, filter: Int) {
+        if ProcessInfo.processInfo.environment["WP_NO_GENERAL_PROPS"] != nil {
+            generalAudioListen = true; generalFlip = false; generalFilter = 0; return
+        }
+        generalAudioListen = audioListen
+        generalFlip = flip
+        generalFilter = max(0, filter)
+    }
+
     /// 暂停/恢复所有视频纹理 + 壁纸音频(省电:窗口隐藏、电池模式等)。
     func pauseVideos() { for l in layers { l.video?.pause() }; audioPlayback.pause() }
     func resumeVideos() { for l in layers { l.video?.resume() }; audioPlayback.resume() }
@@ -2149,7 +2175,10 @@ final class SceneRenderEngine {
         // lwe(CPass.cpp:785-790)绑三套**原生**频谱 audio16/32/64(各分辨率在 AudioCapture 里独立分桶,
         // 非由 64 段重采样);shader 按 RESOLUTION combo 声明的段数取对应那套。
         // 音频条层(hasAudioBars)和音频反应特效(hasAudioReactiveFX,如 pulse)都要;两者皆无则不取(省锁)。
-        currentAudio = (hasAudioReactiveFX || hasAudioBars)
+        // 通用区「音频监听」关 → 喂空频谱(音频条/oscilloscope 归零静默),即便壁纸用音频也不响应。
+        // WP_FORCE_AUDIO_OFF=1:验证用(headless 不走 setGeneralProps),强制关闭音频监听。
+        let audioListen = generalAudioListen && ProcessInfo.processInfo.environment["WP_FORCE_AUDIO_OFF"] == nil
+        currentAudio = (audioListen && (hasAudioReactiveFX || hasAudioBars))
             ? WEEffectChain.AudioSpectrum(s16: AudioCapture.shared.spectrum16,
                                           s32: AudioCapture.shared.spectrum32,
                                           s64: AudioCapture.shared.bands)
@@ -2187,9 +2216,12 @@ final class SceneRenderEngine {
         }
         // camerashake:lwe 只解析不渲染 → 不产生任何抖动(无真实公式可移植,绝不自造)。
         // 音频反应脚本:本帧频谱(仅当有音频脚本时取,省锁)。下面循环喂进各用音频的脚本(setAudioSpectrum)。
-        var scrA16 = hasAudioReactiveScript ? AudioCapture.shared.spectrum16 : []
-        var scrA32 = hasAudioReactiveScript ? AudioCapture.shared.spectrum32 : []
-        var scrA64 = hasAudioReactiveScript ? AudioCapture.shared.bands : []
+        // 通用区「音频监听」关 → 脚本也读空频谱(音频条 bar 模板等归零)。
+        let scriptAudioOn = hasAudioReactiveScript && generalAudioListen
+            && ProcessInfo.processInfo.environment["WP_FORCE_AUDIO_OFF"] == nil
+        var scrA16 = scriptAudioOn ? AudioCapture.shared.spectrum16 : []
+        var scrA32 = scriptAudioOn ? AudioCapture.shared.spectrum32 : []
+        var scrA64 = scriptAudioOn ? AudioCapture.shared.bands : []
         // WP_TEST_AUDIO 注入的合成频谱(currentAudio,见上)也喂给音频反应脚本(音频条 bar 模板等),
         // 否则无头渲染下脚本读到的还是空捕获、条恒静止 → 无法验证。生产无此 env 时零影响。
         if hasAudioReactiveScript, ProcessInfo.processInfo.environment["WP_TEST_AUDIO"] != nil {
@@ -3968,6 +4000,58 @@ final class SceneRenderEngine {
                 be.endEncoding()
             }
         }
+        // WE「属性」通用区:翻转 + 图片筛选器。整帧已合成进 finalTarget;若任一启用,把 finalTarget 拷到临时纹理
+        //   再用 fullscreen_present 翻转/染色回写 finalTarget(实时与离屏 renderToPNG 共用 encodeFrame → 一处生效)。
+        //   默认(不翻转、滤镜无)整段不执行 → finalTarget 原样 → 零回归。
+        applyGeneralPresentFilter(commandBuffer: cmd, finalTarget: finalTarget)
+    }
+
+    /// 翻转 + 图片筛选器的最终回写(见 encodeFrame 末)。需把 finalTarget 拷到 tmp(同尺寸)再采样回写。
+    private func applyGeneralPresentFilter(commandBuffer cmd: MTLCommandBuffer, finalTarget: MTLTexture) {
+        // 验证用 env 覆盖(headless --render 不走 setGeneralProps):WP_FORCE_FLIP=1 / WP_FORCE_FILTER=<0..5>。
+        // 生产无此 env 时零影响(仍按 setGeneralProps 推入的用户值)。
+        var flip = generalFlip, filter = generalFilter
+        let env = ProcessInfo.processInfo.environment
+        if env["WP_FORCE_FLIP"] == "1" { flip = true }
+        if let f = env["WP_FORCE_FILTER"], let v = Int(f) { filter = v }
+        guard flip || filter > 0, let pf = pipelineBlitPresent else { return }
+        let savedFlip = generalFlip, savedFilter = generalFilter
+        generalFlip = flip; generalFilter = filter
+        defer { generalFlip = savedFlip; generalFilter = savedFilter }
+        let w = finalTarget.width, h = finalTarget.height
+        guard let tmp = ensurePresentFilterTex(w, h) else { return }
+        // finalTarget → tmp(全屏拷贝)。
+        guard let blit = pipelineBlit else { return }
+        let cp = MTLRenderPassDescriptor()
+        cp.colorAttachments[0].texture = tmp
+        cp.colorAttachments[0].loadAction = .dontCare
+        cp.colorAttachments[0].storeAction = .store
+        if let ce = cmd.makeRenderCommandEncoder(descriptor: cp) {
+            ce.setRenderPipelineState(blit); ce.setFragmentSamplerState(sampler, index: 0)
+            ce.setFragmentTexture(finalTarget, index: 0)
+            ce.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); ce.endEncoding()
+        }
+        // tmp →(翻转/滤镜)→ finalTarget。
+        let pp = MTLRenderPassDescriptor()
+        pp.colorAttachments[0].texture = finalTarget
+        pp.colorAttachments[0].loadAction = .dontCare
+        pp.colorAttachments[0].storeAction = .store
+        if let pe = cmd.makeRenderCommandEncoder(descriptor: pp) {
+            pe.setRenderPipelineState(pf); pe.setFragmentSamplerState(sampler, index: 0)
+            pe.setFragmentTexture(tmp, index: 0)
+            var gp = SIMD2<Float>(generalFlip ? 1 : 0, Float(generalFilter))
+            pe.setFragmentBytes(&gp, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+            pe.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); pe.endEncoding()
+        }
+    }
+
+    private var presentFilterTex: MTLTexture?
+    private func ensurePresentFilterTex(_ w: Int, _ h: Int) -> MTLTexture? {
+        if let t = presentFilterTex, t.width == w, t.height == h { return t }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+        d.usage = [.renderTarget, .shaderRead]; d.storageMode = .private
+        presentFilterTex = device.makeTexture(descriptor: d)
+        return presentFilterTex
     }
 
     /// 把指定粒子组(parent 指向某 composelayer)画进一张**透明全画布 child FBO**(clearColor=透明黑)。
@@ -5035,6 +5119,32 @@ final class SceneRenderEngine {
         float2 uv = 0.5 + (in.uv - 0.5) * uvScale;
         if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return float4(0.0, 0.0, 0.0, 1.0);
         return t.sample(s, uv);
+    }
+    // WE「属性」通用区:翻转(uv.x 镜像)+ 图片筛选器(0=无/1=灰度/2=棕褐/3=反相/4=暖/5=冷)。
+    // gp.x=flip(0/1),gp.y=filter 索引。仅在 flip 或 filter 启用时走本 pipeline,默认走 fullscreen_copy 不变。
+    fragment float4 fullscreen_present(VOut in [[stage_in]], texture2d<float> t [[texture(0)]],
+                                       sampler s [[sampler(0)]], constant float2& gp [[buffer(0)]]) {
+        float2 uv = in.uv;
+        if (gp.x > 0.5) uv.x = 1.0 - uv.x;   // 水平翻转整个壁纸
+        float4 c = t.sample(s, uv);
+        int f = int(gp.y + 0.5);
+        if (f == 1) {                         // 灰度(luma)
+            float l = dot(c.rgb, float3(0.299, 0.587, 0.114));
+            c.rgb = float3(l);
+        } else if (f == 2) {                  // 棕褐(sepia 矩阵)
+            float3 o = c.rgb;
+            c.r = dot(o, float3(0.393, 0.769, 0.189));
+            c.g = dot(o, float3(0.349, 0.686, 0.168));
+            c.b = dot(o, float3(0.272, 0.534, 0.131));
+            c.rgb = clamp(c.rgb, 0.0, 1.0);
+        } else if (f == 3) {                  // 反相
+            c.rgb = 1.0 - c.rgb;
+        } else if (f == 4) {                  // 暖色(抬红/降蓝)
+            c.rgb = clamp(c.rgb * float3(1.10, 1.02, 0.88), 0.0, 1.0);
+        } else if (f == 5) {                  // 冷色(降红/抬蓝)
+            c.rgb = clamp(c.rgb * float3(0.88, 1.00, 1.12), 0.0, 1.0);
+        }
+        return c;
     }
     // FXAA(快速近似抗锯齿,FXAA3 简化版)。rcp = 1/源纹理尺寸。呈现时按 luma 边缘做一次平滑。
     fragment float4 fullscreen_fxaa(VOut in [[stage_in]], texture2d<float> t [[texture(0)]],

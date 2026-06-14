@@ -19,6 +19,10 @@ final class SceneRenderer: WallpaperRenderer {
     private var paused = false
     private var frameCount = 0
 
+    // WE「属性」通用区·播放速度:按倍率累积 sim 时间,中途改速度也连续(直接缩放墙钟会跳变)。
+    private var scaledSimTime: CFTimeInterval = 0
+    private var lastWallTime: CFTimeInterval = 0
+
     // 审计修复 #1:frameTick(CVDisplayLink 后台线程)的 engine.update/render 与
     // load/reloadInPlace/stop(主线程)对 engine 状态(layers/particleGroups)的重建/释放
     // 之间存在无锁数据竞争。用此锁串行化两侧对 engine 的访问。
@@ -112,7 +116,20 @@ final class SceneRenderer: WallpaperRenderer {
             showFallback(item); return
         }
         loaded = true
+        applyGeneralProps()
         Log.write("SceneRenderer: \(item.title) → \(engine.layerCount) gpu layers, 3D=\(engine.has3DScene), animated=\(engine.isAnimated)")
+    }
+
+    /// 把 WE「属性」通用区(音频监听/翻转/图片筛选器/音量)推入引擎。load/reloadInPlace 与属性改动后调用。
+    /// 播放速度在 frameTick 里按倍率累积 sim 时间(不在此推)。默认值 = 现状,零回归。
+    private func applyGeneralProps() {
+        guard let engine, let item = loadedItem else { return }
+        let g = GeneralWallpaperSettings.shared
+        engine.setGeneralProps(audioListen: g.audioListen(item.id),
+                               flip: g.flip(item.id),
+                               filter: g.filter(item.id).rawValue)
+        // 音量:WE 是 per-wallpaper(0–100)。叠加全局静音/音量上限作整体乘子,喂壁纸自带 BGM 播放。
+        engine.setAudioVolume(PreferencesStore.shared.volume * g.volume(item.id) / 100.0)
     }
 
     /// 就地重载场景文档(属性改动后),**不重建 Metal 层** → 无黑屏。
@@ -129,6 +146,7 @@ final class SceneRenderer: WallpaperRenderer {
         engine.load(document: doc, source: source)
         renderLock.unlock()
         paused = wasPaused
+        applyGeneralProps()
         if !engine.isAnimated { drawOnce() }   // 静态场景:显示链没跑,手动画一帧
         Log.write("SceneRenderer: reloadInPlace \(item.id) → \(engine.layerCount) layers")
     }
@@ -148,6 +166,7 @@ final class SceneRenderer: WallpaperRenderer {
         guard loaded, let engine else { return }
         if engine.isAnimated {
             startTime = CACurrentMediaTime()
+            scaledSimTime = 0; lastWallTime = 0   // 播放速度累积器复位(避免跨次启动残留)
             startDisplayLink()
         } else {
             drawOnce()   // 静态场景:画一帧即可
@@ -180,7 +199,12 @@ final class SceneRenderer: WallpaperRenderer {
         let cap = PreferencesStore.shared.frameRateCap
         if cap > 0, now - lastRenderTime < (1.0 / Double(cap)) - 0.001 { return }
         lastRenderTime = now
-        let t = now - startTime
+        // WE「属性」通用区·播放速度:按倍率累积 sim 时间(中途改速度连续不跳)。倍率 1.0(默认)= 现状(t=now-startTime)。
+        let speed = GeneralWallpaperSettings.shared.speedMultiplier(loadedItem?.id ?? "")
+        let wallDelta = lastWallTime > 0 ? (now - lastWallTime) : 0
+        lastWallTime = now
+        scaledSimTime += wallDelta * speed
+        let t = scaledSimTime
 
         // 鼠标相对主屏中心归一化到 [-1,1](y 向上)。
         // ⚠ 关键(xray/视差不跟鼠标真因):本 app 是 .accessory 菜单栏代理,桌面窗口 ignoresMouseEvents=true 且

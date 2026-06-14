@@ -37,7 +37,8 @@ struct WallpaperSettingsPanel: View {
             }
         }
     }
-    private func renderUnits(for props: [WallpaperProperty]) -> [RenderUnit] {
+    private var renderUnits: [RenderUnit] {
+        let props = visibleProperties
         var units: [RenderUnit] = []
         var i = 0
         while i < props.count {
@@ -56,30 +57,38 @@ struct WallpaperSettingsPanel: View {
         VStack(spacing: 0) {
             header
             Divider().opacity(0.4)
-            let props = visibleProperties
-            // WE 属性面板:无 index 的 WE 标准属性(schemecolor 等)在分隔线**上**(通用「属性」);
-            // 有 index 的作者自定义属性在分隔线**下**(该壁纸专属可调属性)。分区依据来自 pkg(见 isGeneral)。
-            let generalUnits = renderUnits(for: props.filter { $0.isGeneral })
-            let customUnits = renderUnits(for: props.filter { !$0.isGeneral })
-            if props.isEmpty {
-                emptyState
-            } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 14) {
-                        ForEach(generalUnits) { unit in unitView(unit) }      // 分隔线上:通用属性
-                        if !generalUnits.isEmpty && !customUnits.isEmpty {
-                            Divider().opacity(0.55).padding(.vertical, 2)      // WE 分隔线
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    // WE「属性」通用区:每个壁纸固定的 7 个标准通用控件(与 project.json 无关)。
+                    GeneralPropertiesSection(item: item, accent: accent,
+                                             schemeColorProp: schemeColorProp,
+                                             onChange: { version += 1; onApply() })
+                    // 清晰分隔线:通用区 ↑ / 壁纸自定义属性 ↓。
+                    sectionDivider(title: "壁纸专属")
+                    // project.json 自定义属性(去掉已并进通用区的 schemecolor)。
+                    if customRenderUnits.isEmpty {
+                        Text("这个壁纸没有额外的自定义属性").font(.system(size: 11)).foregroundStyle(.secondary)
+                            .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 4)
+                    } else {
+                        ForEach(customRenderUnits) { unit in
+                            switch unit {
+                            case .single(let prop):
+                                PropertyControl(item: item, prop: prop, accent: accent,
+                                                onChange: { version += 1; onApply() })
+                            case .group(let title, let members):
+                                PropertyGroupSection(item: item, title: title, props: members, accent: accent,
+                                                     onChange: { version += 1; onApply() })
+                            }
                         }
-                        ForEach(customUnits) { unit in unitView(unit) }        // 分隔线下:壁纸专属
                     }
-                    .padding(.horizontal, 18).padding(.vertical, 16)
-                    // 不再用 .id(...version...) 破坏性重建子树 —— 那会在选色时销毁正与系统颜色面板
-                    // 绑定的 ColorPicker、令其脱钩(色块不跟手)。store 现为 ObservableObject,改值
-                    // 会发通知让 body 自然重算重读 value,无需强制重建。
                 }
-                Divider().opacity(0.4)
-                resetBar
+                .padding(.horizontal, 18).padding(.vertical, 16)
+                // 不再用 .id(...version...) 破坏性重建子树 —— 那会在选色时销毁正与系统颜色面板
+                // 绑定的 ColorPicker、令其脱钩(色块不跟手)。store 现为 ObservableObject,改值
+                // 会发通知让 body 自然重算重读 value,无需强制重建。
             }
+            Divider().opacity(0.4)
+            resetBar
             // 取消订阅栏(始终在底部,即使无可调属性也可用)。
             if onUnsubscribe != nil {
                 Divider().opacity(0.4)
@@ -91,17 +100,29 @@ struct WallpaperSettingsPanel: View {
         .id(item.id)   // 切换壁纸时强制重建,彻底避免状态残留
     }
 
-    /// 渲染一个 RenderUnit(单条属性 / 折叠组),供分隔线上下两段复用。
-    @ViewBuilder
-    private func unitView(_ unit: RenderUnit) -> some View {
-        switch unit {
-        case .single(let prop):
-            PropertyControl(item: item, prop: prop, accent: accent,
-                            onChange: { version += 1; onApply() })
-        case .group(let title, let members):
-            PropertyGroupSection(item: item, title: title, props: members, accent: accent,
-                                 onChange: { version += 1; onApply() })
+    /// project.json 里的 schemecolor 属性(若有)→ 并进通用区「主题配色」。
+    private var schemeColorProp: WallpaperProperty? {
+        allProperties.first { $0.id == "schemecolor" }
+    }
+    /// 自定义属性渲染单元:从 renderUnits 里剔除 schemecolor(已在通用区显示)。
+    private var customRenderUnits: [RenderUnit] {
+        renderUnits.compactMap { unit in
+            switch unit {
+            case .single(let p): return p.id == "schemecolor" ? nil : unit
+            case .group(let title, let ps):
+                let kept = ps.filter { $0.id != "schemecolor" }
+                return kept.isEmpty ? nil : .group(title: title, props: kept)
+            }
         }
+    }
+
+    private func sectionDivider(title: String) -> some View {
+        HStack(spacing: 8) {
+            Text(title).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(.tertiary)
+                .textCase(.uppercase)
+            Rectangle().fill(Color.secondary.opacity(0.25)).frame(height: 1)
+        }
+        .padding(.top, 6).padding(.bottom, 2)
     }
 
     private var header: some View {
@@ -124,6 +145,7 @@ struct WallpaperSettingsPanel: View {
         HStack {
             Button {
                 store.reset(forID: item.id, folderURL: item.folderURL)
+                GeneralWallpaperSettings.shared.reset(item.id)   // 通用区也恢复默认
                 version += 1; onApply()
             } label: {
                 Label("恢复默认", systemImage: "arrow.uturn.backward").font(.system(size: 11.5))
@@ -133,15 +155,6 @@ struct WallpaperSettingsPanel: View {
             Text("\(visibleProperties.filter { $0.type != .label }.count) 项").font(.system(size: 11)).foregroundStyle(.tertiary)
         }
         .padding(.horizontal, 16).padding(.vertical, 12)
-    }
-
-    private var emptyState: some View {
-        VStack(spacing: 10) {
-            Image(systemName: "slider.horizontal.below.rectangle").font(.system(size: 30)).foregroundStyle(.tertiary)
-            Text("这个壁纸没有可调属性").font(.system(size: 12)).foregroundStyle(.secondary)
-                .multilineTextAlignment(.center)
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity).padding(20)
     }
 
     private var unsubscribeBar: some View {
@@ -168,6 +181,107 @@ struct WallpaperSettingsPanel: View {
         a.addButton(withTitle: "取消订阅并删除")
         a.addButton(withTitle: "取消")
         if a.runModal() == .alertFirstButtonReturn { onUnsubscribe?() }
+    }
+}
+
+/// WE「属性」通用区:每个壁纸顶部固定的 7 个标准通用控件(与 project.json 自定义属性无关)。
+/// 顺序对齐 WE 实拍:音频监听 / 主题配色 / 音量 / 播放速度 / 翻转 / 图片筛选器 / 显示颜色选项。
+/// 持久化:通用区 6 项存 GeneralWallpaperSettings(per-wallpaper);主题配色复用 project.json 的
+/// schemecolor(若有,走 WallpaperPropertyStore),没有则提供本地默认色块占位。
+struct GeneralPropertiesSection: View {
+    let item: WallpaperItem
+    let accent: Color
+    let schemeColorProp: WallpaperProperty?   // project.json 的 schemecolor(若有)
+    var onChange: () -> Void
+
+    @ObservedObject private var g = GeneralWallpaperSettings.shared
+    @ObservedObject private var propStore = WallpaperPropertyStore.shared
+    @State private var localScheme: Color = .white   // schemecolor 缺省时的本地占位
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("属性").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
+
+            // 1) 音频监听(bool,默认开)
+            Toggle(isOn: Binding(get: { g.audioListen(item.id) },
+                                 set: { g.setAudioListen($0, item.id); onChange() })) {
+                Text("音频监听").font(.system(size: 12.5))
+            }.toggleStyle(.switch).tint(accent)
+
+            // 2) 主题配色(color)— 复用 schemecolor(若有),否则本地占位
+            HStack {
+                Text("主题配色").font(.system(size: 12.5)).lineLimit(1)
+                Spacer()
+                ColorPicker("", selection: schemeBinding, supportsOpacity: false).labelsHidden()
+            }
+
+            // 3) 音量(slider 0–100,默认 100)
+            sliderRow(label: "音量", value: Binding(get: { g.volume(item.id) },
+                                                  set: { g.setVolume($0, item.id); onChange() }),
+                      range: 0...100, format: "%.0f")
+
+            // 4) 播放速度(slider 0–100,默认 100 = 正常速度)
+            sliderRow(label: "播放速度", value: Binding(get: { g.playbackSpeed(item.id) },
+                                                     set: { g.setPlaybackSpeed($0, item.id); onChange() }),
+                      range: 0...100, format: "%.0f")
+
+            // 5) 翻转(bool,默认关)
+            Toggle(isOn: Binding(get: { g.flip(item.id) },
+                                 set: { g.setFlip($0, item.id); onChange() })) {
+                Text("翻转").font(.system(size: 12.5))
+            }.toggleStyle(.switch).tint(accent)
+
+            // 6) 图片筛选器(combo,默认无)
+            HStack {
+                Text("图片筛选器").font(.system(size: 12.5)).lineLimit(1)
+                Spacer()
+                Picker("", selection: Binding(get: { g.filter(item.id) },
+                                              set: { g.setFilter($0, item.id); onChange() })) {
+                    ForEach(GeneralWallpaperSettings.ImageFilter.allCases) { f in
+                        Text(f.label).tag(f)
+                    }
+                }.labelsHidden().fixedSize()
+            }
+
+            // 7) 显示颜色选项(bool,默认关)
+            Toggle(isOn: Binding(get: { g.showColorOptions(item.id) },
+                                 set: { g.setShowColorOptions($0, item.id); onChange() })) {
+                Text("显示颜色选项").font(.system(size: 12.5))
+            }.toggleStyle(.switch).tint(accent)
+        }
+    }
+
+    /// 主题配色绑定:有 schemecolor 属性 → 读写 WallpaperPropertyStore;否则用本地占位(@State)。
+    private var schemeBinding: Binding<Color> {
+        if let p = schemeColorProp {
+            return Binding(
+                get: {
+                    if case .color(let c) = propStore.value(forID: item.id, property: p, folderURL: item.folderURL) {
+                        return Color(red: Double(c.x), green: Double(c.y), blue: Double(c.z))
+                    }
+                    return .white
+                },
+                set: { newColor in
+                    let rgb = NSColor(newColor).usingColorSpace(.sRGB) ?? .white
+                    propStore.setValue(.color(SIMD3(Float(rgb.redComponent), Float(rgb.greenComponent), Float(rgb.blueComponent))),
+                                       forID: item.id, propertyKey: p.id)
+                    onChange()
+                })
+        }
+        return Binding(get: { localScheme }, set: { localScheme = $0 })
+    }
+
+    @ViewBuilder
+    private func sliderRow(label: String, value: Binding<Double>, range: ClosedRange<Double>, format: String) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            HStack {
+                Text(label).font(.system(size: 12.5)).lineLimit(1)
+                Spacer()
+                Text(String(format: format, value.wrappedValue)).font(.system(size: 10.5).monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Slider(value: value, in: range).tint(accent)
+        }
     }
 }
 
