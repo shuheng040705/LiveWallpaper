@@ -287,6 +287,25 @@ def fbo_scales(edef):
             out[f["name"]] = int(f.get("scale", 1) or 1)
     return out
 
+def fbo_meta(edef):
+    """effect.json 的 fbos[] → {name: {format, unique}}(R5:中间 FBO 像素格式 + 跨帧持久标记)。
+    WE 的 fbos[] 每条除 scale 外还带:
+      - format:像素格式字符串(默认 "rgba8888")。fluidsimulation 用 "rg1616f"(速度场)/"r16f"(压力/
+        散度/旋度场)需浮点精度,8-bit 量化会出色带/精度丢失;glitter 用 "r8"。"rgba_backbuffer"/"rgba8888"
+        = 标准 8-bit(=引擎默认 .bgra8Unorm)。
+      - unique:bool(默认 false)。true = 跨帧持久累积缓冲(motionblur 的 _rt_FullCompoBuffer1 存上一帧合成;
+        fluidsimulation 的速度/压力/dye 场逐帧累积模拟),引擎不得逐帧 clear/重建。
+    引擎侧(WEEffectChain.swift)据此选 MTLPixelFormat 并对 unique FBO 用 .load(不清空)。
+    只提取这两个字段进每个命名 FBO 的元数据;format 缺省 "rgba8888"、unique 缺省 false(=现状,前向兼容)。"""
+    out = {}
+    for f in edef.get("fbos", []):
+        if isinstance(f, dict) and f.get("name"):
+            out[f["name"]] = {
+                "format": str(f.get("format", "rgba8888") or "rgba8888"),
+                "unique": bool(f.get("unique", False)),
+            }
+    return out
+
 def pass_bound_slots(p, mat_textures):
     """本 pass 占用的贴图槽索引集合(item 5 的 textureSlotUsed,对齐 CPass m_passTextures)。
     = material/pass 的 textures[] 中非空项的下标 ∪ effect.json pass 的 bind[].index ∪ pass.textures 非空项。
@@ -347,8 +366,10 @@ def build_effect_passes(edef, combos, ckey, shaders_dir, file_reader, tex_reader
     """通用 pass 构建:builtin 与 workshop 共用。shaders_dir = .vert/.frag 所在目录;
     file_reader 读 material(builtin=磁盘相对 effect 目录,workshop=pkg map)。
     tex_reader(rel)→bytes|None 读 .tex 二进制(供 item 3 TEX0FORMAT 注入)。
-    fbos 的 scale 写进每个 pass 的 targetScale(目标降采样分母,默认 1)。"""
+    fbos 的 scale 写进每个 pass 的 targetScale(目标降采样分母,默认 1);
+    fbos 的 format/unique(R5)写进 targetFormat/targetUnique(按 pass 的 target FBO 名查)。"""
     scales = fbo_scales(edef)
+    fmeta = fbo_meta(edef)
     passes_out = []
     stage_misses = []   # (pass_index, shader_base, stage) 缺 .vert/.frag 文件 → transpile_stage 返回 None
     for i, p in enumerate(edef.get("passes", [])):
@@ -411,6 +432,15 @@ def build_effect_passes(edef, combos, ckey, shaders_dir, file_reader, tex_reader
         target = p.get("target")
         pass_rec = {"shader": base, "target": target, "bind": p.get("bind", []),
                     "uniformMeta": meta, "targetScale": scales.get(target, 1)}
+        # R5:目标 FBO 的像素格式 + 跨帧持久(unique)。仅当 target 命名且非默认(format!="rgba8888"/
+        # "rgba_backbuffer" 或 unique=True)时写入,保持现有 manifest 体积不变(绝大多数 pass 无此字段)。
+        fm = fmeta.get(target)
+        if fm:
+            fmt = fm["format"]
+            if fmt not in ("rgba8888", "rgba_backbuffer"):
+                pass_rec["targetFormat"] = fmt
+            if fm["unique"]:
+                pass_rec["targetUnique"] = True
         # 链接驱动的 varying 兼容(item 4):vert 编译看 frag 接口、frag 看 vert 接口(include 展开源)。
         link_for = {"vert": fraw, "frag": vraw}
         for stage in ["vert", "frag"]:

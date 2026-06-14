@@ -11,6 +11,11 @@ struct ParticleEmitterDesc {
     var distanceMax: Float
     var startTime: Float
     var sceneObjIndex: Int = .max   // scene.json objects 数组下标(粒子按场景序与图层交错绘制的锚点)
+    // 该粒子对象的 scene `parent` id。父指向一个 composelayer(frameBufferInput)时,WE 把粒子渲进**父
+    // composelayer 的自有 FBO**(透明底),让父层对「只含粒子」的 FBO 跑 tint/opacity-mask(矩阵被染色 + 裁到
+    // 遮罩区),再合成回场景——而非把粒子当独立世界粒子全屏画、且 composelayer 不会把下方场景(角色/龙身)染色。
+    // 凯尔希×Mon3tr「Matrix spawner」(parent=1322 可调整组合层)即此机制(lwe 未实现 parent→child FBO,真 WE 独有)。
+    var parentObjId: Int? = nil
 
     // 发射器形状:boxrandom(盒内对称采样,沿 directions 喷)vs sphererandom(球面/圆盘散开)。
     var isBox: Bool = false
@@ -234,6 +239,29 @@ struct ParticleEmitterDesc {
 
     // 鼠标拖尾:发射器原点跟随光标(controlpoint[0].flags==1 / rope renderer)。
     var followsCursor: Bool = false
+
+    // ── eventfollow 拖尾子粒子(凯尔希×Mon3tr 矩阵数字雨「渐变淡出尾巴」)─────────────────────────
+    // WE 的 child `type:"eventfollow"`:每当**父粒子(matrix_code 头)**存在/移动时,在父粒子当前位置
+    // 持续生成拖尾子粒子,子粒子用 controlpointattract(cp1=被跟随的父粒子位置)+ 自身 velocity + alphachange
+    // 形成「跟随并淡出」的尾巴。**lwe 完全没有 eventfollow / child 处理**(穷尽搜 src/WallpaperEngine:无
+    // "eventfollow"/"childcreatetime"/"emittrigger",CParticle 只处理 renderers[0] 单发射器)→ 我们的 children
+    // 机制本就超出 lwe,eventfollow 按真 WE 语义实现。
+    //
+    // 架构约束:每个 desc → 一个独立 ParticleSimulator → **一张**纹理(trail 用 halo_3,与头 halo_1 不同),
+    // 故 trail 必须是独立 desc/simulator;而各 simulator 运行期互不通信(SceneRenderEngine 逐组独立 step,
+    // 只外灌 cursorOrigin),要让 trail 跟随**另一个** simulator 的活头粒子需改 SceneRenderEngine(本轮禁改)。
+    // 退而求其次(任务明示的 fallback,且对此壁纸**几何等价**):矩阵头沿列**确定性**下落(列局部原点出生、
+    // 速度 (0,-100)、lifetime 11-16s、rate 1、maxcount 10),故 trail simulator **内部自带一份「ghost 头」模拟**
+    // 复现父列出生轨迹,每帧在 ghost 头位置发射 trail 子粒子(用 trail 自身的发射节奏/初值/算子)。这与 WE
+    // eventfollow 几何一致(子粒子诞生在父位置链上、随生命 alpha 1→0 淡出 = 沿列的渐变尾)。
+    // eventFollow=true 时该 desc 的发射改走 ghost-头路径(见 ParticleSimulator.step / emitEventFollow)。
+    var eventFollow: Bool = false
+    // ghost 头(父 matrix_code 头)的出生参数,层局部坐标(与 trail 共享同一对象层变换,故同一 layerOrigin/Scale)。
+    var efHeadOrigin: SIMD3<Float> = .zero           // 父头出生点(列局部,= 父 emitter.origin)
+    var efHeadVelocity: SIMD3<Float> = SIMD3(0, -100, 0)   // 父头速度(matrix 头 velocityrandom = 0 -100 0)
+    var efHeadLifeMin: Float = 11, efHeadLifeMax: Float = 16   // 父头 lifetimerandom
+    var efHeadRate: Float = 1                          // 父头 emitter.rate
+    var efHeadMaxCount: Int = 10                        // 父头单列 maxcount(static child 覆盖值)
     // spritetrail 渲染器:粒子按速度方向拉伸成拖尾带(genericparticle.vert TRAILRENDERER 分支)。
     // 长轴 = size·clamp(speed·trailLength, trailMinLength, trailMaxLength)·textureRatio,短轴 = size。
     // 默认值照 ObjectParser.cpp:1004-1006(length 0.05 / maxlength 10 / minlength 0)。
@@ -320,6 +348,12 @@ final class ParticleSimulator {
     private var instantaneousEmitted = false
     // mapsequence 的发射序号(跨该发射器所有粒子共享,到 count 回绕——形成圆周分布,CParticle.cpp:944/953)。
     private var mapSeqIndex = 0
+
+    // eventfollow:内部「ghost 头」(复现父 matrix_code 头的下落,见 ParticleEmitterDesc.eventFollow 注释)。
+    // 仅位置/年龄/寿命/每头发射累加器——不渲染,只作 trail 子粒子的出生锚点。
+    private struct GhostHead { var pos: SIMD2<Float>; var age: Float; var life: Float; var emitAccum: Float }
+    private var ghostHeads: [GhostHead] = []
+    private var ghostEmitAccum: Float = 0
 
     /// 鼠标拖尾:当前光标在画布像素中的位置(每帧由引擎更新)。nil = 不跟随。
     var cursorOrigin: SIMD2<Float>? = nil
@@ -537,7 +571,11 @@ final class ParticleSimulator {
                 // threshold 取一半(CParticle.cpp:1476)。dist∈(0.001, threshold) 时 vel += dir·scale·dt·speedOverride。
                 // scale<0 = 排斥(Bird.json cp1=鼠标:鸟群避开光标;cp2/3/4=世界路径锚点)。
                 var center = attract.center
-                if attract.linkMouse {
+                if desc.eventFollow && attract.linkMouse {
+                    // eventfollow 语境:cp1(flags&1)= 被跟随的父粒子,**不是光标**。子粒子诞生时把父头位置
+                    // (层局部)存进 spawnOrigin,cp1 即吸向此出生锚点(配合向上 velocity + alphachange 形成渐变尾)。
+                    center = SIMD3(particles[i].spawnOrigin.x, particles[i].spawnOrigin.y, 0) + attract.originOff
+                } else if attract.linkMouse {
                     guard let cur = cursorOrigin else { continue }   // 无光标(headless 未传)→ 该力不施加
                     center = SIMD3((cur.x - desc.layerOrigin.x), (cur.y - desc.layerOrigin.y), 0) + attract.originOff
                 }
@@ -615,6 +653,14 @@ final class ParticleSimulator {
             i += 1
         }
 
+        // eventfollow 拖尾:不走「在 emitter 原点发射」的常规路径,改在 ghost 头(复现父 matrix_code 头下落)
+        // 位置发射 trail 子粒子(见 ParticleEmitterDesc.eventFollow / emitEventFollow 注释)。WP_NO_MATRIX_TRAIL 关闭。
+        if desc.eventFollow {
+            if ParticleSimulator.eventFollowDisabled { return }
+            emitEventFollow(d: d)
+            return
+        }
+
         // 发射新粒子。拖尾粒子只在光标已知时发射(没光标位置就不喷)。
         if desc.followsCursor && cursorOrigin == nil { return }
 
@@ -652,6 +698,48 @@ final class ParticleSimulator {
         }
     }
 
+    /// eventfollow 关闭开关(WP_NO_MATRIX_TRAIL=1):矩阵渐变拖尾不发射(A/B 诊断)。
+    static let eventFollowDisabled = ProcessInfo.processInfo.environment["WP_NO_MATRIX_TRAIL"] != nil
+
+    /// eventfollow 拖尾发射(本帧已 advance dt=d)。先 advance/补充 ghost 头(复现父 matrix_code 头的列内下落),
+    /// 再在每个 ghost 头位置按 trail 自身 emitter.rate 发射 trail 子粒子。子粒子 pos/spawnOrigin = 该 ghost 头
+    /// 的**层局部**位置,trail 的 cp1 controlpointattract(linkMouse 标记,eventfollow 语境=被跟随父粒子)即吸向
+    /// 此出生锚点(见 step() cp 循环的 eventFollow 分支),配合 velocity 向上 + alphachange 1→0 = 沿列的渐变尾。
+    private func emitEventFollow(d: Float) {
+        // 1) advance 已有 ghost 头(到寿删除;直线下落,无受力)。
+        var gi = 0
+        while gi < ghostHeads.count {
+            ghostHeads[gi].age += d
+            if ghostHeads[gi].age >= ghostHeads[gi].life {
+                ghostHeads.remove(at: gi); continue
+            }
+            // 父头速度(层局部,与 trail 子粒子同坐标系);不翻 Y(我们 Y-up,与雨/雪约定一致,见 velocityrandom 注释)。
+            ghostHeads[gi].pos += SIMD2(desc.efHeadVelocity.x, desc.efHeadVelocity.y) * d
+            gi += 1
+        }
+        // 2) 按父头 emitter.rate 补充新 ghost 头(rate 1/s,上限 efHeadMaxCount;出生在列局部头原点)。
+        if desc.efHeadRate > 0 {
+            ghostEmitAccum += desc.efHeadRate * d
+            var add = Int(ghostEmitAccum); ghostEmitAccum -= Float(add)
+            while add > 0, ghostHeads.count < max(1, desc.efHeadMaxCount) {
+                add -= 1
+                let life = max(0.0001, rnd(desc.efHeadLifeMin, desc.efHeadLifeMax))
+                ghostHeads.append(GhostHead(pos: SIMD2(desc.efHeadOrigin.x, desc.efHeadOrigin.y),
+                                            age: 0, life: life, emitAccum: 0))
+            }
+        }
+        // 3) 在每个 ghost 头位置发射 trail 子粒子(trail 自身 emitter.rate=2/s/头)。
+        for hi in ghostHeads.indices {
+            guard desc.rate > 0 else { break }
+            ghostHeads[hi].emitAccum += desc.rate * d
+            var em = Int(ghostHeads[hi].emitAccum); ghostHeads[hi].emitAccum -= Float(em)
+            while em > 0, particles.count < desc.maxCount {
+                em -= 1
+                particles.append(spawn(eventFollowAnchor: ghostHeads[hi].pos))
+            }
+        }
+    }
+
     /// 预热:让粒子系统达到稳态(避免开场空屏),模拟 warmup 秒。
     /// **步数上限 300(=10s)**:某些壁纸的 lifetimeMax 异常大(如上百秒),seconds×30 会爆成几万~几十万步,
     /// 每步还 spawn/age 大量粒子 → 加载时 100% CPU 卡死(实测某工坊壁纸 emitter)。10s 预热对绝大多数已足够。
@@ -669,7 +757,9 @@ final class ParticleSimulator {
         while n > 0 { self.step(dt: step, time: t); t += step; n -= 1 }
     }
 
-    private func spawn() -> Particle {
+    /// eventFollowAnchor:eventfollow 拖尾子粒子的出生锚点(层局部),非 nil 时把粒子出生位置移到该处,
+    /// 并存进 spawnOrigin 供 cp1 controlpointattract 吸附(见 emitEventFollow / step cp 循环)。
+    private func spawn(eventFollowAnchor: SIMD2<Float>? = nil) -> Particle {
         // 发射初速度(累加式:emitter 给一份,velocityrandom/turbVelRand 再 += 上去,照 WE)。
         var vel = SIMD3<Float>(0, 0, 0)
         var pos: SIMD3<Float>
@@ -728,6 +818,11 @@ final class ParticleSimulator {
         // 【审计修复】位置 NaN 兜底:无论 box/sphere 哪条采样路径,若 distance 数据病态导致 pos 出现
         // 非有限分量(NaN/Inf),回退到发射器原点,避免 NaN 位置传播到 trail / rope 顶点。
         if !pos.x.isFinite || !pos.y.isFinite || !pos.z.isFinite { pos = desc.emitterOrigin }
+        // eventfollow:把出生位置平移到 ghost 头(层局部)。emitter sphererandom distance 0 → 上面 pos≈emitterOrigin
+        // (≈0),加上锚点即落在父头当前位置;velocityrandom(向上)随后照常累加。
+        if let anchor = eventFollowAnchor {
+            pos += SIMD3(anchor.x - desc.emitterOrigin.x, anchor.y - desc.emitterOrigin.y, 0)
+        }
         // velocityrandom 初始化器(CParticle.cpp:790-792):vel = rand3(min,max)×speedOverride,累加。
         // **不翻 Y**:lwe 的 v.y=-v.y 是它 y 向下模拟空间的坐标补偿,我们 matOrtho 是 y 向上,照搬会把
         // 雨(authored y=-5000=下落)变成 +5000 上升,且与 gravity(不翻 Y)矛盾。同「角度符号照搬 lwe 取负→反」教训。
@@ -835,8 +930,9 @@ final class ParticleSimulator {
             angVel: desc.orientationUpright ? 0 : angVelInit,
             frame: sheetFrames > 1 ? Int(rnd(0, Float(sheetFrames))) % sheetFrames : 0,
             upright: desc.orientationUpright,
-            // 拖尾粒子:诞生瞬间记下光标位置;之后粒子在此处独立漂移/淡出。
-            spawnOrigin: cursorOrigin ?? .zero
+            // 鼠标拖尾:诞生瞬间记下光标位置(画布像素);之后粒子在此处独立漂移/淡出。
+            // eventfollow:存 ghost 头出生锚点(**层局部**),供 cp1 controlpointattract 吸附(见 step cp 循环)。
+            spawnOrigin: eventFollowAnchor ?? (cursorOrigin ?? .zero)
         )
         // oscillate 逐粒子随机一次(照 CParticle.cpp:1531;phase = rand(phaseMin, phaseMax+2π))。
         let tau = 2 * Float.pi
@@ -1260,6 +1356,9 @@ enum ParticleParser {
                 }
                 desc.aboveBloom = objIndex > postLayerIndex   // 排在后处理层之上 → 不被 bloom
                 desc.sceneObjIndex = objIndex   // 场景对象序(粒子在图层间插画的锚点;WE 按对象序绘制一切)
+                // scene `parent` id(父粒子 desc 与各 child desc 共用此对象级属性):父若是 composelayer
+                // (frameBufferInput),load() 会把本粒子组渲进该 composelayer 的 FBO 而非主场景(见 parentObjId 注释)。
+                desc.parentObjId = (obj["parent"] as? NSNumber)?.intValue
             }
             if var desc = build(from: pj, source: source) {
                 applyObjectLayer(&desc); result.append(desc)
@@ -1268,11 +1367,77 @@ enum ParticleParser {
             // 当独立粒子系统、继承父图层变换。漏加 → 粒子稀疏单一(枫叶"劣质"主因:只渲 10 片单贴图而非 60 片双贴图)。
             // 对照 ObjectParser.cpp:621-626 + parseParticleChild。
             if let children = pj["children"] as? [[String: Any]] {
+                let parentAngleZ = VecParse.f3(obj["angles"]).z
+                // 子条目的局部 origin/scale 应用到一个 desc(33 列各摆在 X=0,60,…;trail 与其头同列 → 同变换)。
+                func applyChildTransform(_ desc: inout ParticleEmitterDesc, _ child: [String: Any]) {
+                    let childLocal = VecParse.f3(child["origin"])
+                    if childLocal != .zero {
+                        var off = SIMD2(childLocal.x * layerScale.x, childLocal.y * layerScale.y)
+                        if parentAngleZ != 0 {
+                            let ca = cos(parentAngleZ), sa = sin(parentAngleZ)
+                            off = SIMD2(off.x * ca - off.y * sa, off.x * sa + off.y * ca)
+                        }
+                        desc.layerOrigin += off
+                    }
+                    let childScale = VecParse.f3(child["scale"], default: SIMD3(1, 1, 1))
+                    if childScale.x != 1 || childScale.y != 1 {
+                        desc.layerScale = SIMD2(desc.layerScale.x * childScale.x, desc.layerScale.y * childScale.y)
+                    }
+                }
                 for child in children {
                     let cPath = (child["particle"] as? String) ?? (child["name"] as? String)
                     guard let cPath, let cpj = source.json(for: cPath), cpj["emitter"] != nil,
                           var cdesc = build(from: cpj, source: source) else { continue }
-                    applyObjectLayer(&cdesc); result.append(cdesc)
+                    // 子条目 maxcount 覆盖 preset(matrix 每列 child maxcount=10,而 matrix_code preset 只 1
+                    // → 不覆盖则每列仅 1 个字符=矩阵雨极稀疏)。先于 applyObjectLayer,让对象级 io count 仍能叠乘。
+                    let childMaxCount = (child["maxcount"] as? NSNumber)?.intValue
+                    if let mc = childMaxCount { cdesc.maxCount = mc }
+                    applyObjectLayer(&cdesc)
+                    // 子粒子在父粒子**局部空间**的放置偏移 child["origin"]:matrix 数字雨把 33 列
+                    // 分别摆在 X=0,60,120,…,1920(每 60 一列,横铺满画布宽)。过去漏读 → 33 列全套同一个
+                    // 父层变换 = 全堆在父原点(画布最左)。照 ObjectParser 子对象 origin/scale:局部 origin
+                    // 先按父层 scale 缩放、再绕父原点转父角度(与渲染期 layerAngleZ 同矩阵 +CCW),加进 layerOrigin;
+                    // 子 scale 乘进 layerScale(缩放粒子模拟域)。origin=0+scale=1 的旧 children(如枫叶第二叶贴图)零变化。
+                    applyChildTransform(&cdesc, child)
+                    result.append(cdesc)
+
+                    // 该列头(matrix_code)自带的 eventfollow 拖尾子(grandchild):渐变淡出尾巴。
+                    // WE 嵌套:spawner →(static)matrix_code 头 →(eventfollow)matrix_trail。我们的 children
+                    // 循环原本只下一层(spawner 的 33 列),不递归头的 children → trail 被整个丢掉。在此处建出 trail
+                    // desc(独立 simulator,用 trail 自己的材质 halo_3),标 eventFollow + 灌入父头出生参数,渲染期由
+                    // emitEventFollow 在内部 ghost 头位置发射(见 ParticleEmitterDesc.eventFollow 注释)。
+                    if let gkids = cpj["children"] as? [[String: Any]] {
+                        // 父头出生参数(供 trail 内部 ghost 头复现父列下落):头 emitter.origin/velocityrandom/lifetimerandom/rate。
+                        let headEm = (cpj["emitter"] as? [[String: Any]])?.first ?? [:]
+                        let headOrigin = VecParse.f3(headEm["origin"])
+                        let headRate = (headEm["rate"] as? NSNumber)?.floatValue ?? 1
+                        var headVel = SIMD3<Float>(0, -100, 0); var headLifeMin: Float = 11, headLifeMax: Float = 16
+                        for ini in cpj["initializer"] as? [[String: Any]] ?? [] {
+                            switch ini["name"] as? String {
+                            case "velocityrandom": headVel = VecParse.f3(ini["min"], default: headVel)
+                            case "lifetimerandom":
+                                headLifeMin = (ini["min"] as? NSNumber)?.floatValue ?? headLifeMin
+                                headLifeMax = (ini["max"] as? NSNumber)?.floatValue ?? headLifeMax
+                            default: break
+                            }
+                        }
+                        let headMax = childMaxCount ?? ((cpj["maxcount"] as? NSNumber)?.intValue ?? 1)
+                        for gk in gkids where (gk["type"] as? String) == "eventfollow" {
+                            let tPath = (gk["particle"] as? String) ?? (gk["name"] as? String)
+                            guard let tPath, let tpj = source.json(for: tPath), tpj["emitter"] != nil,
+                                  var tdesc = build(from: tpj, source: source) else { continue }
+                            if let mc = (gk["maxcount"] as? NSNumber)?.intValue { tdesc.maxCount = mc }
+                            tdesc.eventFollow = true
+                            tdesc.efHeadOrigin = headOrigin
+                            tdesc.efHeadVelocity = headVel
+                            tdesc.efHeadLifeMin = headLifeMin; tdesc.efHeadLifeMax = headLifeMax
+                            tdesc.efHeadRate = headRate
+                            tdesc.efHeadMaxCount = max(1, headMax)
+                            applyObjectLayer(&tdesc)     // 同列对象层变换(parent FBO / 染色 / 视差等与头一致)
+                            applyChildTransform(&tdesc, child)   // 同列局部 origin/scale(与头同列对齐)
+                            result.append(tdesc)
+                        }
+                    }
                 }
             }
         }

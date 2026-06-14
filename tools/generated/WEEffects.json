@@ -7011,7 +7011,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_vorticity",
@@ -7460,7 +7462,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "rg1616f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_divergence",
@@ -7504,7 +7508,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_clear",
@@ -7558,7 +7564,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -7616,7 +7624,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -7674,7 +7684,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -7732,7 +7744,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -7790,7 +7804,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -7848,7 +7864,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -7906,7 +7924,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -7964,7 +7984,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -8022,7 +8044,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -8080,7 +8104,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_gradientsubtract",
@@ -8138,7 +8164,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "rg1616f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_advection",
@@ -8426,7 +8454,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "rg1616f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_advection",
@@ -8838,7 +8868,8 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_normal",
@@ -9086,14 +9117,17 @@
       "copy": false,
       "target": "_rt_SmokeVelocity2",
       "source": "_rt_SmokeVelocity1",
-      "bind": []
+      "bind": [],
+      "targetFormat": "rg1616f",
+      "targetUnique": true
      },
      {
       "command": "swap",
       "copy": false,
       "target": "_rt_SmokeDye2",
       "source": "_rt_SmokeDye1",
-      "bind": []
+      "bind": [],
+      "targetUnique": true
      }
     ]
    },
@@ -9144,7 +9178,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_vorticity",
@@ -9593,7 +9629,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "rg1616f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_divergence",
@@ -9637,7 +9675,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_clear",
@@ -9691,7 +9731,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -9749,7 +9791,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -9807,7 +9851,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -9865,7 +9911,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -9923,7 +9971,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -9981,7 +10031,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -10039,7 +10091,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -10097,7 +10151,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -10155,7 +10211,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_pressure",
@@ -10213,7 +10271,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r16f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_gradientsubtract",
@@ -10271,7 +10331,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "rg1616f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_advection",
@@ -10559,7 +10621,9 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "rg1616f",
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_advection",
@@ -10971,7 +11035,8 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetUnique": true
      },
      {
       "shader": "effects/fluidsimulation_normal",
@@ -11219,14 +11284,17 @@
       "copy": false,
       "target": "_rt_SmokeVelocity2",
       "source": "_rt_SmokeVelocity1",
-      "bind": []
+      "bind": [],
+      "targetFormat": "rg1616f",
+      "targetUnique": true
      },
      {
       "command": "swap",
       "copy": false,
       "target": "_rt_SmokeDye2",
       "source": "_rt_SmokeDye1",
-      "bind": []
+      "bind": [],
+      "targetUnique": true
      }
     ]
    }
@@ -11695,7 +11763,8 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r8"
      },
      {
       "shader": "effects/glitter_combine",
@@ -11875,7 +11944,8 @@
         }
        ],
        "ubuf": 0
-      }
+      },
+      "targetFormat": "r8"
      },
      {
       "shader": "effects/glitter_combine",
@@ -16693,7 +16763,8 @@
       "copy": true,
       "target": "_rt_FullCompoBuffer1",
       "source": "_rt_FullCompoBuffer2",
-      "bind": []
+      "bind": [],
+      "targetUnique": true
      },
      {
       "shader": "effects/motionblur_combine",
@@ -16830,7 +16901,8 @@
       "copy": true,
       "target": "_rt_FullCompoBuffer1",
       "source": "_rt_FullCompoBuffer2",
-      "bind": []
+      "bind": [],
+      "targetUnique": true
      },
      {
       "shader": "effects/motionblur_combine",

@@ -52,6 +52,24 @@ private func matLookAt(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>
     ))
 }
 
+/// 世界法线矩阵:world 上 3×3 的逆转置(非均匀缩放下法线不被拉歪),封装进 float4x4 的左上 3×3,
+/// 其余行/列零(w=1),供 frag 取 (normalMat*float4(n,0)).xyz。退化(不可逆)时回退原 3×3。
+private func normalMatrix(_ world: simd_float4x4) -> simd_float4x4 {
+    let m3 = simd_float3x3(columns: (
+        SIMD3(world.columns.0.x, world.columns.0.y, world.columns.0.z),
+        SIMD3(world.columns.1.x, world.columns.1.y, world.columns.1.z),
+        SIMD3(world.columns.2.x, world.columns.2.y, world.columns.2.z)
+    ))
+    let det = simd_determinant(m3)
+    let inv3 = abs(det) > 1e-8 ? m3.inverse.transpose : m3
+    return simd_float4x4(columns: (
+        SIMD4(inv3.columns.0, 0),
+        SIMD4(inv3.columns.1, 0),
+        SIMD4(inv3.columns.2, 0),
+        SIMD4(0, 0, 0, 1)
+    ))
+}
+
 private func matModel(centerPx: SIMD2<Float>, sizePx: SIMD2<Float>, angleDegZ: Float) -> simd_float4x4 {
     // ⚠ angleDegZ 名字是历史误称——WE 的 angles 单位其实是**弧度**(lwe CImage.cpp:1083
     // "already in radians from scene.json";glm::rotate 取弧度),不是角度!之前 ×π/180 当成
@@ -126,6 +144,8 @@ private struct GPULayer {
     var parallax: SIMD2<Float>   // parallaxDepth:视差响应强度
     var sizePx: SIMD2<Float>
     var rawSizePx: SIMD2<Float> = SIMD2(1, 1)   // **未缩放**原始 size(lwe CImage.cpp:239 m_size);composelayer 自有 FBO 用它(:278-283),scale 只作用于 quad 几何。sizePx=size×scale 仅用于 quad/mvp。
+    var opaqueRect: SIMD4<Float> = SIMD4(0, 0, 1, 1)  // 贴图不透明内容包围盒(uv [u0,v0,u1,v1]);自适应判大图层真实内容是否探进 cover 裁切区
+    var opaqueSolid: Float = 1                         // 包围盒内实心占比(alpha>200);区分密实主体(角色)vs 稀薄大气层(云/雾)
     var video: VideoTexture? = nil   // 视频纹理(动态贴图);非 nil 时每帧刷新 texture
     var effects: [LayerEffect] = []  // 图层后处理效果链
     var text: TextLayerState? = nil  // 文本图层(时钟/日期);非 nil 时按秒刷新纹理
@@ -145,6 +165,11 @@ private struct GPULayer {
     var effectAuxFlags: [[Int: TexFlags]] = []  // **逐特效**辅助贴图 flags(slot→flags,与 effects 对齐)
     var useWE = false                   // 该层有任一可跑的真 WE 特效 → 跑 WEEffectChain 产出 effectedTexture
     var frameBufferInput = false        // composelayer/_rt_FullFrameBuffer:特效链输入=下方已合成整帧场景(打雷等)
+    // 以本 composelayer 为 parent 的粒子组下标(scene `parent` 指向本层 id 且本层 frameBufferInput)。
+    // 非空 → encodeLweScene 在跑本层特效前,把这些粒子组画进一张**透明全画布 child FBO**,
+    // 用它(而非累积场景 sceneFBO)当 computeLayerEffect 的 sceneInput → 特效(tint/opacity-mask)只作用于
+    // 「只含粒子」的 FBO,不染下方场景的角色/龙身(凯尔希×Mon3tr Matrix spawner 机制,真 WE,lwe 未实现)。
+    var childParticleGroupIndices: [Int] = []
     var abovePost = false               // 排在最后一个 postChain fullscreenlayer 之上 → postChain 跑完后再叠(不被后处理染暗,WE 语义)
     var regionFit = false               // 区域性 composelayer(非 pulse):特效在该层 region [0,1] 跑(裁场景+遮罩到 region);encode 用普通 UV 贴回。pulse=false 走全屏画布 UV(不动)。
     var effectedTexture: MTLTexture? = nil   // 每帧由 WEEffectChain 产出的特效后纹理
@@ -167,6 +192,13 @@ private struct GPULayer {
     // 全部可见 animationlayers(WE 真义:多层叠加合成,additive 层在 base 上追加位移)。
     // 御剑龙 = 「动画 1」base + 「动画 2」additive(含下压/飞行整体运动)——只播第一层会把龙整体运动丢掉(恒停高位)。
     var puppetAnimLayers: [(animId: Int, rate: Float, additive: Bool)] = []
+    // 眼睛部件剔除朝向:默认 .none(3D 蒙皮自身把眼睛收缩闭合,实测不需剔除)。WP_EYE_CULL=front/back
+    // 仅作 A/B 诊断(实测凯尔希眼三角绕序恒单朝向、眨眼不翻面 → .back 全程剔光眼、.front 不剔任何)。
+    // 主 puppet(龙/刀/朱鹤/头发/衣物)恒 .none。
+    var puppetCull: MTLCullMode = .none
+    // 眼睛层:蒙皮用完整 3D TRS(含 rx/ry/tz 出平面)→ 眨眼闭合。主 puppet=false 用平面 TRS(丢 rx/ry,零回归;
+    // 朱鹤 anim458 bone2 rx→π/2 在无深度的 2D 下会折叠成色块)。
+    var puppetUse3D: Bool = false
     // 部件间 attachment 层(凯尔希眼睛/眼睑/耳朵→主体「头部」):baseModel/mvp 已按**父**变换搭好,
     // 子顶点已搬进父 mesh-local 空间。update() 的 origin/angle/scale 脚本及 origin 关键帧重建会用**子自身**
     // origin/size 覆写 baseModel → 破坏 attachment,故对这些层跳过那些重建(只保留视差,视差作用于 baseModel 安全)。
@@ -276,6 +308,11 @@ private final class ParticleGroup {
     // = 首个场景序排在本粒子之后的图层下标;encode 在画 layers[anchor] 之前冲刷本组。
     // layers.count = 在所有图层之上(顶层粒子)。Postscript 鸟(对象序[1])锚到人物层之前 → 被人物盖住。
     var anchorLayerIndex: Int = .max
+    // scene `parent` id(从 ParticleEmitterDesc.parentObjId 透传)。
+    var parentObjId: Int? = nil
+    // parent 解析到的 composelayer(frameBufferInput)图层下标。非 nil → 本组**不进主场景**,
+    // 而是渲进该 composelayer 的 child FBO(见 GPULayer.childParticleGroupIndices)。
+    var parentComposeLayerIndex: Int? = nil
     init(sim: ParticleSimulator, texture: MTLTexture, additive: Bool,
          isRefract: Bool = false, isRope: Bool = false, normalTexture: MTLTexture? = nil, aboveBloom: Bool = false,
          parallaxDepth: SIMD2<Float> = SIMD2(1, 1)) {
@@ -306,8 +343,9 @@ final class SceneRenderEngine {
     private var pipelineBlit: MTLRenderPipelineState?              // 全屏拷贝(折射 pass 先铺底图)
     private var pipelineBlitMix: MTLRenderPipelineState?          // 常量-alpha 混合:把后处理层结果按 opacity 叠回前一画面
     private var pipelineBlitFXAA: MTLRenderPipelineState?          // FXAA 呈现(画质设置开时用)
+    private var pipelineBlitAspect: MTLRenderPipelineState?        // 屏幕适配呈现(uvScale 居中裁切/留黑边,= lwe updateTextureUVs)
     // MARK: 3D 透视场景(太阳系3662790108/土星3589454154 等;.mdl 几何模型 + 透视相机 + 深度缓冲)
-    private struct Material3DGPU { let tex: MTLTexture?; let color: SIMD3<Float>; let brightness: Float; let alpha: Float; let translucent: Bool }
+    private struct Material3DGPU { let tex: MTLTexture?; let color: SIMD3<Float>; let brightness: Float; let alpha: Float; let translucent: Bool; let lighting: Bool }
     private struct Submesh3DGPU { let mat: Material3DGPU; let start: Int; let count: Int }
     private struct Model3DGPU { let id: Int; let vb: MTLBuffer; let ib: MTLBuffer; var world: simd_float4x4; let submeshes: [Submesh3DGPU] }
     private var models3D: [Model3DGPU] = []
@@ -318,6 +356,7 @@ final class SceneRenderEngine {
     private let scene3DLiveModels = ProcessInfo.processInfo.environment["WP_3D_LIVE_MODELS"] != nil  // 调试:让模型也逐帧(取景会漂)
     private var logged3DHud = false   // WP_3D_HUD_LOG 诊断:只打一次 HUD 层位置
     private var viewProj3D = matrix_identity_float4x4
+    private var light3D: Scene3DRuntime.ResolvedLight?   // 3D 场景方向光(N·L 漫反射昼夜终止线);nil/WP_NO_3D_LIGHTING=平涂
     private var depthTex3D: MTLTexture?
     private var pipeline3DOpaque: MTLRenderPipelineState?
     private var pipeline3DBlend: MTLRenderPipelineState?
@@ -362,7 +401,9 @@ final class SceneRenderEngine {
     private var mfxKey: String = ""                               // scaler 的尺寸键(变了就重建)
     private var refractSceneTex: MTLTexture?                       // 折射用:层+非折射粒子的离屏底图
     private var sceneBelowForEffects: MTLTexture?                  // frame_builder 等整帧底图特效用:该层之下已合成场景
-    private var ndcScale = SIMD2<Float>(1, 1)                      // 画布↔屏幕宽高比适配(cover:填满+裁切,不拉伸)
+    private var ndcScale = SIMD2<Float>(1, 1)                      // 顶点宽高比缩放:新机制下渲到画布长宽比纹理→恒(1,1)(不缩放=无分带)
+    private var aspectMouse = SIMD2<Float>(1, 1)                   // 鼠标/视差用的「旧 cover/fit ndc」(从屏幕长宽比算;blitUVScale=1/它)
+    private var blitUVScale = SIMD2<Float>(1, 1)                   // 最终呈现 blit 的 uvScale(lwe updateTextureUVs:<1 裁切、>1 留黑边)
     private var weEffects: WEEffectChain?                          // 转译特效引擎(真 WE shader)
     // in-engine 路径已调通。默认:manifest 里有的 effect 都走真 WE shader,除 denylist:
     //  - cursorripple:已有专门的 3-pass 流体模拟(CursorRippleSim),走 projectlayer 路径,不用这条。
@@ -552,6 +593,13 @@ final class SceneRenderEngine {
             d.vertexFunction = fsv; d.fragmentFunction = fsf
             d.colorAttachments[0].pixelFormat = .bgra8Unorm
             pipelineBlit = try device.makeRenderPipelineState(descriptor: d)
+            // 屏幕适配呈现管线(uvScale 居中裁切/留黑边):场景渲到画布长宽比纹理后,最终一次性 blit 到屏幕。
+            if let fsa = lib.makeFunction(name: "fullscreen_copy_aspect") {
+                let da = MTLRenderPipelineDescriptor()
+                da.vertexFunction = fsv; da.fragmentFunction = fsa
+                da.colorAttachments[0].pixelFormat = .bgra8Unorm
+                pipelineBlitAspect = try? device.makeRenderPipelineState(descriptor: da)
+            }
             // 常量-alpha 混合管线(同顶点/片元,开 blend):src*constAlpha + dst*(1-constAlpha) = mix(dst, src, α)。
             // 供后处理层 opacity 把"加特效的画面"按 α 叠回下方干净画面(真 WE 的 fullscreenlayer 图层 opacity 语义)。
             let dm = MTLRenderPipelineDescriptor()
@@ -747,6 +795,8 @@ final class SceneRenderEngine {
             var solidColorBaked = false
             // 音频可视化 solidlayer(audioline 等):透明底 + effectedTexture 自带逐像素 alpha,对象 alpha=0 不应再乘。
             var audioVizSelfAlpha = false
+            var opaqueR = SIMD4<Float>(0, 0, 1, 1)   // 贴图不透明内容包围盒(自适应判大图截断用)
+            var opaqueSolidR: Float = 1              // 包围盒内实心占比(角色 vs 云雾)
             if layer.audioBars != nil {
                 // 音频频谱条:用**透明**底纹理作画布,真 WE Simple_Audio_Bars shader(在 effects 链里)
                 // 据系统音频频谱把条画上去(TRANSPARENCY=REPLACE → alpha=bar*opacity),再由 perspective
@@ -755,6 +805,23 @@ final class SceneRenderEngine {
                 tex = t
                 AudioCapture.shared.acquire()
                 usesAudio = true
+            } else if layer.selfDrawFullscreen {
+                // 自绘满画布特效层(lightshafts 阳光/光束):shape="quad" + 无 image + DIRECTDRAW 自绘特效。
+                //   用**透明全画布底**作 g_Texture0(DIRECTDRAW 分支 `albedo=CAST4(0)` 忽略它),真 WE
+                //   lightshafts shader 据 point0..3 透视 UV 把光束自绘上去(alpha=光束强度);additive 合成。
+                //   底分辨率取画布最长边 ≤ 1920(省显存,光束是平滑渐变、不需全分辨率)。
+                let cw = max(2, Int((layer.sizePx?.x ?? 1920).rounded()))
+                let ch = max(2, Int((layer.sizePx?.y ?? 1080).rounded()))
+                let longest = max(cw, ch)
+                let cap = 1920
+                let bw = longest > cap ? Int((Float(cw) * Float(cap) / Float(longest)).rounded()) : cw
+                let bh = longest > cap ? Int((Float(ch) * Float(cap) / Float(longest)).rounded()) : ch
+                guard let t = transparentTexture(width: max(2, bw), height: max(2, bh)) else {
+                    Log.write("scene: lightshafts transparent texture alloc failed for \(layer.name)"); continue
+                }
+                tex = t
+                // 保留 effectedTexture 逐像素 alpha(光束强度),合成不乘对象色(对象色 = 白 (1,1,1,1))。
+                audioVizSelfAlpha = true
             } else if let textDesc = layer.text {
                 // 文本图层(时钟/日期):Core Text 渲染成纹理,每秒刷新。
                 var td = textDesc
@@ -821,6 +888,7 @@ final class SceneRenderEngine {
                 }
                 let decoded = decodedWF.tex
                 texFlags = decodedWF.flags
+                let ob = Self.opaqueBounds(decoded); opaqueR = ob.rect; opaqueSolidR = ob.solidFrac  // 不透明内容范围+实心占比
                 if case .video(let mp4) = decoded {
                     // 视频纹理:先用首帧建静态兜底,再尝试建逐帧播放器。
                     guard let frame = VideoFrame.firstFrameRGBA8(mp4),
@@ -887,9 +955,11 @@ final class SceneRenderEngine {
                 }
                 let dec = dec0
                 auxCache[ref] = t; auxFlagsCache[ref] = dec.flags
-                // 【已废弃的 freeimage Resolution quirk,默认关】曾按"(容器,内容)头部喂 Resolution"模型修条带,
-                // 后被跨端采集证伪(真解=画布对位+反相,见 composeMask 路径)。WP_FIF_RES=1 可临时启用作 A/B 诊断。
-                if ProcessInfo.processInfo.environment["WP_FIF_RES"] != nil,
+                // ⭐freeimage 容器≠内容 → 喂 g_TextureNResolution=(容器,内容):这是 **WE 真机制**(opacity.vert
+                // 用 `zw=(u·imgW/texW, v·imgH/texH)` 采样遮罩,见源码)。御剑「影子」遮罩=4096²容器/4096×2296内容,
+                // 喂对后 shader 自己把整张遮罩映射到层 region(横向全宽、纵向 v×0.56),条带淡且落角色躯干=对齐 WE 实图。
+                // (此前误判:画布对位裁切+反相是非 WE 的猜测,已撤;那套基于错误的"反相"跨端结论。)WP_NO_FIF_RES=1 退回作 A/B。
+                if ProcessInfo.processInfo.environment["WP_NO_FIF_RES"] == nil,
                    let info = TexDecoder.headerInfo(b), info.freeImage,
                    (info.texW != info.imgW || info.texH != info.imgH) {
                     auxResCache[ref] = SIMD4(Float(info.texW), Float(info.texH), Float(info.imgW), Float(info.imgH))
@@ -904,7 +974,9 @@ final class SceneRenderEngine {
             // 作用域极窄:frameBufferInput+regionFit(打雷 pulse=非 regionFit 不动)且遮罩尺寸==画布(±4px)。
             // WP_NO_FBMASK_FIX=1 退回旧直采。
             func composeMaskTex(_ ref: String) -> MTLTexture? {
-                guard ProcessInfo.processInfo.environment["WP_NO_FBMASK_FIX"] == nil,
+                // 【默认关】画布对位裁切是非 WE 的猜测(把整张影子裁到 region 当层遮罩)——已被 WE opacity.vert 真机制
+                // (freeimage 分辨率喂 g_TextureNResolution 让 shader 算 zw)取代,见上方 auxResCache。WP_FBMASK_CROP=1 才用作 A/B。
+                guard ProcessInfo.processInfo.environment["WP_FBMASK_CROP"] != nil,
                       layer.frameBufferInput, layer.regionFit,
                       let sz = layer.sizePx else { return nil }
                 let key = "\(ref)#fbinv#\(layer.id)"
@@ -932,17 +1004,34 @@ final class SceneRenderEngine {
                 guard x1 > x0 + 8, y1 > y0 + 8 else { return nil }
                 let cw = x1 - x0, chh = y1 - y0
                 var out = [UInt8](repeating: 0, count: cw * chh * 4)
+                // WE opacity.frag 铁证:`albedo.a *= mask.r`(纯乘、**不反相**)→ 条带显示在遮罩**白处**。
+                // 御剑「影子」白在角色 → 条带上身(WE对比图实证:条带在角色躯干、不在龙)。旧硬编码反相=偏离 WE
+                // (把条带推到剪影外/龙身上),已撤。WP_FBMASK_INVERT=1 恢复旧反相作 A/B。
+                let doInv = ProcessInfo.processInfo.environment["WP_FBMASK_INVERT"] != nil
                 for y in 0..<chh {
                     let srcRow = (y0 + y) * w
                     for x in 0..<cw {
                         let s = (srcRow + x0 + x) * 4, d = (y * cw + x) * 4
-                        out[d] = 255 &- px[s]; out[d+1] = 255 &- px[s+1]; out[d+2] = 255 &- px[s+2]; out[d+3] = 255
+                        if doInv { out[d] = 255 &- px[s]; out[d+1] = 255 &- px[s+1]; out[d+2] = 255 &- px[s+2] }
+                        else { out[d]=px[s]; out[d+1]=px[s+1]; out[d+2]=px[s+2] }
+                        out[d+3] = 255
                     }
+                }
+                // 诊断:WP_DUMP_MASK=1 把裁出的遮罩(反相后)+ 原始裁块(反相前)存 PNG,核对剪影对位/极性。
+                if ProcessInfo.processInfo.environment["WP_DUMP_MASK"] != nil {
+                    // 全画布遮罩(未裁),看剪影在画布哪
+                    saveTexture(makeTexture(.rgba8(pixels: px, width: w, height: h), loader: loader)!, to: "/tmp/mask_\(layer.id)_full.png")
+                    var raw = [UInt8](repeating: 0, count: cw * chh * 4)
+                    for y in 0..<chh { let sr=(y0+y)*w; for x in 0..<cw { let s=(sr+x0+x)*4, d=(y*cw+x)*4
+                        raw[d]=px[s]; raw[d+1]=px[s+1]; raw[d+2]=px[s+2]; raw[d+3]=255 } }
+                    saveTexture(makeTexture(.rgba8(pixels: raw, width: cw, height: chh), loader: loader)!, to: "/tmp/mask_\(layer.id)_raw.png")
+                    saveTexture(makeTexture(.rgba8(pixels: out, width: cw, height: chh), loader: loader)!, to: "/tmp/mask_\(layer.id)_inv.png")
+                    Log.write("WP_DUMP_MASK: layer=\(layer.id) region origin=(\(layer.originPx.x),\(layer.originPx.y)) size=(\(sz.x),\(sz.y)) crop x[\(x0),\(x1)] y[\(y0),\(y1)]")
                 }
                 guard let t = makeTexture(.rgba8(pixels: out, width: cw, height: chh), loader: loader) else { return nil }
                 auxCache[key] = t
-                Log.write("scene: composeMask canvas-aligned+inverted ref=\(ref) layer=\(layer.id) crop=\(cw)x\(chh)")
-                auditLines.append("ℹ️ 层id=\(layer.id) 遮罩\(ref) → 画布对位+反相(WE实测语义) 裁\(cw)x\(chh)")
+                Log.write("scene: composeMask canvas-aligned ref=\(ref) layer=\(layer.id) crop=\(cw)x\(chh) inv=\(doInv)")
+                auditLines.append("ℹ️ 层id=\(layer.id) 遮罩\(ref) → 画布对位(WE alpha*=mask 不反相\(doInv ? "/已反相" : "")) 裁\(cw)x\(chh)")
                 return t
             }
             let effectAux: [[Int: MTLTexture]] = layer.effects.map { eff in
@@ -1097,6 +1186,8 @@ final class SceneRenderEngine {
             var puppetVB: MTLBuffer? = nil, puppetIB: MTLBuffer? = nil, puppetCount = 0
             var puppetMesh: PuppetMesh? = nil, puppetAnimId = 0, puppetAnimRate: Float = 1
             var puppetAnimLayers: [(animId: Int, rate: Float, additive: Bool)] = []
+            var eyeCull: MTLCullMode = .none   // 眼睛层背面剔除朝向(非眼=.none 保持零回归)
+            var eyeUse3D = false               // 眼睛层用完整 3D 蒙皮(主 puppet=false 平面蒙皮零回归)
             if ProcessInfo.processInfo.environment["WP_NOPUPPET"] == nil,
                let pup = layer.puppet, let blob = source.data(for: pup),
                let mesh = PuppetMesh.parse(blob, size: size), mesh.indices.count >= 3,
@@ -1125,9 +1216,40 @@ final class SceneRenderEngine {
                 //   不会把眼睛拉散/脱位。旧关闭原因(attachedUnitVerts 按父 size 归一)随①统一锚点废弃已不存在。
                 //   WP_NO_ATTACH_BLINK=1 可临时退回静态 bind(A/B 对比眨眼)。
                 let blinkOn = ProcessInfo.processInfo.environment["WP_NO_ATTACH_BLINK"] == nil
-                if mesh.hasSkin, (layer.attachment == nil || blinkOn),
+                if mesh.hasSkin,
                    let al = layer.animationLayers.first(where: { $0.visible }) ?? layer.animationLayers.first {
-                    puppetMesh = mesh; puppetAnimId = al.animation; puppetAnimRate = al.rate
+                    // ⭐**眼睛眨眼/眼球转动 = 完整 3D 蒙皮**(2026-06-14c,替代旧「眼睛一律静态 bind」绕过):
+                    //   眼睛是「离体 UV 岛」(眼白顶点在 mesh box 外、拉到脸上)。蒙皮数学本身正确(invBind/权重/
+                    //   归一已验证 frame0 偏差=0)。旧「眼睛一律静态 bind」绕过让眼睛恒睁(不眨)。
+                    //   真因 = 平面 skinner 的 trs 只构 rz、丢 rx/ry/tz,而凯尔希「眼睛」anim1405 bone2 的眨眼是
+                    //   **出平面**变换:rx→π/2(虹膜绕 X 翻 90°)+ tz→−61(后退)。丢掉 rx → 顶点 x/y 根本不动 →
+                    //   眼睛永远睁着。补完整 3D trs3D 后,虹膜区顶点随 rx/tz 把眼睛**收缩成一条闭合的眼线**
+                    //   (隔离渲染像素实测:眨眼峰值眼面积 1538→730 px,睁→闭→睁干净过渡,无翻面色块)。
+                    //   ⚠ 背面剔除经实测**不需要也不该用**:凯尔希眼三角屏幕绕序恒为单朝向、眨眼时不翻面 →
+                    //     .back 会把睁眼整片剔掉(全程无眼)、.front 不剔任何(=.none);3D 蒙皮自身已闭合眼睛,
+                    //     故默认 cull=.none。WP_EYE_CULL=front/back 仅留作 A/B 诊断。
+                    //   m眼睛 anim1038 是平面挤眼(sy→0.77,rx=ry=0)→ trs3D 退化为 trs,同样正确。
+                    //   主 puppet(龙/刀/朱鹤/头发/衣物,非眼)走平面蒙皮(use3D=false,丢 rx/ry)=旧行为零回归
+                    //   (朱鹤 anim458 bone2 rx→π/2 在 2D 无深度下出平面旋转会折叠成色块,故主 puppet 不上 3D)。
+                    //   WP_NO_EYE_SKIN=1 退回旧静态 bind 绕过(A/B 对比)。
+                    let nm = layer.name.lowercased()
+                    let isEye = layer.name.contains("眼") || nm.contains("eye")
+                    let eyeSkinOn = ProcessInfo.processInfo.environment["WP_NO_EYE_SKIN"] == nil
+                    let attachOK = blinkOn && (isEye ? eyeSkinOn : true)
+                    if attachOK {
+                        puppetMesh = mesh; puppetAnimId = al.animation; puppetAnimRate = al.rate
+                        if isEye {
+                            eyeUse3D = true
+                            switch ProcessInfo.processInfo.environment["WP_EYE_CULL"] {
+                            case "back":  eyeCull = .back
+                            case "front": eyeCull = .front
+                            default:      eyeCull = .none   // 默认不剔除;3D 蒙皮自身闭合眼睛
+                            }
+                            Log.write("puppet: \(layer.name) 眼睛部件 → 3D 蒙皮 anim\(al.animation)(cull=\(eyeCull == .back ? "back" : eyeCull == .front ? "front" : "none"))")
+                        }
+                    } else if isEye {
+                        Log.write("puppet: \(layer.name) 眼睛部件 → WP_NO_EYE_SKIN 退回静态 bind")
+                    }
                 }
                 // WE 真义:对象的**全部可见** animationlayers 叠加合成(additive 层追加位移)。
                 // 御剑龙「动画 2」(additive,含下压/飞行)曾被只取首层的旧逻辑丢掉 → 龙恒停 bind 高位(偏上真因)。
@@ -1151,6 +1273,8 @@ final class SceneRenderEngine {
                 parallax: layer.parallax,
                 sizePx: effSize,
                 rawSizePx: size,   // 未缩放(lwe m_size);composelayer footprint FBO 用它,不用 effSize(=size×scale)
+                opaqueRect: opaqueR,
+                opaqueSolid: opaqueSolidR,
                 video: videoTex,
                 effects: effs,
                 text: textState,
@@ -1185,6 +1309,8 @@ final class SceneRenderEngine {
             result[result.count - 1].id = layer.id   // 诊断用:按 pkg id 隐藏图层(WP_HIDE_IDS)
             result[result.count - 1].sceneObjIndex = layer.sceneObjIndex   // 场景对象序(粒子插画锚点)
             result[result.count - 1].puppetAnimLayers = puppetAnimLayers   // 全部可见 animationlayers(additive 叠加)
+            result[result.count - 1].puppetCull = eyeCull   // 眼睛层背面剔除(转背虹膜剔掉=闭眼);非眼=.none
+            result[result.count - 1].puppetUse3D = eyeUse3D  // 眼睛层完整 3D 蒙皮;主 puppet 平面(零回归)
             result[result.count - 1].audioVizSelfAlpha = audioVizSelfAlpha   // 音频可视化层:合成保留 effectedTexture 逐像素 alpha
             result[result.count - 1].isAttached = (attachWorld != nil)   // attach 成功(蒙皮或刚性 quad 均含):baseModel 已按挂点搭好,update 跳过 origin/scale/angle 覆写
             // 动态挂点跟随:父 puppet 有骨骼动画(主体 anim206 呼吸)时,记下重算所需数据,update() 每帧把
@@ -1298,6 +1424,9 @@ final class SceneRenderEngine {
         hasAngleScript = result.contains { $0.angleScript != nil }
         hasAudioBars = result.contains { $0.audioBars != nil }
         hasInstancedBars = result.contains { $0.instancedBarsScript != nil }
+        // 关键帧时间线动画(开场动画黑层 alpha 1→0 淡出 / 对象 origin/angle 摆动):是「持续动画内容」,
+        // 否则纯关键帧场景被当静态图 → drawOnce 只画 t=0 一帧 → 开场永远卡 frame0(黑层不淡出)。
+        hasKeyframeAnim = result.contains { $0.alphaKeyAnim != nil || $0.originKeyAnim != nil || $0.angleKeyAnim != nil }
         cameraParallax = document.cameraParallax
         cameraParallaxAmount = document.cameraParallaxAmount
         cameraParallaxMouseInfluence = document.cameraParallaxMouseInfluence
@@ -1360,7 +1489,7 @@ final class SceneRenderEngine {
         hasCursorRipple = document.hasCursorRipple
         cursorRippleCutoff = document.cursorRippleLayerCutoff
         if hasCursorRipple {
-            if rippleSim == nil { rippleSim = CursorRippleSim(device: device, sampler: sampler, quad: quadBuffer) }
+            if rippleSim == nil { rippleSim = CursorRippleSim(device: device, sampler: sampler, quad: quadBuffer, aspect: canvas.y > 0 ? canvas.x / canvas.y : 1) }
             Log.write("cursorripple: 折射作用于 projectlayer 下方 \(cursorRippleCutoff) 层(layers[0..<\(cursorRippleCutoff)]),上方层不折射")
             rippleSim?.rippleStrength = document.rippleParams.x
             rippleSim?.rippleScale = document.rippleParams.y
@@ -1480,11 +1609,47 @@ final class SceneRenderEngine {
             // dependencies 拓扑重排的 2 张壁纸亦无实际位移)。无 → layers.count(全场顶层)。
             particleGroups[particleGroups.count - 1].anchorLayerIndex =
                 layers.firstIndex(where: { $0.sceneObjIndex > em.sceneObjIndex }) ?? layers.count
+            particleGroups[particleGroups.count - 1].parentObjId = em.parentObjId   // scene parent id(child→FBO 判定用)
+        }
+        // parent→child composelayer FBO 关联(真 WE,lwe 未实现;见 useComposeChildFBO 注释):
+        // 若某粒子组的 scene parent 指向一个 frameBufferInput composelayer,则把它绑到该层 → 渲进该层的
+        // child FBO(透明底)而非主场景。作用域极窄:只对「有 child 粒子对象的 composelayer」启用,
+        // 其他 composelayer 壁纸(打雷 pulse / 音频条 regionFit,无 child 粒子)完全不受影响、零回归。
+        if useComposeChildFBO {
+            for (gi, g) in particleGroups.enumerated() {
+                guard let pid = g.parentObjId,
+                      let L = layers.firstIndex(where: { $0.id == pid && $0.frameBufferInput }) else { continue }
+                g.parentComposeLayerIndex = L
+                layers[L].childParticleGroupIndices.append(gi)
+                hasComposeChildFBO = true
+                // 矩阵渲进 1322 的 child FBO,**只用 opacity 的 MASK 把它裁到龙翅区(限制范围),不应用 tint**:
+                // 1322 的 tint(青 0.584/0.921/1.0 加法)在真 WE 里作用于「下方场景」产生青色辉光,**不染矩阵**;
+                // 误把 tint 加在矩阵上 → 绿矩阵被染青(被用户指出「没达到 WE 效果」,WE 矩阵是纯绿)。故剔除该层
+                // 色调 tint,保留 opacity(MASK 限制)→ 矩阵=绿色 + 限制在龙翅区 = WE 真效果。WP_MATRIX_KEEP_TINT 退回。
+                // ⭐**默认保留 tint**(2026-06-14 订正):WE 矩阵的「淡」正来自 1322 tint(BLENDMODE31 加法青色
+                //   0.584/0.921/1.0)给纯绿矩阵加一层青 → 淡青绿(用户「WE 更淡」)。上轮误删 tint → 饱和深绿。
+                //   child FBO 只含矩阵(透明底),tint 只染矩阵字形像素、空像素 alpha=0 经 opacity-mask 仍透明 →
+                //   **不会染龙身/角色**(头身分离顾虑在 child-FBO 架构下不成立)。WP_MATRIX_REMOVE_TINT=1 才删(A/B)。
+                if ProcessInfo.processInfo.environment["WP_MATRIX_REMOVE_TINT"] != nil,
+                   let ti = layers[L].effects.firstIndex(where: { $0.weName == "tint" }) {
+                    // 必须同步移除**所有与 effects 对齐的并行数组**同下标项(effectMasks/effectAux/effectAuxRes/
+                    // effectMaskFlags/effectAuxFlags),否则 opacity 会错位拿到 tint 的遮罩槽 → MASK 限制失效(全宽)。
+                    layers[L].effects.remove(at: ti)
+                    if ti < layers[L].effectMasks.count { layers[L].effectMasks.remove(at: ti) }
+                    if ti < layers[L].effectAux.count { layers[L].effectAux.remove(at: ti) }
+                    if ti < layers[L].effectAuxRes.count { layers[L].effectAuxRes.remove(at: ti) }
+                    if ti < layers[L].effectMaskFlags.count { layers[L].effectMaskFlags.remove(at: ti) }
+                    if ti < layers[L].effectAuxFlags.count { layers[L].effectAuxFlags.remove(at: ti) }
+                    Log.write("composeChildFBO: 剔除 composelayer \(pid) 的 tint[idx\(ti)]+对齐遮罩(矩阵保持绿色,只留 opacity-MASK 限制)")
+                }
+                Log.write("composeChildFBO: particle group \(gi) (parent=\(pid)) → composelayer id=\(pid) layerIndex=\(L) (child FBO, 不进主场景)")
+            }
         }
         lastUpdateTime = -1
         let cbmLayers = layers.filter { $0.colorBlendMode > 0 }
         let cbmInfo = cbmLayers.isEmpty ? "" : " colorBlendMode=\(cbmLayers.map { $0.colorBlendMode })(pipe=\(pipelineColorBlend != nil ? "Y" : "N"))"
         Log.write("scene: loaded \(layers.count)/\(document.layers.count) layers, \(particleGroups.count)/\(document.emitters.count) particle groups, canvas \(canvas.x)x\(canvas.y), parallax=\(hasParallax)\(cbmInfo)")
+        precomputeLargeLayers()   // 自适应「大图被切→拉伸」:算定大图像层不透明内容包围盒
         writeRenderAudit(document: document, source: source)
     }
 
@@ -1530,7 +1695,7 @@ final class SceneRenderEngine {
     }
 
     /// 是否需要持续动画(有视差、粒子、视频纹理、effect、文本时钟、scale 脚本、音频条或鼠标水波)。
-    var isAnimated: Bool { hasParallax || !particleGroups.isEmpty || hasVideo || hasEffects || hasText || hasScaleScript || hasOriginScript || hasAngleScript || hasAudioBars || hasInstancedBars || hasCursorRipple || has3DScene }
+    var isAnimated: Bool { hasParallax || !particleGroups.isEmpty || hasVideo || hasEffects || hasText || hasScaleScript || hasOriginScript || hasAngleScript || hasAudioBars || hasInstancedBars || hasCursorRipple || has3DScene || hasKeyframeAnim }
     private var hasScaleScript = false
     /// 是否含 origin 脚本图层(鼠标指针等动态 origin → 需每帧重算)。容器/时钟的 origin 脚本虽静态,
     /// 设此标志也无妨:每帧重算得同值,baseModel 不变,代价极小。
@@ -1626,6 +1791,24 @@ final class SceneRenderEngine {
     /// lwe CScene.cpp:432-447 用 clearcolor 清场景 FBO);Task 4(per-Image ping-pong/blend 末移)经源码分析
     /// 与本实现像素等价、跳过。逃生开关 WP_NO_LWE_COMPOSITE=1 退回旧 compositeSceneBelow 路径(保险)。
     private var useLweComposite: Bool { ProcessInfo.processInfo.environment["WP_NO_LWE_COMPOSITE"] == nil }
+    // parent→child composelayer FBO 机制(**默认开**,真 WE,lwe 未实现):parent 指向 composelayer 的粒子组
+    // 渲进该 composelayer 的透明 child FBO(见 GPULayer.childParticleGroupIndices),由 composelayer 对「只含
+    // 粒子」的 FBO 跑 tint/opacity-mask 后合成回场景(矩阵被染色+裁到遮罩区,角色/龙身不被染色)。
+    // WP_NO_COMPOSE_CHILD_FBO=1 退回旧:粒子当独立世界粒子全屏画 + composelayer 把下方场景染色。
+    private var useComposeChildFBO: Bool { ProcessInfo.processInfo.environment["WP_NO_COMPOSE_CHILD_FBO"] == nil }
+    // 仅当确实建立了 parent→child 关联(load() 设)才启用 child FBO 路径,其他 composelayer 壁纸完全不受影响。
+    private var hasComposeChildFBO = false
+    // child FBO(透明全画布,放父 composelayer 的子粒子组);按场景分辨率(=sceneFBO 尺寸)建,复用。
+    private var composeChildTex: MTLTexture?
+    private func composeChildTarget(width: Int, height: Int) -> MTLTexture? {
+        if composeChildTex?.width != width || composeChildTex?.height != height {
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+                                                             width: width, height: height, mipmapped: false)
+            d.usage = [.renderTarget, .shaderRead]; d.storageMode = .private
+            composeChildTex = device.makeTexture(descriptor: d)
+        }
+        return composeChildTex
+    }
     private var lweSceneTex: MTLTexture?
     private func lweSceneTarget(width: Int, height: Int) -> MTLTexture? {
         if lweSceneTex?.width != width || lweSceneTex?.height != height {
@@ -1684,6 +1867,8 @@ final class SceneRenderEngine {
     private var hasAudioBars = false
     /// 是否含运行时动态建层脚本(音频条 bar 模板:每帧 runDynamicBars 重算 N 根 bar → 需持续动画)。
     private var hasInstancedBars = false
+    /// 是否含关键帧时间线动画(开场 alpha 淡出 / origin/angle 摆动)→ 需起动画循环并逐帧重绘。
+    private var hasKeyframeAnim = false
     private var hasAudioReactiveFX = false   // 任一图层/后处理特效请求 AUDIOPROCESSING(pulse 等)
     private var hasAudioReactiveScript = false  // 任一 origin/scale/angle 脚本用音频(registerAudioBuffers)
     private var currentAudio = WEEffectChain.AudioSpectrum()  // 本帧三套原生频谱(16/32/64),供 WEEffectChain 的音频 uniform
@@ -1762,8 +1947,10 @@ final class SceneRenderEngine {
                 guard let mesh = layers[i].puppetMesh, let vb = layers[i].puppetVB else { continue }
                 // 多 animationlayer 叠加合成(WE 真义;御剑龙 base+additive)。skinLayers 要求精确 anim id 命中,
                 // 失败(id 不在 MDLA,如部分壁纸引用编辑器层 id)→ 回退旧单层 skin()(带 anims.first 兜底),零回归。
-                let skinned = mesh.skinLayers(time: time, layers: layers[i].puppetAnimLayers)
-                    ?? mesh.skin(time: time, rate: layers[i].puppetAnimRate, animId: layers[i].puppetAnimId)
+                // 眼睛层用完整 3D 蒙皮(rx/ry/tz)配背面剔除;主 puppet 用平面蒙皮(丢 rx/ry,零回归)。
+                let use3D = layers[i].puppetUse3D
+                let skinned = mesh.skinLayers(time: time, layers: layers[i].puppetAnimLayers, use3D: use3D)
+                    ?? mesh.skin(time: time, rate: layers[i].puppetAnimRate, animId: layers[i].puppetAnimId, use3D: use3D)
                 guard let sk = skinned else { continue }
                 let bytes = MemoryLayout<Float>.stride * sk.count
                 if vb.length >= bytes { sk.withUnsafeBytes { vb.contents().copyMemory(from: $0.baseAddress!, byteCount: bytes) } }
@@ -1784,9 +1971,11 @@ final class SceneRenderEngine {
         // WP_TEST_AUDIO_FLAT=1 退回恒定(对比)。
         if let s = ProcessInfo.processInfo.environment["WP_TEST_AUDIO"], let v = Float(s) {
             let flat = ProcessInfo.processInfo.environment["WP_TEST_AUDIO_FLAT"] != nil
+            let neg = ProcessInfo.processInfo.environment["WP_TEST_AUDIO_NEG"] != nil  // 诊断:注入含负频谱(模拟真实音乐 mag<1 → 0.35*log10<0)
             func gen(_ n: Int) -> [Float] {
-                flat ? [Float](repeating: v, count: n)
-                     : (0..<n).map { v * (0.15 + 0.85 * abs(sin(Float($0) * 0.7 + 0.3))) }
+                if neg { return (0..<n).map { v * sin(Float($0) * 0.9 + 0.3) - 0.3 } }  // 约半数为负,验证 oscilloscope powr(负) NaN 修复
+                return flat ? [Float](repeating: v, count: n)
+                            : (0..<n).map { v * (0.15 + 0.85 * abs(sin(Float($0) * 0.7 + 0.3))) }
             }
             currentAudio = WEEffectChain.AudioSpectrum(s16: gen(16), s32: gen(32), s64: gen(64))
         }
@@ -1802,7 +1991,7 @@ final class SceneRenderEngine {
             let userStrength = Float(PreferencesStore.shared.parallaxStrength)
             // centeredMouse = 画布 UV - 0.5(lwe CScene.cpp:313)。同 cursor:屏幕 NDC 要先 /ndcScale 扣 cover 裁切,
             // 否则非同比例屏上视差量也随距离偏。mouseUV = (mouseNorm/ndcScale + 1)/2 → centered = mouseUV - 0.5。
-            let centered = SIMD2(mouseNorm.x / ndcScale.x * 0.5, mouseNorm.y / ndcScale.y * 0.5)
+            let centered = SIMD2(mouseNorm.x / aspectMouse.x * 0.5, mouseNorm.y / aspectMouse.y * 0.5)
             let target = centered * cameraParallaxAmount * cameraParallaxMouseInfluence * userStrength
             let k = max(0, min(1, cameraParallaxDelay * Float(dt)))
             parallaxDisplacement += (target - parallaxDisplacement) * k
@@ -2065,8 +2254,8 @@ final class SceneRenderEngine {
         // 光标特效在屏幕上落到 `s×ndcScale`,离中心越远偏得越外(用户实测:鼠标越往右、樱花特效越偏右)。
         // lwe(CScene.cpp:371-383)同样把鼠标先到 viewport [0,1] 再按可见 UV 范围(=扣裁切)映射到场景 UV。
         // ndcScale 由上一帧 render() 算(只随 resize 变);单 NDC 校正同时用于 pointer / 粒子 followsCursor / 水波。
-        let mouseUVc = SIMD2(min(1, max(0, (mouseNorm.x / ndcScale.x + 1) * 0.5)),
-                             min(1, max(0, (mouseNorm.y / ndcScale.y + 1) * 0.5)))
+        let mouseUVc = SIMD2(min(1, max(0, (mouseNorm.x / aspectMouse.x + 1) * 0.5)),
+                             min(1, max(0, (mouseNorm.y / aspectMouse.y + 1) * 0.5)))
         let cursorCanvas = SIMD2(mouseUVc.x * canvas.x, mouseUVc.y * canvas.y)
         // 光标归一化 UV [0,1](y 向上)。喂 WE 交互特效(xray/depthparallax/樱花轨迹)的 pointer 量。
         cursorUV = mouseUVc
@@ -2128,6 +2317,7 @@ final class SceneRenderEngine {
         // 否则仅视差驱动 → 仅当视差位移本帧移动了 或 鼠标移动了 才需重画。两者皆无 → 画面与上帧一致,跳过渲染。
         let alwaysAnimating = !particleGroups.isEmpty || hasVideo || hasEffects || hasText
             || hasScaleScript || hasOriginScript || hasAngleScript || hasAudioBars || hasCursorRipple
+            || hasKeyframeAnim
         let parallaxMoved = cameraParallax
             && (simd_distance(parallaxDisplacement, dispBefore) > 1e-5 || mouseNorm != lastMouseForChange)
         frameDidChange = alwaysAnimating || parallaxMoved
@@ -2367,6 +2557,9 @@ final class SceneRenderEngine {
             var bound = false
             for g in particleGroups {
                 if let a = anchor, g.anchorLayerIndex != a { continue }
+                // parent 指向 composelayer 的粒子组**不进主场景**:它们渲进该 composelayer 的 child FBO
+                // (encodeLweScene 在跑该层特效前单独画;见 GPULayer.childParticleGroupIndices)。
+                if g.parentComposeLayerIndex != nil { continue }
                 if g.isRefract { continue }   // 折射粒子采样整帧场景,单独 pass(encodeRefract)
                 if let f = particleFilter, !f(ParticleGroupInfo(aboveBloom: g.aboveBloom)) { continue }
                 if !bound {
@@ -2416,7 +2609,8 @@ final class SceneRenderEngine {
         for li in liLo..<liHi {
             if !Self.particlesOnTop, li > liLo { drawGroups(anchor: li) }   // 序在 layers[li] 之前的粒子
             let layer = layers[li]
-            guard drawLayers, layer.visible, !Self.hideLayerIds.contains(layer.id) else { continue }
+            guard drawLayers, layer.visible, !Self.hideLayerIds.contains(layer.id),
+                  Self.onlyLayerIds.isEmpty || Self.onlyLayerIds.contains(layer.id) else { continue }
             // puppet 层:用单位空间 mesh 顶点 + 该层 mvp(proj×matModel)**直渲索引三角网格**(替代平面 quad),
             // 偏心/出界顶点不裁——照 lwe 把局部 puppet 顶点直接用场景投影渲(setupPuppetGeometryCallback)。
             // 非 puppet 层走原 quad 逻辑。
@@ -2425,8 +2619,12 @@ final class SceneRenderEngine {
             encoder.setVertexBuffer(isPup ? layer.puppetVB : quadBuffer, offset: 0, index: 0)
             func drawGeom() {
                 if isPup, let ib = layer.puppetIB {
+                    // puppet 剔除:眼睛闭合靠 3D 蒙皮(trs3D),默认不剔除(puppetCull=.none)。仅 WP_EYE_CULL
+                    // 诊断时该层可能 .front/.back;画完立刻还原 .none(编码器状态共享,绝不能漏到后续主 puppet 龙/刀/头发)。
+                    if layer.puppetCull != .none { encoder.setCullMode(layer.puppetCull) }
                     encoder.drawIndexedPrimitives(type: .triangle, indexCount: layer.puppetIndexCount,
                                                   indexType: .uint16, indexBuffer: ib, indexBufferOffset: 0)
+                    if layer.puppetCull != .none { encoder.setCullMode(.none) }
                 } else {
                     encoder.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4)
                 }
@@ -2796,7 +2994,16 @@ final class SceneRenderEngine {
     // MARK: - 3D 透视场景渲染(.mdl 模型)
 
     // 与 Metal shader `struct U3` 内存布局一致:float4x4(64) + float3(16,含pad) + float + float。
-    private struct U3GPU { var mvp: simd_float4x4; var color: SIMD3<Float>; var brightness: Float; var alpha: Float }
+    // 3D 模型 uniform:mvp + 材质 color/brightness/alpha + 光照(法线矩阵以 float4x4 传,避 float3x3 对齐坑)。
+    // SIMD3<Float> 在 Swift/Metal 都对齐 16 字节;字段顺序与 Metal `U3` 严格一致。
+    private struct U3GPU {
+        var mvp: simd_float4x4
+        var normalMat: simd_float4x4          // world 法线矩阵(逆转置上 3×3,放进 float4x4)
+        var color: SIMD3<Float>; var brightness: Float
+        var lightDir: SIMD3<Float>; var alpha: Float
+        var lightColor: SIMD3<Float>; var lightIntensity: Float
+        var ambient: SIMD3<Float>; var lighting: Float   // lighting:1=做 N·L 漫反射,0=平涂
+    }
 
     /// 解析并上传 3D 模型(几何 GPU 缓冲 + baseColor 纹理 + 世界矩阵)。
     private func build3DModels(source: SceneSource, loader: MTKTextureLoader) {
@@ -2871,12 +3078,21 @@ final class SceneRenderEngine {
             for (i, sm) in o.geometry.submeshes.enumerated() {
                 let mat = i < o.materials.count ? o.materials[i] : (o.materials.first ?? Model3DMaterial())
                 subs.append(Submesh3DGPU(mat: Material3DGPU(tex: loadTex(mat.baseColorTex), color: mat.color,
-                                          brightness: mat.brightness, alpha: mat.alpha, translucent: mat.translucent),
+                                          brightness: mat.brightness, alpha: mat.alpha, translucent: mat.translucent,
+                                          lighting: mat.lighting),
                                           start: sm.indexStart, count: sm.indexCount))
             }
             out.append(Model3DGPU(id: o.id, vb: vb, ib: ib, world: o.world, submeshes: subs))
         }
         models3D = out
+        // 3D 场景方向光(N·L 漫反射昼夜终止线):rt.bake/recompute 已写 sun 驱动的光源世界位置 → 取主光。
+        // WP_NO_3D_LIGHTING=1 退回平涂(旧行为)做 before/after 对比。
+        light3D = ProcessInfo.processInfo.environment["WP_NO_3D_LIGHTING"] == nil ? rt.lightInfo() : nil
+        if let l = light3D {
+            let litSubs = out.reduce(0) { $0 + $1.submeshes.filter { $0.mat.lighting }.count }
+            let totSubs = out.reduce(0) { $0 + $1.submeshes.count }
+            Log.write("3D light: dir=\(l.dir) color=\(l.color) intensity=\(l.intensity) ambient=\(l.ambient) litSubmeshes=\(litSubs)/\(totSubs)")
+        }
         // 太阳辉光精灵纹理(image 是材质 json → textures[0] → .tex)
         sunSpriteTex.removeAll()
         for sp in rt.sunSprites where !sp.image.isEmpty {
@@ -2945,11 +3161,19 @@ final class SceneRenderEngine {
             enc.setDepthStencilState(translucentPass ? depthState3DNoWrite : depthState3DWrite)
             enc.setVertexBytes(&ndc, length: 8, index: 3)
             enc.setFragmentSamplerState(sampler, index: 0)
+            let lit = light3D
             for m in models3D {
                 let mvp = viewProj3D * m.world
+                // 世界法线矩阵 = world 上 3×3 的逆转置(处理各天体非均匀缩放,法线不被拉歪)。放进 float4x4。
+                let nm = normalMatrix(m.world)
                 enc.setVertexBuffer(m.vb, offset: 0, index: 0)
                 for s in m.submeshes where s.mat.translucent == translucentPass {
-                    var u = U3GPU(mvp: mvp, color: s.mat.color, brightness: s.mat.brightness, alpha: s.mat.alpha)
+                    let doLight = (lit != nil) && s.mat.lighting
+                    var u = U3GPU(mvp: mvp, normalMat: nm,
+                                  color: s.mat.color, brightness: s.mat.brightness,
+                                  lightDir: lit?.dir ?? SIMD3(0, 0, 1), alpha: s.mat.alpha,
+                                  lightColor: lit?.color ?? SIMD3(1, 1, 1), lightIntensity: lit?.intensity ?? 0,
+                                  ambient: lit?.ambient ?? .zero, lighting: doLight ? 1 : 0)
                     enc.setVertexBytes(&u, length: MemoryLayout<U3GPU>.stride, index: 1)
                     enc.setFragmentBytes(&u, length: MemoryLayout<U3GPU>.stride, index: 1)
                     enc.setFragmentTexture(s.mat.tex ?? whiteTex3D, index: 0)
@@ -3355,6 +3579,70 @@ final class SceneRenderEngine {
         }
     }
 
+    /// 把指定粒子组(parent 指向某 composelayer)画进一张**透明全画布 child FBO**(clearColor=透明黑)。
+    /// 该 FBO 替代累积场景 sceneFBO 当 composelayer 特效链(computeLayerEffect)的 sceneInput → tint/opacity-mask
+    /// 只作用于「只含粒子」的内容(矩阵被染色 + 裁到遮罩区),不染下方场景的角色/龙身(真 WE parent→child FBO)。
+    /// 用与主场景一致的 ndcScale/proj/视差画粒子(与 sceneFBO 同坐标空间),故 composelayer footprint(layer.mvp)
+    /// 在 child FBO 上采样到的位置与在 sceneFBO 上一致。返回画好的 child FBO(失败/无粒子则 nil → 调用方退回旧路径)。
+    private func encodeChildParticleFBO(groupIndices: [Int], width w: Int, height h: Int,
+                                        commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
+        guard w > 0, h > 0, !groupIndices.isEmpty,
+              pipelineParticleAdd != nil, pipelineParticleAlpha != nil,
+              let target = composeChildTarget(width: w, height: h) else { return nil }
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)   // 透明底:只留粒子
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return nil }
+        enc.label = "composeChildFBO"
+        enc.setFragmentSamplerState(sampler, index: 0)
+        var ndc = ndcScale   // 与主场景同宽高比缩放(child FBO 与 sceneFBO 同尺寸/同坐标空间)
+        enc.setVertexBytes(&ndc, length: MemoryLayout<SIMD2<Float>>.stride, index: 3)
+        enc.setVertexBuffer(quadBuffer, offset: 0, index: 0)
+        var blankFx = EffectUniforms()
+        enc.setFragmentBytes(&blankFx, length: MemoryLayout<EffectUniforms>.stride, index: 0)
+        let ring = frameIndex % Self.kBufferRing
+        let skipRope = ProcessInfo.processInfo.environment["WP_NO_ROPE"] != nil
+        func childProj(_ g: ParticleGroup) -> simd_float4x4 {
+            var pd = g.parallaxDepth   // 同 encode.particleProj 的 minimumParticleDepth=0.65 钳制
+            if abs(pd.x) < 0.65 { pd.x = pd.x < 0 ? -0.65 : 0.65 }
+            if abs(pd.y) < 0.65 { pd.y = pd.y < 0 ? -0.65 : 0.65 }
+            let off = parallaxOffset(depth: pd)
+            return proj * matTranslate(off.x, off.y)
+        }
+        for gi in groupIndices {
+            guard gi >= 0, gi < particleGroups.count else { continue }
+            let g = particleGroups[gi]
+            if g.isRefract { continue }   // 折射粒子需采场景底图,不进透明 child FBO(矩阵粒子非折射)
+            if g.isRope {
+                guard !skipRope, g.ropeVertexCount >= 3, let buf = g.ropeBuffers[ring],
+                      let pipeline = g.additive ? pipelineRopeAdd : pipelineRopeAlpha else { continue }
+                enc.setRenderPipelineState(pipeline)
+                var projVar = childProj(g)
+                enc.setVertexBytes(&projVar, length: MemoryLayout<simd_float4x4>.stride, index: 1)
+                enc.setVertexBuffer(buf, offset: 0, index: 2)
+                enc.setFragmentTexture(g.texture, index: 0)
+                enc.setFragmentTexture(g.texture, index: 1)
+                enc.setFragmentTexture(g.texture, index: 2)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: g.ropeVertexCount)
+            } else {
+                guard g.instanceCount > 0, let buf = g.instanceBuffers[ring],
+                      let pipeline = g.additive ? pipelineParticleAdd : pipelineParticleAlpha else { continue }
+                enc.setRenderPipelineState(pipeline)
+                var projVar = childProj(g)
+                enc.setVertexBytes(&projVar, length: MemoryLayout<simd_float4x4>.stride, index: 1)
+                enc.setVertexBuffer(buf, offset: 0, index: 2)
+                enc.setFragmentTexture(g.texture, index: 0)
+                enc.setFragmentTexture(g.texture, index: 1)
+                enc.setFragmentTexture(g.texture, index: 2)
+                enc.drawPrimitives(type: .triangleStrip, vertexStart: 0, vertexCount: 4, instanceCount: g.instanceCount)
+            }
+        }
+        enc.endEncoding()
+        return target
+    }
+
     /// A(WP_LWE_COMPOSITE):忠实对齐 lwe —— 图层按 z 序累积进持久场景 FBO(target = _rt_FullFrameBuffer),
     /// 每个 frameBufferInput composelayer 读「累积到它之下的真场景」作特效输入(取代 compositeSceneBelow 临场重渲),
     /// 跑特效链产出 effectedTexture,再画该层。非折射、非 postProcess 路径专用;(belowBloom)粒子在末段统一画。
@@ -3388,7 +3676,18 @@ final class SceneRenderEngine {
             //   (= WE _rt_FullFrameBuffer 语义:此前粒子被整体延后,composelayer 永远看不到它们)。
             //   WP_PARTICLES_ON_TOP 旧行为:中段不画,粒子统一在末段之后(encode 收尾 anchor:nil)。
             segment(cursor..<i, withParticles: !Self.particlesOnTop)        // 累积 [cursor, i) 进 sceneFBO
-            computeLayerEffect(i, sceneInput: sceneFBO, commandBuffer: cmd) // 该层读真累积场景跑特效链
+            // parent→child composelayer FBO(真 WE):本 composelayer 若有 child 粒子组(parent 指向它),
+            // 把这些粒子画进透明 child FBO,用它当特效输入 → tint/opacity-mask 只染粒子、裁到遮罩区,
+            // 不染下方场景(角色/龙身)。无 child 粒子的 composelayer(绝大多数)仍喂累积场景 sceneFBO(旧行为)。
+            let childIdx = layers[i].childParticleGroupIndices
+            var fxInput = sceneFBO
+            if useComposeChildFBO, !childIdx.isEmpty,
+               let childFBO = encodeChildParticleFBO(groupIndices: childIdx,
+                                                     width: sceneFBO.width, height: sceneFBO.height,
+                                                     commandBuffer: cmd) {
+                fxInput = childFBO
+            }
+            computeLayerEffect(i, sceneInput: fxInput, commandBuffer: cmd) // 该层读累积场景(或 child FBO)跑特效链
             cursor = i                                                      // 该层自身留到下段画(effectedTexture 已就绪)
         }
         segment(cursor..<hi, withParticles: true)   // 余下图层 + 本段锚定粒子(旧行为:全部 belowBloom 粒子)
@@ -3453,6 +3752,11 @@ final class SceneRenderEngine {
         guard let s = ProcessInfo.processInfo.environment["WP_HIDE_IDS"] else { return [] }
         return Set(s.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
     }()
+    // 诊断:WP_ONLY_IDS=863 只画这些 id 的图层(其余跳过),用于隔离单个 puppet 层观察蒙皮/剔除。空=全画。
+    static let onlyLayerIds: Set<Int> = {
+        guard let s = ProcessInfo.processInfo.environment["WP_ONLY_IDS"] else { return [] }
+        return Set(s.split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
+    }()
     // 旧行为退路:WP_PARTICLES_ON_TOP=1 → 粒子恒画在(本相位)所有图层之上,不按场景对象序插画。
     static let particlesOnTop = ProcessInfo.processInfo.environment["WP_PARTICLES_ON_TOP"] != nil
     static let kBufferRing = 4
@@ -3465,6 +3769,136 @@ final class SceneRenderEngine {
     private lazy var captureMax: Int = Int(ProcessInfo.processInfo.environment["WP_CAP_MAX"] ?? "") ?? 720
     private var presentTex: MTLTexture?
     private var drawStaging: MTLTexture?
+    private var aspectTex: MTLTexture?       // 画布长宽比编码/呈现纹理(场景渲它,ndcScale=1 不分带)
+    private var aspectAuxTex: MTLTexture?     // 屏幕适配下 FXAA 输出(画布长宽比)
+    // 自适应「大图被切→拉伸」:解析期算定的「大图像层不透明内容包围盒」(画布像素,x0,y0,x1,y1)。
+    // aspectMap 用它判 cover 裁切区是否切到大图(切到→stretch)。粒子天然不在 layers、隐藏层建层时已跳过。
+    private var largeOpaqueAABBs: [SIMD4<Float>] = []
+
+    /// 扫贴图 alpha 求不透明内容包围盒(uv [u0,v0,u1,v1])+ 实心占比(包围盒内 alpha>200 的比例)。
+    /// 实心占比区分「密实主体(角色)」与「稀薄大气层(云/雾/光)」。全不透明/无 alpha → ((0,0,1,1), 1)。
+    private static func opaqueBounds(_ dec: DecodedTex) -> (rect: SIMD4<Float>, solidFrac: Float) {
+        guard case let .rgba8(pixels, w, h) = dec, w > 0, h > 0, pixels.count >= w * h * 4 else { return (SIMD4(0, 0, 1, 1), 1) }
+        let step = max(1, max(w, h) / 512)
+        var minX = w, minY = h, maxX = -1, maxY = -1
+        var sampled = 0, solid = 0
+        var y = 0
+        while y < h {
+            let row = y * w * 4
+            var x = 0
+            while x < w {
+                let a = pixels[row + x * 4 + 3]
+                sampled += 1
+                if a > 200 { solid += 1 }
+                if a > 16 {
+                    if x < minX { minX = x }; if x > maxX { maxX = x }
+                    if y < minY { minY = y }; if y > maxY { maxY = y }
+                }
+                x += step
+            }
+            y += step
+        }
+        if maxX < 0 { return (SIMD4(0, 0, 1, 1), 0) }
+        // 实心占比按**包围盒内**采样估(整图占比会被透明边距稀释)
+        let bxN = max(1, (maxX - minX) / step + 1) * max(1, (maxY - minY) / step + 1)
+        return (SIMD4(Float(minX) / Float(w), Float(minY) / Float(h),
+                      Float(min(w, maxX + step)) / Float(w), Float(min(h, maxY + step)) / Float(h)),
+                Float(solid) / Float(bxN))
+    }
+
+    /// 解析期算定「大图像层不透明内容包围盒」(画布像素)。判据:可见图像层(非文本)、内容尺寸足够大、
+    /// 非满铺背景。供自适应判 cover 是否会切到大图。
+    private func precomputeLargeLayers() {
+        largeOpaqueAABBs.removeAll()
+        guard canvas.x > 0, canvas.y > 0 else { return }
+        let cw = canvas.x, ch = canvas.y, area = cw * ch
+        for l in layers {
+            if l.text != nil { continue }                       // 文本层不算(尺寸/定位另说)
+            if l.audioBars != nil || l.instancedBarsScript != nil { continue }  // 音频条不算
+            let sx = l.sizePx.x, sy = l.sizePx.y
+            if sx >= 0.80 * cw && sy >= 0.80 * ch { continue }  // 满铺背景 → 跳过
+            let r = l.opaqueRect                                 // uv 不透明子矩形
+            // 不透明内容在画布像素的包围盒(quad = origin ± sizePx/2,贴图 uv[0,1]→quad)
+            let x0 = l.origin.x - sx / 2 + r.x * sx, x1 = l.origin.x - sx / 2 + r.z * sx
+            let y0 = l.origin.y - sy / 2 + r.y * sy, y1 = l.origin.y - sy / 2 + r.w * sy
+            // 裁进画布内(画布外的内容本就不显示)
+            let cx0 = max(0, x0), cx1 = min(cw, x1), cy0 = max(0, y0), cy1 = min(ch, y1)
+            let ow = cx1 - cx0, oh = cy1 - cy0
+            if ow <= 0 || oh <= 0 { continue }
+            // 「比较大」:内容某一维 ≥ 22% 画布 且 面积 ≥ 5% 画布
+            if max(ow / cw, oh / ch) < 0.22 || (ow * oh) < 0.05 * area { continue }
+            if l.opaqueSolid < 0.35 { continue }                // 稀薄大气层(云/雾/光,实心占比低)不算
+            let asp = ow / oh
+            if asp > 3 || asp < 1.0 / 3 { continue }            // 细长横/竖带(背景天空带/分隔条)不算
+            Log.write(String(format: "  大图候选 id=%d size=%.2fx%.2f 实心=%.2f 比=%.1f AABB=[%.0f,%.0f,%.0f,%.0f]",
+                             l.id, sx / cw, sy / ch, l.opaqueSolid, asp, cx0, cy0, cx1, cy1))
+            largeOpaqueAABBs.append(SIMD4(cx0, cy0, cx1, cy1))
+        }
+        Log.write("自适应大图层: \(largeOpaqueAABBs.count) 个(共 \(layers.count) 层)")
+    }
+
+    /// 给定输出尺寸,判 cover 裁切区是否切到任一大图像层(切到→自适应该 stretch)。
+    private func coverTruncatesLargeLayer(outW: Int, outH: Int) -> Bool {
+        guard !largeOpaqueAABBs.isEmpty, canvas.x > 0, canvas.y > 0, outW > 0, outH > 0 else { return false }
+        let cw = canvas.x, ch = canvas.y
+        let ac = cw / ch, ao = Float(outW) / Float(outH)
+        // cover 可见区(画布像素):画布更宽→裁左右,更高→裁上下。超裁切线要够深(>5% 画布维)才算
+        // 「真被切」——避免主体帽角/发梢擦边就触发拉伸(那点擦边不值得整张变形)。
+        if ac >= ao {
+            let visW = cw * ao / ac, cropL = (cw - visW) / 2, cropR = cw - cropL, m = 0.05 * cw
+            for b in largeOpaqueAABBs where b.x < cropL - m || b.z > cropR + m { return true }
+        } else {
+            let visH = ch * ac / ao, cropT = (ch - visH) / 2, cropB = ch - cropT, m = 0.05 * ch
+            for b in largeOpaqueAABBs where b.y < cropT - m || b.w > cropB + m { return true }
+        }
+        return false
+    }
+
+    /// 屏幕适配(lwe updateTextureUVs 机制):算画布长宽比中间纹理尺寸 + 鼠标用 ndc(旧 cover/fit 值)+ blit uvScale。
+    /// 场景渲到画布长宽比纹理(ndcScale 自动=1,顶点不缩放=无内屏分带),长宽比裁切全挪到最终一次 blit。
+    private func aspectMap(outW: Int, outH: Int) -> (encW: Int, encH: Int, mouseNdc: SIMD2<Float>, uvScale: SIMD2<Float>) {
+        guard canvas.x > 0, canvas.y > 0, outW > 0, outH > 0 else {
+            return (max(1, outW), max(1, outH), SIMD2(1, 1), SIMD2(1, 1))
+        }
+        let ac = canvas.x / canvas.y
+        // 画布长宽比中间纹理,尺寸 ≥ 输出对应维度(cover 裁切的那维放大,避免欠采样糊)。
+        let encH = max(outH, Int((Float(outW) / ac).rounded()))
+        let encW = max(1, Int((Float(encH) * ac).rounded()))
+        let k = ac / (Float(outW) / Float(outH))
+        var nd = SIMD2<Float>(1, 1)
+        switch PreferencesStore.shared.wallpaperScaleMode {
+        case 1: nd = k >= 1 ? SIMD2(1, 1 / k) : SIMD2(k, 1)   // fit:留黑边、全可见
+        case 2: nd = SIMD2(1, 1)                              // stretch:画布长宽比纹理铺满输出 → 拉伸
+        case 3:                                               // 自适应(我方新增,非 WE 原生):默认 cover 零变形;
+            // 但若 cover 会切到大图像层的真实内容 → 改 stretch 拉伸填满(保大图完整,代价是变形);
+            // 比例已接近屏幕(差 <6%)也直接 stretch(形变可忽略、无裁切)。粒子/小装饰/满铺背景不算。
+            let mm = k >= 1 ? k - 1 : 1 / k - 1
+            if mm < 0.06 || coverTruncatesLargeLayer(outW: outW, outH: outH) {
+                nd = SIMD2(1, 1)                              // 近似匹配 或 cover 会切大图 → 拉伸填满
+            } else {
+                nd = k >= 1 ? SIMD2(k, 1) : SIMD2(1, 1 / k)  // 比例差大且不切大图 → cover 零变形
+            }
+        default: nd = k >= 1 ? SIMD2(k, 1) : SIMD2(1, 1 / k)  // cover:填满+裁切(WE 默认)
+        }
+        return (encW, max(1, encH), nd, SIMD2(1 / nd.x, 1 / nd.y))
+    }
+
+    private func ensureAspectTex(_ w: Int, _ h: Int) -> MTLTexture? {
+        if let t = aspectTex, t.width == w, t.height == h { return t }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+        d.usage = [.renderTarget, .shaderRead, .shaderWrite]   // shaderWrite:MetalFX scaler 输出
+        d.storageMode = captureEnabled ? .shared : .private
+        aspectTex = device.makeTexture(descriptor: d)
+        return aspectTex
+    }
+
+    private func ensureAspectAux(_ w: Int, _ h: Int) -> MTLTexture? {
+        if let t = aspectAuxTex, t.width == w, t.height == h { return t }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
+        d.usage = [.renderTarget, .shaderRead]; d.storageMode = .private
+        aspectAuxTex = device.makeTexture(descriptor: d)
+        return aspectAuxTex
+    }
 
     /// 实时呈现纹理(与离屏 renderToPNG 同款可读纹理;也作 MetalFX 升采样输出 → 需 shaderWrite)。
     private func ensurePresentTex(_ w: Int, _ h: Int) -> MTLTexture? {
@@ -3573,9 +4007,13 @@ final class SceneRenderEngine {
         let useMFX = prefs.metalFXEnabled
         let scale = prefs.renderScale
         let downscaled = scale < 0.999
-        let lowW = max(2, Int((Double(w) * scale).rounded())), lowH = max(2, Int((Double(h) * scale).rounded()))
-        // 编码目标:降分辨率时渲到低分纹理,否则直接渲到全分呈现纹理。
-        let encodeTex = downscaled ? ensureRenderScaleTex(lowW, lowH) : ensurePresentTex(w, h)
+        // 屏幕适配(lwe 机制):场景渲到**画布长宽比**中间纹理(ndcScale 自动=1,顶点不缩放=无内屏分带),
+        // 长宽比裁切/留黑边全挪到最终一次 blit(blitUVScale)。aspectMouse 给下一帧鼠标/视差用。
+        let (encW, encH, mNdc, uvS) = aspectMap(outW: w, outH: h)
+        aspectMouse = mNdc; blitUVScale = uvS
+        let lowW = max(2, Int((Double(encW) * scale).rounded())), lowH = max(2, Int((Double(encH) * scale).rounded()))
+        // 编码目标:降分辨率时渲到低分纹理(画布长宽比),否则直接渲到画布长宽比呈现纹理。
+        let encodeTex = downscaled ? ensureRenderScaleTex(lowW, lowH) : ensureAspectTex(encW, encH)
         guard let encodeTex else {
             // 审计修复#1:分配失败绝不把 encodeFrame 多 pass 直写 framebufferOnly drawable(顶部注释明令禁止,
             // 会泄漏平铺显存成黑线/噪点)。改为只 clear 该 drawable(整张定义为黑)并 present,跳过该帧渲染。
@@ -3597,27 +4035,42 @@ final class SceneRenderEngine {
         inflightSemaphore.wait()
         cmd.addCompletedHandler { [inflightSemaphore] _ in inflightSemaphore.signal() }
         encodeFrame(commandBuffer: cmd, finalTarget: encodeTex)
-        // 升采样:MetalFX(画质优)→ presentTex;否则呈现 pass 的采样器直接双线性放大 encodeTex。
+        // 升采样:MetalFX(画质优)→ 画布长宽比全分纹理;否则最终 blit 的采样器直接双线性放大。
         var srcTex = encodeTex
-        if downscaled, useMFX, let scaler = ensureScaler(inW: lowW, inH: lowH, outW: w, outH: h),
-           let presentT = ensurePresentTex(w, h) {
+        if downscaled, useMFX, let scaler = ensureScaler(inW: lowW, inH: lowH, outW: encW, outH: encH),
+           let fullT = ensureAspectTex(encW, encH) {
             scaler.colorTexture = encodeTex
-            scaler.outputTexture = presentT
+            scaler.outputTexture = fullT
             scaler.encode(commandBuffer: cmd)
-            srcTex = presentT
+            srcTex = fullT
+        }
+        // FXAA(画质设置开):先把场景按 1:1 抗锯齿到画布长宽比辅助纹理,再交给最终适配 blit。
+        if prefs.fxaaEnabled, let fx = pipelineBlitFXAA, let fxTex = ensureAspectAux(srcTex.width, srcTex.height) {
+            let fp = MTLRenderPassDescriptor()
+            fp.colorAttachments[0].texture = fxTex
+            fp.colorAttachments[0].loadAction = .dontCare
+            fp.colorAttachments[0].storeAction = .store
+            if let fe = cmd.makeRenderCommandEncoder(descriptor: fp) {
+                fe.setRenderPipelineState(fx)
+                var rcp = SIMD2<Float>(1.0 / Float(srcTex.width), 1.0 / Float(srcTex.height))
+                fe.setFragmentBytes(&rcp, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+                fe.setFragmentSamplerState(sampler, index: 0)
+                fe.setFragmentTexture(srcTex, index: 0)
+                fe.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); fe.endEncoding()
+            }
+            srcTex = fxTex
         }
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = drawable.texture
         pass.colorAttachments[0].loadAction = .clear
         pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         pass.colorAttachments[0].storeAction = .store
-        // 呈现:FXAA(画质设置开)或普通拷贝;采样器对 srcTex<drawable 自动双线性升采样。
-        let fxaa = prefs.fxaaEnabled ? pipelineBlitFXAA : nil
+        // 最终呈现:屏幕适配 blit(uvScale 居中裁切/留黑边);采样器对 srcTex 自动双线性升采样到 drawable。
         if let enc = cmd.makeRenderCommandEncoder(descriptor: pass) {
-            if let fx = fxaa {
-                enc.setRenderPipelineState(fx)
-                var rcp = SIMD2<Float>(1.0 / Float(srcTex.width), 1.0 / Float(srcTex.height))
-                enc.setFragmentBytes(&rcp, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+            var uvx = blitUVScale
+            if let blitA = pipelineBlitAspect {
+                enc.setRenderPipelineState(blitA)
+                enc.setFragmentBytes(&uvx, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
             } else if let blit = pipelineBlit {
                 enc.setRenderPipelineState(blit)
             }
@@ -3658,8 +4111,19 @@ final class SceneRenderEngine {
 
     private func saveTexture(_ tex: MTLTexture, to path: String) {
         let width = tex.width, height = tex.height, rowBytes = width * 4
+        // ⚠ 渲染目标纹理(.renderTarget/.shaderWrite)在 Apple GPU 上可能是无损压缩布局,直接 getBytes 会进
+        //   AGX processCompressedRegion2D 崩溃(EXC_BAD_ACCESS,抓帧诊断时踩到)。统一先 blit 到线性 .shared
+        //   暂存纹理(GPU 解压)再读,任何来源都安全。
+        let readDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: tex.pixelFormat, width: width, height: height, mipmapped: false)
+        readDesc.usage = [.shaderRead]; readDesc.storageMode = .shared
+        guard let stg = device.makeTexture(descriptor: readDesc),
+              let cb = queue.makeCommandBuffer(), let be = cb.makeBlitCommandEncoder() else { return }
+        be.copy(from: tex, sourceSlice: 0, sourceLevel: 0,
+                sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0), sourceSize: MTLSize(width: width, height: height, depth: 1),
+                to: stg, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: 0, y: 0, z: 0))
+        be.endEncoding(); cb.commit(); cb.waitUntilCompleted()
         var raw = [UInt8](repeating: 0, count: rowBytes * height)
-        tex.getBytes(&raw, bytesPerRow: rowBytes, from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
+        stg.getBytes(&raw, bytesPerRow: rowBytes, from: MTLRegionMake2D(0, 0, width, height), mipmapLevel: 0)
         let cs = CGColorSpaceCreateDeviceRGB()
         let info = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedFirst.rawValue | CGBitmapInfo.byteOrder32Little.rawValue)
         guard let ctx = CGContext(data: &raw, width: width, height: height, bitsPerComponent: 8,
@@ -3677,7 +4141,28 @@ final class SceneRenderEngine {
         desc.storageMode = .shared
         guard let target = device.makeTexture(descriptor: desc) else { return false }
         guard let cmd = queue.makeCommandBuffer() else { return false }
-        encodeFrame(commandBuffer: cmd, finalTarget: target)
+        // 屏幕适配(与实时同机制):场景渲到画布长宽比中间纹理(ndcScale=1),再按 uvScale 适配 blit 到目标尺寸。
+        let (encW, encH, mNdc, uvS) = aspectMap(outW: width, outH: height)
+        aspectMouse = mNdc; blitUVScale = uvS
+        let interDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: encW, height: encH, mipmapped: false)
+        interDesc.usage = [.renderTarget, .shaderRead]; interDesc.storageMode = .private
+        guard let inter = device.makeTexture(descriptor: interDesc) else { return false }
+        encodeFrame(commandBuffer: cmd, finalTarget: inter)
+        let bp = MTLRenderPassDescriptor()
+        bp.colorAttachments[0].texture = target
+        bp.colorAttachments[0].loadAction = .clear
+        bp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+        bp.colorAttachments[0].storeAction = .store
+        if let enc = cmd.makeRenderCommandEncoder(descriptor: bp) {
+            var uvx = blitUVScale
+            if let blitA = pipelineBlitAspect {
+                enc.setRenderPipelineState(blitA)
+                enc.setFragmentBytes(&uvx, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
+            } else if let blit = pipelineBlit { enc.setRenderPipelineState(blit) }
+            enc.setFragmentSamplerState(sampler, index: 0)
+            enc.setFragmentTexture(inter, index: 0)
+            enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); enc.endEncoding()
+        }
         cmd.commit()
         cmd.waitUntilCompleted()
 
@@ -3704,6 +4189,12 @@ final class SceneRenderEngine {
         desc.usage = [.renderTarget, .shaderRead]
         desc.storageMode = .shared
         guard let target = device.makeTexture(descriptor: desc) else { return false }
+        // 屏幕适配(与实时同机制):场景渲到画布长宽比中间纹理,再 uvScale 适配 blit 到 target。
+        let (encW, encH, mNdc, uvS) = aspectMap(outW: width, outH: height)
+        aspectMouse = mNdc; blitUVScale = uvS
+        let interDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: encW, height: encH, mipmapped: false)
+        interDesc.usage = [.renderTarget, .shaderRead]; interDesc.storageMode = .private
+        guard let inter = device.makeTexture(descriptor: interDesc) else { return false }
         var warmRopePeakN: [Int: Int] = [:]
         var warmRopePeakV: [Int: Int] = [:]
         // WP_CURSOR_ORBIT(仅验证用):让光标绕画布中心做圆周运动,驱动「鼠标拖尾」rope 喷射(否则静止光标永不发射)。
@@ -3717,7 +4208,22 @@ final class SceneRenderEngine {
             } else { m = SIMD2<Float>(0, 0) }
             update(time: Double(i) * dt, mouseNorm: m)   // 审计修复#2:update 已推进 frameIndex 轮换缓冲
             guard let cmd = queue.makeCommandBuffer() else { return false }
-            encodeFrame(commandBuffer: cmd, finalTarget: target)
+            encodeFrame(commandBuffer: cmd, finalTarget: inter)
+            let bp = MTLRenderPassDescriptor()
+            bp.colorAttachments[0].texture = target
+            bp.colorAttachments[0].loadAction = .clear
+            bp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
+            bp.colorAttachments[0].storeAction = .store
+            if let enc = cmd.makeRenderCommandEncoder(descriptor: bp) {
+                var uvx = blitUVScale
+                if let blitA = pipelineBlitAspect {
+                    enc.setRenderPipelineState(blitA)
+                    enc.setFragmentBytes(&uvx, length: MemoryLayout<SIMD2<Float>>.stride, index: 1)
+                } else if let blit = pipelineBlit { enc.setRenderPipelineState(blit) }
+                enc.setFragmentSamplerState(sampler, index: 0)
+                enc.setFragmentTexture(inter, index: 0)
+                enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); enc.endEncoding()
+            }
             cmd.commit(); cmd.waitUntilCompleted()
             if orbit {
                 for (gi, g) in particleGroups.enumerated() where g.isRope {
@@ -3774,9 +4280,18 @@ final class SceneRenderEngine {
     }
 
     // ---- 3D 透视场景:模型 pass(太阳系/土星)----
-    // 顶点缓冲交错:每顶点 8 float = pos.xyz, uv.xy, normal.xyz(32 字节)。U3:mvp + 颜色/亮度/alpha。
-    struct V3Out { float4 position [[position]]; float2 uv; float3 normal; };
-    struct U3 { float4x4 mvp; float3 color; float brightness; float alpha; };
+    // 顶点缓冲交错:每顶点 8 float = pos.xyz, uv.xy, normal.xyz(32 字节)。
+    // U3:mvp + 法线矩阵 + 材质 color/brightness/alpha + 光照(lightDir/color/intensity/ambient/lighting)。
+    // 字段顺序/对齐与 Swift U3GPU 严格一致(SIMD3 = float3 都 16 字节对齐)。
+    struct V3Out { float4 position [[position]]; float2 uv; float3 worldNormal; };
+    struct U3 {
+        float4x4 mvp;
+        float4x4 normalMat;
+        float3 color; float brightness;
+        float3 lightDir; float alpha;
+        float3 lightColor; float lightIntensity;
+        float3 ambient; float lighting;
+    };
     vertex V3Out model3d_vertex(uint vid [[vertex_id]],
                                 const device float* v [[buffer(0)]],
                                 constant U3& u [[buffer(1)]],
@@ -3787,7 +4302,9 @@ final class SceneRenderEngine {
         o.position = u.mvp * float4(pos, 1.0);
         o.position.xy *= ndcScale;          // 宽高比 cover 适配(与 2D 一致)
         o.uv = float2(v[b+3], v[b+4]);
-        o.normal = float3(v[b+5], v[b+6], v[b+7]);
+        // 法线变换到世界空间(逆转置上 3×3,放在 normalMat 的 float4x4 里取 .xyz)。
+        float3 n = float3(v[b+5], v[b+6], v[b+7]);
+        o.worldNormal = (u.normalMat * float4(n, 0.0)).xyz;
         return o;
     }
     fragment float4 model3d_fragment(V3Out in [[stage_in]],
@@ -3796,6 +4313,13 @@ final class SceneRenderEngine {
                                      constant U3& u [[buffer(1)]]) {
         float4 albedo = tex.sample(smp, in.uv);
         float3 rgb = albedo.rgb * u.color * u.brightness;
+        // 方向光漫反射(WE 3D 模型 LIGHTING:N·L 形成昼夜终止线)。lighting=0 时平涂(genericimage4/天空盒)。
+        if (u.lighting > 0.5) {
+            float3 N = normalize(in.worldNormal);
+            float ndl = max(0.0, dot(N, normalize(u.lightDir)));   // diffuse = max(0, dot(N,L))
+            float3 lit = u.ambient + u.lightColor * (u.lightIntensity * ndl);
+            rgb = albedo.rgb * u.color * u.brightness * lit;
+        }
         float a = albedo.a * u.alpha;
         return float4(rgb, a);
     }
@@ -4061,6 +4585,15 @@ final class SceneRenderEngine {
     }
     fragment float4 fullscreen_copy(VOut in [[stage_in]], texture2d<float> t [[texture(0)]], sampler s [[sampler(0)]]) {
         return t.sample(s, in.uv);
+    }
+    // 屏幕适配呈现:把画布长宽比中间纹理按 uvScale 居中缩放采样(= lwe updateTextureUVs):
+    //   uvScale<1 在该轴 = cover 裁切(采更窄范围放大填满);uvScale>1 = fit 留黑边(采超 [0,1] 部分取黑);
+    //   (1,1) = stretch(画布长宽比纹理直接铺满输出 → 拉伸)。顶点已不乘 ndcScale,长宽比全在此一次性处理。
+    fragment float4 fullscreen_copy_aspect(VOut in [[stage_in]], texture2d<float> t [[texture(0)]],
+                                           sampler s [[sampler(0)]], constant float2& uvScale [[buffer(1)]]) {
+        float2 uv = 0.5 + (in.uv - 0.5) * uvScale;
+        if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0) return float4(0.0, 0.0, 0.0, 1.0);
+        return t.sample(s, uv);
     }
     // FXAA(快速近似抗锯齿,FXAA3 简化版)。rcp = 1/源纹理尺寸。呈现时按 luma 边缘做一次平滑。
     fragment float4 fullscreen_fxaa(VOut in [[stage_in]], texture2d<float> t [[texture(0)]],

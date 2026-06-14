@@ -347,7 +347,15 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
         for i in 0..<16 { _bands16[i] = Self.movetowards(_bands16[i], dest16[i], 0.3) }
         _level = Self.movetowards(_level, overall, 0.3)
         lock.unlock()
+        // 诊断:周期性记录频谱范围(验证真实音乐下是否出现【负】频谱 = oscilloscope powr(负)=NaN 根因)。
+        // 负频谱来自 f1=0.35*log10(mag),mag<1 时 f1<0(lwe 亦如此,不钳);已在 shader 消费端 max(0) 修。低频。
+        Self.specLogCounter += 1
+        if Self.specLogCounter % 90 == 0 {
+            let mn = dest32.min() ?? 0, mx = dest32.max() ?? 0, neg = dest32.filter { $0 < 0 }.count
+            Log.write(String(format: "AUDIOSPEC dest32 min=%.3f max=%.3f neg=%d/32 level=%.3f", mn, mx, neg, overall))
+        }
     }
+    private static var specLogCounter = 0
 
     /// WE 的线性逼近(PulseAudioPlaybackRecorder.cpp movetowards):每步最多移动 maxDelta,
     /// 距离 ≤ maxDelta 时直接落到 target。

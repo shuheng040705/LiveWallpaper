@@ -175,7 +175,6 @@ struct SettingsForm: View {
 
     // MARK: - 显示与渲染
 
-    @State private var videoFill = PreferencesStore.shared.videoFill
     @State private var mainScreenOnly = PreferencesStore.shared.mainScreenOnly
     @State private var parallax = PreferencesStore.shared.parallaxStrength
     @State private var frameCap = PreferencesStore.shared.frameRateCap
@@ -190,14 +189,6 @@ struct SettingsForm: View {
 
     private var displayCard: some View {
         card("显示与渲染", "sparkles.tv.fill", .indigo) {
-            row("视频填充方式", "铺满裁切,或完整显示(可能留黑边)") {
-                Picker("", selection: $videoFill) {
-                    Text("铺满").tag(true)
-                    Text("完整").tag(false)
-                }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 130)
-                .onChange(of: videoFill) { v in actions.onVideoFillChanged(v) }
-            }
             switchRow("仅主显示器", "多显示器时只在主屏显示壁纸", $mainScreenOnly) {
                 actions.onMainScreenOnlyChanged($0)
             }
@@ -247,11 +238,11 @@ struct SettingsForm: View {
             switchRow("FXAA 抗锯齿", "呈现时做一次快速抗锯齿,边缘更平滑(开销很低)", divider: true, $fxaa) {
                 PreferencesStore.shared.fxaaEnabled = $0
             }
-            row("屏幕适配", "屏幕长宽比≠壁纸时:填满=裁切边缘(WE 默认)/黑边=全可见留黑边/拉伸=全屏无黑边但变形。内屏 16:10 看 16:9 壁纸边缘特效被裁时换「黑边」或「拉伸」", divider: true) {
+            row("屏幕适配", "场景+视频通用。屏幕长宽比≠壁纸时:填满=裁切边缘(WE 默认)/黑边=全可见留黑边/拉伸=全屏无黑边但变形/自适应=场景比例差大用填满零变形+视频用几何中间(无黑边、不放大、形变减半)。内屏看视频被放大时用「自适应」或「黑边」", divider: true) {
                 Picker("", selection: $scaleMode) {
-                    Text("填满").tag(0); Text("黑边").tag(1); Text("拉伸").tag(2)
+                    Text("填满").tag(0); Text("黑边").tag(1); Text("拉伸").tag(2); Text("自适应").tag(3)
                 }
-                .pickerStyle(.segmented).labelsHidden().frame(width: 200)
+                .pickerStyle(.segmented).labelsHidden().frame(width: 260)
                 .onChange(of: scaleMode) { v in
                     PreferencesStore.shared.wallpaperScaleMode = v
                     actions.onAssetsPathChanged()   // 重载让 ndcScale 即时生效

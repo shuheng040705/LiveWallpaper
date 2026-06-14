@@ -29,6 +29,27 @@ struct TextLayerDesc {
     // (WE 行为——盒子定屏上大小,不靠 pointsize 的自然像素),保持字形纵横比按高度适配进盒子,
     // 多余空间按 align 放置。nil = autosize(取文本纹理自然像素,旧行为;无显式 size 的静态文本/问候)。
     var boxSizePx: SIMD2<Float>? = nil
+
+    // ── 描边/阴影/字重(R15)──────────────────────────────────────────────────────
+    // 关键实据(扒全库 157 张 pkg、331 个文本对象 + lwe 源码核对,2026-06-14):
+    //   • WE 文本对象**没有** strokecolor/strokesize/shadowcolor/shadowoffset/bold/italic 字段
+    //     —— 全库 raw 字节搜索 0 命中。任务设想的「scene 对象级描边/阴影/粗斜体字段」在 WE 数据模型里不存在。
+    //   • 真正的 WE 文本**描边/外框**走**后处理特效**(workshop shader,如 `textoutline7x7`,
+    //     带 outlinecolor/width/threshold/opacity 的 constantshadervalues)。本引擎已支持:该 shader 已转译
+    //     (workshop__3565237853__effects__textoutline7x7__base__frag.metal)、已进 WEEffects.json、
+    //     parseTextLayer 也已把 obj["effects"] 解进特效链(走 WEEffectChain 统一管线)→ **描边已数据驱动可渲**。
+    //   • **粗体/斜体**在 WE 里由**字体文件本身**承载(如 Quicksand-Bold.otf / LEMONMILK-Light.otf),
+    //     没有独立 bool。FontRegistry 注册 pkg 字体 + resolveFont 按 PS 名取 → 粗细已随字体本身落地。
+    //   • 唯一**真实存在却此前未渲**的对象级文本样式字段 = `castshadow`(bool,投影开关)。
+    //     全库恒 false(无壁纸开),lwe 也直接丢弃不读;但它是 WE_SCENE_SPEC 里的合法基础对象字段,
+    //     故按「严格按 pkg、有字段才渲」补:castshadow=true → CoreText NSShadow 投影(WE 默认软黑投影)。
+    // WP_NO_TEXT_STROKE=1 关闭本节全部新增渲染(castshadow 投影 + 字重 trait 合成回退),A/B 诊断。
+    var castShadow = false                 // pkg `castshadow`(bool):WE 文本投影开关;true 才渲投影
+    var shadowColor: SIMD3<Float> = SIMD3(0, 0, 0)   // 投影色(WE 默认黑;pkg 无独立字段)
+    var shadowOffsetPx: SIMD2<Float> = SIMD2(0, 0)   // 投影偏移(渲染像素;按字号比例算,见 parseTextLayer)
+    var shadowBlurPx: CGFloat = 0          // 投影模糊半径(渲染像素)
+    var wantsBold = false                  // 字体名暗示粗体(*-Bold/Black/Heavy)但系统取到的体不粗 → trait 合成兜底
+    var wantsItalic = false                // 字体名暗示斜体(*-Italic/Oblique)→ trait 合成兜底
 }
 
 enum TextLayerRenderer {
@@ -39,9 +60,15 @@ enum TextLayerRenderer {
         let str = currentString(desc, simTime: simTime)
         guard !str.isEmpty else { return nil }
 
+        let noStroke = ProcessInfo.processInfo.environment["WP_NO_TEXT_STROKE"] != nil
         let nsColor = NSColor(srgbRed: CGFloat(desc.color.x), green: CGFloat(desc.color.y),
                               blue: CGFloat(desc.color.z), alpha: 1)
-        let font = resolveFont(desc.fontName, size: desc.pointSize)
+        // 字重/斜体(R15):resolveFont 取到的体若与字体名暗示的粗/斜不符(取不到带 weight 变体、落了 regular),
+        //   用 NSFontManager trait 合成兜底;已正确加载的粗/斜体不受影响(它们本身就有 trait)。WP_NO_TEXT_STROKE 关闭。
+        let font = noStroke
+            ? resolveFont(desc.fontName, size: desc.pointSize)
+            : styledFont(resolveFont(desc.fontName, size: desc.pointSize),
+                         wantsBold: desc.wantsBold, wantsItalic: desc.wantsItalic)
         let para = NSMutableParagraphStyle()
         para.alignment = desc.align == "left" ? .left : (desc.align == "right" ? .right : .center)
         // 折行:WE 文本框有显式宽度时,长文本应按框宽 word-wrap(超宽换行),而不是无限单行被
@@ -53,32 +80,21 @@ enum TextLayerRenderer {
             .font: font, .foregroundColor: nsColor, .paragraphStyle: para
         ]
 
-        // 描边/阴影/字重脚手架:
-        //   TextLayerDesc 目前**没有** stroke/shadow/bold/italic 字段(见 SceneModel,本文件不可改),
-        //   故无法数据驱动这些效果。下面保留实现接线点(注释掉的赋值即「补字段后」该怎么写),
-        //   需 SceneModel 给 TextLayerDesc 补:
-        //     - var strokeColor: SIMD3<Float>? 与 var strokeWidthPx: CGFloat?  → 描边
-        //     - var shadowColor: SIMD3<Float>?、var shadowOffsetPx: SIMD2<Float>?、var shadowBlurPx: CGFloat? → 阴影
-        //     - var bold: Bool / var italic: Bool(或 var weight: Float) → 字重/斜体(同时影响 resolveFont 取带 weight 的字体变体)
-        //   补字段后,把下面注释解开并用 desc 的对应字段替换占位:
-        //
-        //   if let sc = desc.strokeColor, let sw = desc.strokeWidthPx, sw > 0 {
-        //       // 负值 = 同时填充+描边(WE 描边在字形外侧叠加);正值只描边镂空。
-        //       attrs[.strokeColor] = NSColor(srgbRed: CGFloat(sc.x), green: CGFloat(sc.y), blue: CGFloat(sc.z), alpha: 1)
-        //       // strokeWidth 是相对字号的百分比(负=填充+描边)。WE 给的是像素宽 → 折算成 -%。
-        //       attrs[.strokeWidth] = -(sw / desc.pointSize) * 100.0
-        //   }
-        //   if let shc = desc.shadowColor {
-        //       let shadow = NSShadow()
-        //       shadow.shadowColor = NSColor(srgbRed: CGFloat(shc.x), green: CGFloat(shc.y), blue: CGFloat(shc.z), alpha: 1)
-        //       if let off = desc.shadowOffsetPx { shadow.shadowOffset = NSSize(width: CGFloat(off.x), height: CGFloat(-off.y)) } // y 取负:翻转坐标系内向下
-        //       shadow.shadowBlurRadius = desc.shadowBlurPx ?? 0
-        //       attrs[.shadow] = shadow
-        //       // 注意:有阴影/描边时下面的 pad / boundingRect 需放大,避免效果被裁(见 pad 处)。
-        //   }
-        //   字重/斜体:在 resolveFont 内按 desc.bold/desc.italic 用 NSFontManager.convert(_:toHaveTrait:)
-        //     施加 .boldFontMask/.italicFontMask(或 monospacedSystemFont(weight:))。当前无字段 → 用注册体本身的字重。
-        attrs[.paragraphStyle] = para   // no-op 写回(保持 attrs 为 var);补字段解开上面赋值后可删此行。
+        // 投影(R15):WE `castshadow:true` → CoreText NSShadow 软投影。pkg 不带投影色/偏移/模糊 →
+        //   用 parseTextLayer 算好的 WE 默认软黑投影参数(见 TextLayerDesc 注释里实据)。
+        //   翻转坐标系(下方 scaleBy(1,-1))内 y 向下,故 shadowOffset.height 取 +offy 即屏上向下投影。
+        //   严格按 pkg:castShadow=false(全库恒此值)时不加 → 普通文字零变化。WP_NO_TEXT_STROKE 关闭。
+        var extraPad: CGFloat = 0
+        if desc.castShadow && !noStroke {
+            let shadow = NSShadow()
+            shadow.shadowColor = NSColor(srgbRed: CGFloat(desc.shadowColor.x), green: CGFloat(desc.shadowColor.y),
+                                         blue: CGFloat(desc.shadowColor.z), alpha: 1)
+            shadow.shadowOffset = NSSize(width: CGFloat(desc.shadowOffsetPx.x), height: CGFloat(desc.shadowOffsetPx.y))
+            shadow.shadowBlurRadius = desc.shadowBlurPx
+            attrs[.shadow] = shadow
+            // 投影会越出字形外接框 → 纹理须留够边距容下「偏移 + 模糊」,否则投影被裁。
+            extraPad = max(abs(CGFloat(desc.shadowOffsetPx.x)), abs(CGFloat(desc.shadowOffsetPx.y))) + desc.shadowBlurPx * 2
+        }
 
         // 符号字形回退 + 加粗(月相 ☽/☾ 等):WE 在 Windows(CrossOver)用 Arial 渲符号——但实测 Windows Arial.TTF
         //   同样**不含** ☽(U+263D)/☾(U+263E),走 Windows 字体链回退到 Segoe UI Symbol(粗实月牙、亮)。
@@ -104,10 +120,8 @@ enum TextLayerRenderer {
         let maxWidth: CGFloat = 100000
         let bounds = attr.boundingRect(with: CGSize(width: maxWidth, height: 100000),
                                        options: [.usesLineFragmentOrigin, .usesFontLeading])
-        // 留点边距,避免抗锯齿边缘被裁。
-        // TODO: 补 stroke/shadow 字段后,这里 pad 应加上 max(strokeWidthPx, shadowBlurPx+|shadowOffset|),
-        //   否则描边/阴影会被纹理边界裁掉。
-        let pad: CGFloat = desc.pointSize * 0.3
+        // 留点边距,避免抗锯齿边缘被裁;有投影(castshadow)时再加 extraPad 容下偏移+模糊(R15)。
+        let pad: CGFloat = desc.pointSize * 0.3 + extraPad
         let w = Int(ceil(bounds.width + pad * 2)), h = Int(ceil(bounds.height + pad * 2))
         guard w > 0, h > 0, w < 8192, h < 2048 else { return nil }
 
@@ -232,6 +246,26 @@ enum TextLayerRenderer {
             }
         }
         return out
+    }
+
+    // MARK: - 字重/斜体合成(R15)
+
+    /// 字重/斜体兜底:WE 的粗/斜由字体文件承载(*-Bold.otf 等);FontRegistry + resolveFont 取到带 weight 的体时
+    /// 本函数是 no-op(传入的 base 已是粗/斜体,traits 已含)。仅当**取不到带 weight 变体**(如 systemfont_ 或注册失败
+    /// 落了 regular)而字体名又暗示粗/斜时,用 NSFontManager 合成 bold/italic trait 补上,避免「该粗的渲成细」。
+    /// 已带对应 trait 的体不会被二次加粗/加斜(convert 幂等)。无 wants 时直接返回 base → 普通文字零变化。
+    static func styledFont(_ base: NSFont, wantsBold: Bool, wantsItalic: Bool) -> NSFont {
+        guard wantsBold || wantsItalic else { return base }
+        let mgr = NSFontManager.shared
+        var f = base
+        let cur = mgr.traits(of: f)
+        if wantsBold && !cur.contains(.boldFontMask) {
+            f = mgr.convert(f, toHaveTrait: .boldFontMask)
+        }
+        if wantsItalic && !cur.contains(.italicFontMask) {
+            f = mgr.convert(f, toHaveTrait: .italicFontMask)
+        }
+        return f
     }
 
     // MARK: - 字体解析

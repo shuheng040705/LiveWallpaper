@@ -292,7 +292,7 @@ struct Model3DMaterial {
     var brightness: Float = 1
     var alpha: Float = 1
     var translucent: Bool = false  // blending=translucent → alpha 混合;否则不透明
-    var lighting: Bool = false
+    var lighting: Bool = false      // LIGHTING combo(generic4 默认开=1,genericimage4 默认关=0;combos 显式覆盖)
 }
 
 struct Model3DObject {
@@ -334,6 +334,12 @@ final class Scene3DRuntime {
         (host?.evalUniform(key: "\(id):__scale", comps: 1) ?? [0]).first ?? 0
     }
     private(set) var models: [Model3DObject] = []     // world 由 recompute() 更新
+    /// 场景方向光/点光(土星/太阳系:sun 驱动 ldirectional+lpoint;创建昼夜终止线 N·L 漫反射)。
+    /// id=节点 id(world 由 recompute 求出,光源世界位置=worldsById[id].columns.3),directional=方向光否则点光。
+    struct SceneLight { let id: Int; let directional: Bool; let color: SIMD3<Float>; let intensity: Float; let radius: Float }
+    private(set) var lights: [SceneLight] = []
+    /// general.ambientcolor(脚本则取 value 静态;lwe/WE 默认 vec3(0))。喂 LIGHTING 材质 g_LightAmbientColor。
+    private(set) var ambientColor: SIMD3<Float> = .zero
     private(set) var worldsById: [Int: simd_float4x4] = [:]   // 逐帧同步给 GPU 用
     private(set) var layerOverrides: [Int: [String: SIMD3<Float>]] = [:]  // Main 模拟 getLayer 设的 origin/scale/angles
     private(set) var uiRoots: Set<Int> = []                   // 屏幕 UI 根容器 id(其下层走正交屏幕坐标)
@@ -371,6 +377,32 @@ final class Scene3DRuntime {
     }
     func textValue(id: Int) -> String? { host?.textValue(id: id) }
     func scriptValue(id: Int, prop: String) -> SIMD3<Float>? { host?.value(id: id, prop: prop) }
+
+    /// 解析出的主光照(喂 3D frag):L=世界空间「表面→光源」方向(归一化)、颜色、强度、环境光。
+    /// 方向光:用其世界旋转的前向(-Z)再取反指向光源;点光:光源世界位置 → 朝原点(场景中心=被照天体)。
+    /// sun 驱动脚本已在 bake/recompute 后写入 worldsById,故必须在 recompute() 之后调用。返回 nil = 无光照(2D 等)。
+    struct ResolvedLight { let dir: SIMD3<Float>; let color: SIMD3<Float>; let intensity: Float; let ambient: SIMD3<Float> }
+    func lightInfo() -> ResolvedLight? {
+        guard let l = lights.first else { return nil }   // 土星/太阳系均单主光(directional 优先 or 唯一 point)
+        let main = lights.first(where: { $0.directional }) ?? l
+        let w = worldsById[main.id] ?? matrix_identity_float4x4
+        let pos = SIMD3(w.columns.3.x, w.columns.3.y, w.columns.3.z)
+        // L = 世界空间「表面 → 光源」方向。土星/太阳系两张的 sun 都用脚本驱动光源**世界旋转**编码方向
+        //(土星 ldirectional.angles.y=sun 方位;太阳系 lpoint 在原点但其旋转随 sun 转)→ 世界 +Z 列即朝向。
+        // 点光若有真实离原点位置(parent 偏移)则优先 normalize(pos)(物理:原点天体 → 光源);否则退回 +Z 旋转向量。
+        let fwd = SIMD3(w.columns.2.x, w.columns.2.y, w.columns.2.z)   // 世界 +Z 列(旋转编码的光源方向)
+        var dir: SIMD3<Float>
+        if !main.directional && simd_length(pos) > 0.05 {
+            dir = simd_normalize(pos)                                   // 点光有真实位置:朝原点天体
+        } else if simd_length(fwd) > 1e-5 {
+            dir = simd_normalize(fwd)
+        } else {
+            dir = SIMD3(0, 0, 1)
+        }
+        // 强度归一(WE intensity 是物理多光源累加;这里单光源做漫反射系数,6=「全光照」→1.5,截到合理范围)。
+        let i = max(0, min(main.intensity, 8)) / 8.0 * 2.0
+        return ResolvedLight(dir: dir, color: main.color, intensity: min(i, 1.5), ambient: ambientColor)
+    }
 
     init?(source: SceneSource) {
         guard let sj = source.data(for: "scene.json"),
@@ -487,6 +519,17 @@ final class Scene3DRuntime {
             models.append(Model3DObject(id: id, name: o["name"] as? String ?? "", meshPath: modelPath,
                                         geometry: geo, world: matrix_identity_float4x4, materials: mats))
         }
+        // 场景光源(WE 3D 光照:ldirectional/lpoint;color/intensity/radius 取 pkg,缺省 WE 默认)。
+        // 光源 id 也是节点 → world 由 recompute 求出,光源世界位置/方向喂 frag 做 N·L 漫反射昼夜终止线。
+        for o in objects {
+            guard let id = intOf(o["id"]), let light = o["light"] as? String else { continue }
+            let dir = light == "ldirectional"
+            let color = Self.f3(o["color"], SIMD3(1, 1, 1))   // WE 默认白光
+            let intensity = Self.parseFloats(o["intensity"]).first ?? 1.0
+            let radius = Self.parseFloats(o["radius"]).first ?? 0
+            lights.append(SceneLight(id: id, directional: dir, color: color, intensity: intensity, radius: radius))
+        }
+        if let gen = root["general"] as? [String: Any] { ambientColor = Self.f3(gen["ambientcolor"], .zero) }
         if models.isEmpty { return nil }
     }
 
@@ -596,6 +639,11 @@ final class Scene3DRuntime {
               let root = (try? JSONSerialization.jsonObject(with: d)) as? [String: Any],
               let passes = root["passes"] as? [[String: Any]], let p0 = passes.first else { return m }
         m.translucent = (p0["blending"] as? String) == "translucent"
+        // LIGHTING combo:WE 着色器各有默认值 —— generic4.frag `LIGHTING default:1`(行星/天体默认受光);
+        // genericimage4.frag `LIGHTING default:0`(天空盒/UI 平涂)。pkg 的 combos 显式键再覆盖默认。
+        // 旧码只在 combos.LIGHTING==1 时开 → 土星行星(generic4 且 combos 无 LIGHTING 键)漏光照而平涂。
+        let shader = (p0["shader"] as? String) ?? ""
+        m.lighting = (shader == "generic4")   // 仅 generic4 默认开;其余(genericimage4 等)默认关
         if let combos = p0["combos"] as? [String: Any], let lit = combos["LIGHTING"] as? NSNumber {
             m.lighting = lit.intValue == 1
         }

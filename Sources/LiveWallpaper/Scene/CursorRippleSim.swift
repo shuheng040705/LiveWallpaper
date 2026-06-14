@@ -9,7 +9,8 @@ import simd
 /// combine(按力场方向折射底图)在主着色器里做——本类只产出力场纹理给主着色器采样。
 final class CursorRippleSim {
     private let device: MTLDevice
-    private let size = 512
+    private let size = 512        // 力场纹理宽
+    private let height: Int        // 高=按画布长宽比(16:9→288);修正旧 512×512 正方网格把 16:9 碰撞遮罩/涟漪竖向压扁→护猫白块错位→涟漪漏到猫上
     private var bufA: MTLTexture     // ping
     private var bufB: MTLTexture     // pong
     private var applyPipeline: MTLRenderPipelineState!
@@ -35,15 +36,16 @@ final class CursorRippleSim {
     /// 照 WE simulate_force.frag #if MASK:`force *= 1-step(0.5, mask.r)`。
     var collisionMask: MTLTexture?
 
-    init?(device: MTLDevice, sampler: MTLSamplerState, quad: MTLBuffer) {
+    init?(device: MTLDevice, sampler: MTLSamplerState, quad: MTLBuffer, aspect: Float = 1) {
         self.device = device
         self.sampler = sampler
         self.quad = quad
+        self.height = max(64, Int((512.0 / max(0.1, aspect)).rounded()))   // 画布 16:9 → 高 288
         guard let q = device.makeCommandQueue() else { return nil }
         self.clearQueue = q
-        let sz = 512
+        let szW = size, szH = self.height
         func makeRT() -> MTLTexture? {
-            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: sz, height: sz, mipmapped: false)
+            let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: szW, height: szH, mipmapped: false)
             d.usage = [.renderTarget, .shaderRead]
             d.storageMode = .private
             return device.makeTexture(descriptor: d)
@@ -83,7 +85,7 @@ final class CursorRippleSim {
         enc.setRenderPipelineState(applyPipeline)
         enc.setVertexBuffer(quad, offset: 0, index: 0)
         var u = ApplyU(pointer: pointer, pointerLast: pointerLast,
-                       frametime: frametime, rippleScale: rippleScale, texW: Float(size), texH: Float(size))
+                       frametime: frametime, rippleScale: rippleScale, texW: Float(size), texH: Float(height))
         enc.setVertexBytes(&u, length: MemoryLayout<ApplyU>.stride, index: 1)
         enc.setFragmentBytes(&u, length: MemoryLayout<ApplyU>.stride, index: 0)
         enc.setFragmentTexture(src, index: 0)
@@ -101,7 +103,7 @@ final class CursorRippleSim {
         enc.setRenderPipelineState(simPipeline)
         enc.setVertexBuffer(quad, offset: 0, index: 0)
         var u = SimU(frametime: frametime, rippleSpeed: rippleSpeed, rippleDecay: rippleDecay,
-                     texW: Float(size), texH: Float(size), hasMask: collisionMask != nil ? 1 : 0,
+                     texW: Float(size), texH: Float(height), hasMask: collisionMask != nil ? 1 : 0,
                      rippleStrength: rippleStrength)
         enc.setFragmentBytes(&u, length: MemoryLayout<SimU>.stride, index: 0)
         enc.setFragmentTexture(src, index: 0)

@@ -78,7 +78,7 @@ struct PuppetMesh {
     /// 求 animId 在 time 时刻每根骨的**世界动画变换**(列主序;父链累乘的 worldAnim[b])。
     /// 与 skin() 内部的 world[] 计算逐式相同(共享逻辑)。失败/无骨/无该动画返回 nil。
     /// t=0(或 anim 首帧 == bind)时退化为 worldBind → 与静态结果一致(回归兜底)。
-    private func worldAnim(time: Double, rate: Float, animId: Int) -> [simd_float4x4]? {
+    private func worldAnim(time: Double, rate: Float, animId: Int, use3D: Bool = false) -> [simd_float4x4]? {
         guard hasSkin else { return nil }
         guard let anim = anims.first(where: { $0.id == animId }) ?? anims.first else { return nil }
         guard anim.frameCount > 0, anim.fps > 0 else { return nil }
@@ -94,9 +94,13 @@ struct PuppetMesh {
             let k0 = anim.tracks[b][f0], k1 = anim.tracks[b][f1]
             func lp(_ i: Int) -> Float { k0[i] + (k1[i] - k0[i]) * a }
             let t = SIMD3<Float>(lp(0), lp(1), lp(2))
-            let rz = lp(5)
             let s = SIMD3<Float>(lp(6), lp(7), lp(8))
-            local[b] = Self.trs(t: t, rz: rz, s: s)
+            // use3D=眼睛层:完整 3D TRS(含 rx/ry 出平面旋转 + tz)→ 凯尔希眼 anim1405 bone2 rx→π/2+tz→−61
+            //   把虹膜区顶点收缩成闭合眼线(隔离实测眼面积 1538→730 px,睁→闭干净过渡,无翻面色块,无需剔除)。
+            // use3D=false(主 puppet 龙/刀/朱鹤/头发等):只构 rz 的平面 trs(丢 rx/ry)= 旧行为,零回归
+            //   (朱鹤 anim458 bone2 也有 rx→π/2,在 2D 无深度无剔除下出平面旋转会把网格折叠成色块,故主 puppet 不上 3D)。
+            local[b] = use3D ? Self.trs3D(t: t, rx: lp(3), ry: lp(4), rz: lp(5), s: s)
+                             : Self.trs(t: t, rz: lp(5), s: s)
         }
         var world = [simd_float4x4](repeating: matrix_identity_float4x4, count: nb)
         for b in 0..<nb {
@@ -145,7 +149,8 @@ struct PuppetMesh {
     }
 
     /// 单个动画在 time 时刻的每骨**局部** TRS 矩阵(父链累乘前)。无该动画返回 nil。
-    private func localPose(time: Double, rate: Float, animId: Int) -> [simd_float4x4]? {
+    /// use3D=眼睛层用完整 trs3D(rx/ry/tz);false=主 puppet 平面 trs(只 rz,丢出平面,零回归)。
+    private func localPose(time: Double, rate: Float, animId: Int, use3D: Bool = false) -> [simd_float4x4]? {
         guard let anim = anims.first(where: { $0.id == animId }) else { return nil }
         guard anim.frameCount > 0, anim.fps > 0 else { return nil }
         let nb = parent.count
@@ -159,7 +164,9 @@ struct PuppetMesh {
             guard b < anim.tracks.count, f0 < anim.tracks[b].count, f1 < anim.tracks[b].count else { continue }
             let k0 = anim.tracks[b][f0], k1 = anim.tracks[b][f1]
             func lp(_ i: Int) -> Float { k0[i] + (k1[i] - k0[i]) * a }
-            local[b] = Self.trs(t: SIMD3(lp(0), lp(1), lp(2)), rz: lp(5), s: SIMD3(lp(6), lp(7), lp(8)))
+            local[b] = use3D
+                ? Self.trs3D(t: SIMD3(lp(0), lp(1), lp(2)), rx: lp(3), ry: lp(4), rz: lp(5), s: SIMD3(lp(6), lp(7), lp(8)))
+                : Self.trs(t: SIMD3(lp(0), lp(1), lp(2)), rz: lp(5), s: SIMD3(lp(6), lp(7), lp(8)))
         }
         return local
     }
@@ -170,12 +177,12 @@ struct PuppetMesh {
     /// 合成约定:local = L_base · Π(invLocalBind · L_add)。additive 轨道 entry== bind 时 invLB·L_add = I(零贡献),
     /// 已对照 pkg 数据验证(动画2 entry0 == localBind 逐骨全等 → t=0 合成 == 纯 base == 旧行为,天然回归兜底)。
     /// layers 为空/全不可用 → 返回 nil(调用方维持现状)。
-    func skinLayers(time: Double, layers: [(animId: Int, rate: Float, additive: Bool)]) -> [Float]? {
+    func skinLayers(time: Double, layers: [(animId: Int, rate: Float, additive: Bool)], use3D: Bool = false) -> [Float]? {
         guard hasSkin, !layers.isEmpty else { return nil }
         let nb = parent.count
         var composed: [simd_float4x4]? = nil
         for l in layers {
-            guard let pose = localPose(time: time, rate: l.rate, animId: l.animId) else { continue }
+            guard let pose = localPose(time: time, rate: l.rate, animId: l.animId, use3D: use3D) else { continue }
             if composed == nil {
                 composed = pose                      // 首个可用层 = base(additive 标志忽略,作 base 用)
             } else if l.additive {
@@ -194,10 +201,25 @@ struct PuppetMesh {
     }
 
     /// 求指定 animId 在 time 时刻的蒙皮顶点(单位空间 [x,y,u,v])。失败/无骨返回 nil(调用方回退 bind)。
-    func skin(time: Double, rate: Float, animId: Int) -> [Float]? {
+    /// use3D=眼睛层用完整 3D TRS;false=主 puppet 平面 TRS(零回归)。
+    func skin(time: Double, rate: Float, animId: Int, use3D: Bool = false) -> [Float]? {
         // worldAnim[b] = 父链累乘的该帧骨骼世界变换(与 animatedAttachmentWorld 共享同一求值)。
-        guard let world = worldAnim(time: time, rate: rate, animId: animId) else { return nil }
+        guard let world = worldAnim(time: time, rate: rate, animId: animId, use3D: use3D) else { return nil }
         return skinVerts(world: world)
+    }
+
+    /// 该动画是否「平面内」(planar):所有关键帧的 rx(绕X)/ry(绕Y)旋转都近 0。
+    /// 诊断用(2026-06-14c 起眼睛层用完整 3D trs3D 表示出平面旋转闭合眼球,主 puppet 仍用平面 trs;
+    /// 不再据此门控蒙皮;保留供 A/B 分析与未来判定)。
+    func isAnimationPlanar(_ animId: Int) -> Bool {
+        guard let anim = anims.first(where: { $0.id == animId }) ?? anims.first else { return true }
+        let eps: Float = 0.05   // ≈3°:超过即视为出平面旋转
+        for track in anim.tracks {
+            for k in track where k.count >= 5 {
+                if abs(k[3]) > eps || abs(k[4]) > eps { return false }   // rx/ry 出平面 → 平面 skinner 无法表示
+            }
+        }
+        return true
     }
 
     /// 共享顶点蒙皮:skin[b] = world[b]·invBind[b],逐顶点 4 骨加权,输出单位空间 [x,y,u,v]。
@@ -213,20 +235,50 @@ struct PuppetMesh {
                 let bi = Int(idx[k]); guard bi >= 0, bi < nb else { continue }
                 acc += (world[bi] * invBind[bi]) * p4 * w
             }
-            // 若权重全 0(异常)→ 退原始位置
+            // 若权重全 0(异常)→ 退原始位置。acc.x/acc.y 已含完整 3D 变换后的屏幕平面坐标(use3D 时 trs3D
+            // 把 rx/ry 出平面旋转的 x/y 收缩算进 acc.xy);场景为正交投影,acc.z 不喂顶点(丢 z = 正交投影),
+            // 出平面旋转对 x/y 的收缩(眼睛闭合成眼线)已忠实保留。
             skinned[i] = (acc.w != 0 || wt[0] + wt[1] + wt[2] + wt[3] > 0) ? SIMD2(acc.x, acc.y) : rawPos[i]
             if !skinned[i].x.isFinite || !skinned[i].y.isFinite { skinned[i] = rawPos[i] }
         }
         return unitVerts(skinned)
     }
 
-    /// T·Rz·S 矩阵(列主序 simd)。
+    /// T·Rz·S 矩阵(列主序 simd;平面动画专用,只构 rz,丢 rx/ry)。
+    /// 保留供 m眼睛 等平面挤眼路径与零回归 A/B。
     private static func trs(t: SIMD3<Float>, rz: Float, s: SIMD3<Float>) -> simd_float4x4 {
         let c = cos(rz), sn = sin(rz)
         // 列主序:列 = 基向量
         let c0 = SIMD4<Float>( c * s.x,  sn * s.x, 0, 0)
         let c1 = SIMD4<Float>(-sn * s.y,  c * s.y, 0, 0)
         let c2 = SIMD4<Float>(0, 0, s.z, 0)
+        let c3 = SIMD4<Float>(t.x, t.y, t.z, 1)
+        return simd_float4x4(columns: (c0, c1, c2, c3))
+    }
+
+    /// 完整 3D TRS 矩阵(列主序 simd):T · Rz·Ry·Rx · S。
+    /// 加入 rx(绕X,lp3)/ry(绕Y,lp4)出平面旋转 —— 凯尔希「眼睛」anim1405 bone2 rx→π/2 让虹膜
+    /// 顶点绕 X 翻转 + tz→−61 后退,正交投影下其 x/y 收缩把眼睛闭合成眼线(无需背面剔除,实测干净闭合)。
+    /// 旋转约定与 simd 列主序一致:R = Rz·Ry·Rx(先绕 X 再 Y 再 Z),缩放最后乘进各列。
+    /// rx=ry=0 时退化为 trs(只 rz)的结果(逐元素等价 → 平面动画零回归)。
+    static func trs3D(t: SIMD3<Float>, rx: Float, ry: Float, rz: Float, s: SIMD3<Float>) -> simd_float4x4 {
+        let cx = cos(rx), sx = sin(rx)
+        let cy = cos(ry), sy = sin(ry)
+        let cz = cos(rz), sz = sin(rz)
+        // R = Rz * Ry * Rx(列主序 3x3 旋转,标准 ZYX 复合)
+        let r00 = cz * cy
+        let r01 = cz * sy * sx - sz * cx
+        let r02 = cz * sy * cx + sz * sx
+        let r10 = sz * cy
+        let r11 = sz * sy * sx + cz * cx
+        let r12 = sz * sy * cx - cz * sx
+        let r20 = -sy
+        let r21 = cy * sx
+        let r22 = cy * cx
+        // 列主序:列 i = R 的第 i 列 × s[i]
+        let c0 = SIMD4<Float>(r00 * s.x, r10 * s.x, r20 * s.x, 0)
+        let c1 = SIMD4<Float>(r01 * s.y, r11 * s.y, r21 * s.y, 0)
+        let c2 = SIMD4<Float>(r02 * s.z, r12 * s.z, r22 * s.z, 0)
         let c3 = SIMD4<Float>(t.x, t.y, t.z, 1)
         return simd_float4x4(columns: (c0, c1, c2, c3))
     }

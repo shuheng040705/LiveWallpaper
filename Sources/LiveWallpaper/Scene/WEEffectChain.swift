@@ -48,11 +48,16 @@ final class WEEffectChain {
         let command: String?     // 命令 pass:copy(motionblur 帧间拷贝)/swap(fluidsim 乒乓)等,无 vert/frag
         let copy: Bool?
         let source: String?
+        // R5:目标 FBO 的像素格式字符串(effect.json fbos[].format;无 = 默认 → .bgra8Unorm)与跨帧持久标记
+        // (fbos[].unique;true = 累积缓冲,引擎不逐帧 clear)。fluidsimulation 速度/压力场需 rg1616f/r16f 浮点
+        // 精度(8-bit 量化出色带);motionblur 累积缓冲 unique(逐帧重建会丢累积)。绝大多数 pass 二者皆 nil(现状)。
+        let targetFormat: String?
+        let targetUnique: Bool?
         // 自定义解码:命令 pass 缺 shader/uniformMeta/bind,用 decodeIfPresent + 默认值容错,
         // 否则 JSONDecoder 对整个 manifest 抛错 → 所有特效全丢(连 bloom/filmgrain 都没了)。
         // 命令 pass 解出后无 vert/frag,run() 的 `guard let vstage=p.vert...` 会安全跳过。
         enum CodingKeys: String, CodingKey {
-            case shader, target, bind, uniformMeta, vert, frag, targetScale, command, copy, source
+            case shader, target, bind, uniformMeta, vert, frag, targetScale, command, copy, source, targetFormat, targetUnique
         }
         init(from d: Decoder) throws {
             let c = try d.container(keyedBy: CodingKeys.self)
@@ -66,6 +71,8 @@ final class WEEffectChain {
             command     = try c.decodeIfPresent(String.self, forKey: .command)
             copy        = try c.decodeIfPresent(Bool.self, forKey: .copy)
             source      = try c.decodeIfPresent(String.self, forKey: .source)
+            targetFormat = try c.decodeIfPresent(String.self, forKey: .targetFormat)
+            targetUnique = try c.decodeIfPresent(Bool.self, forKey: .targetUnique)
         }
     }
     struct Variant: Codable { let combos: [String: String]; let passes: [PassDef] }
@@ -452,12 +459,15 @@ final class WEEffectChain {
         libCache[metalFile] = lib; return lib
     }
 
-    private func pipeline(_ p: PassDef) -> MTLRenderPipelineState? {
+    private func pipeline(_ p: PassDef, colorFormat: MTLPixelFormat = .bgra8Unorm) -> MTLRenderPipelineState? {
         // 关键:按**变体的 MSL 文件名**缓存,不能只按 p.shader。同一 shader 的不同 combo 变体
         // (如 depthparallax 的 QUALITY-1 vs MASK-1_QUALITY-1)采样器布局/数量不同 → MSL 不同;
         // 若只按 shader 名缓存,先编译的变体会被另一变体复用 → 贴图索引错位(g_Texture0 取到白色
         // 兜底槽)→ 整层洗白(实测 3440483127 的 ripple720p 水层)。
-        let key = "\(p.vert?.metal ?? "?")|\(p.frag?.metal ?? "?")"
+        // R5:管线的 colorAttachment pixelFormat **必须**匹配渲染目标 FBO 的格式(浮点目标用浮点管线),
+        // 否则 setRenderPipelineState 时该 pass 校验失败。format 入缓存键(默认 bgra8 不改键 = 现有行为不变)。
+        let fmtSuffix = colorFormat == .bgra8Unorm ? "" : "#\(colorFormat.rawValue)"
+        let key = "\(p.vert?.metal ?? "?")|\(p.frag?.metal ?? "?")\(fmtSuffix)"
         if let ps = pipeCache[key] { return ps }
         if pipeFailed.contains(key) { return nil }   // 已知建不成:别每帧重试/刷屏
         guard let v = p.vert, let f = p.frag,
@@ -466,7 +476,7 @@ final class WEEffectChain {
         else { pipeFailed.insert(key); return nil }
         let d = MTLRenderPipelineDescriptor()
         d.vertexFunction = vfn; d.fragmentFunction = ffn
-        d.colorAttachments[0].pixelFormat = .bgra8Unorm
+        d.colorAttachments[0].pixelFormat = colorFormat
         // 顶点布局:a_Position(float3 @0)+ a_TexCoord(float2 @12),stride 20,buffer index 1。
         let vd = MTLVertexDescriptor()
         vd.attributes[0].format = .float3; vd.attributes[0].offset = 0;  vd.attributes[0].bufferIndex = 1
@@ -483,8 +493,31 @@ final class WEEffectChain {
         pipeCache[key] = ps; return ps
     }
 
-    private func makeTarget(width: Int, height: Int) -> MTLTexture? {
-        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
+    /// R5:WE effect.json fbos[].format 字符串 → MTLPixelFormat。
+    /// 映射依据 WE 的 TextureFormat 枚举(见 lwe Data/Assets/Texture.h):
+    ///   rg1616f→RG1616f(10)、r16f→R16f(11)、rgba16161616f/rgba16f→RGBA16161616f(14)、
+    ///   r8→R8(9)、rg88→RG88(8)、rgb161616f→RGB(Metal 无 rgb16f,退 RGBA16Float)。
+    ///   rgba8888 / rgba_backbuffer(= 标准 8-bit backbuffer)/ 缺省 → .bgra8Unorm(现状)。
+    /// ⚠lwe 自身把所有 FBO 硬编码成 GL_RGBA8(FBOProvider.cpp 注释 "TODO: PROPERLY DETERMINE FBO FORMAT")——
+    ///   即 lwe 在此为未完成移植;按真 WE 语义补上(fluidsimulation/motionblur 才正确)。
+    /// WP_NO_FBO_FORMAT=1 → 全部退回 .bgra8Unorm(A/B 守门,回归排查)。
+    private static func pixelFormat(for fmt: String?) -> MTLPixelFormat {
+        guard let f = fmt?.lowercased(),
+              ProcessInfo.processInfo.environment["WP_NO_FBO_FORMAT"] == nil else { return .bgra8Unorm }
+        switch f {
+        case "rg1616f":                          return .rg16Float
+        case "r16f":                             return .r16Float
+        case "rgba16161616f", "rgba16f":         return .rgba16Float
+        case "rgb161616f", "rgb16f":             return .rgba16Float   // Metal 无三通道 16f,用 RGBA16Float
+        case "r8":                               return .r8Unorm
+        case "rg88":                             return .rg8Unorm
+        case "rgba8888", "rgba_backbuffer", "":  return .bgra8Unorm
+        default:                                 return .bgra8Unorm    // 未知格式保守退默认
+        }
+    }
+
+    private func makeTarget(width: Int, height: Int, format: MTLPixelFormat = .bgra8Unorm) -> MTLTexture? {
+        let desc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format,
                                                             width: width, height: height, mipmapped: false)
         desc.usage = [.renderTarget, .shaderRead]; desc.storageMode = .private
         return device.makeTexture(descriptor: desc)
@@ -518,10 +551,11 @@ final class WEEffectChain {
         utilCache[ref] = entry; return entry
     }
 
-    private func renderTarget(_ name: String, width: Int, height: Int) -> MTLTexture? {
-        let key = "\(name)@\(width)x\(height)"
+    private func renderTarget(_ name: String, width: Int, height: Int, format: MTLPixelFormat = .bgra8Unorm) -> MTLTexture? {
+        // 键含格式:同名 FBO 在不同 format 间不复用(实际同名恒同 format,format 入键只为防呆 + 让浮点块与默认块分桶)。
+        let key = format == .bgra8Unorm ? "\(name)@\(width)x\(height)" : "\(name)@\(width)x\(height)#\(format.rawValue)"
         if let t = rtPool[key] { return t }
-        let t = makeTarget(width: width, height: height); rtPool[key] = t; return t
+        let t = makeTarget(width: width, height: height, format: format); rtPool[key] = t; return t
     }
 
     // MARK: - Uniform 装填
@@ -562,6 +596,31 @@ final class WEEffectChain {
             let p = buf.advanced(by: offset + i * stride).assumingMemoryBound(to: Float.self)
             p[0] = i < value.count ? value[i] : 0
         }
+    }
+
+    /// lightshafts gradient 模式的 colorastart→colorend 1D 渐变图(64×1 RGBA8,线性插值,clamp)。
+    /// 按颜色键缓存,避免逐帧重建。替代静态 gradient_iridescent 彩虹图 → 光束按 pkg 着色(白→青等)。
+    private var lightshaftRampCache: [String: MTLTexture] = [:]
+    private func lightshaftRamp(start: [Float], end: [Float]) -> MTLTexture? {
+        func c(_ a: [Float], _ i: Int) -> Float { i < a.count ? max(0, min(1, a[i])) : (i == 3 ? 1 : 0) }
+        let s = SIMD3<Float>(c(start,0), c(start,1), c(start,2))
+        let e = SIMD3<Float>(c(end,0), c(end,1), c(end,2))
+        let key = String(format: "%.3f_%.3f_%.3f__%.3f_%.3f_%.3f", s.x,s.y,s.z, e.x,e.y,e.z)
+        if let t = lightshaftRampCache[key] { return t }
+        let n = 64
+        var px = [UInt8](repeating: 0, count: n * 4)
+        for i in 0..<n {
+            let t = Float(i) / Float(n - 1)
+            let col = s + (e - s) * t
+            px[i*4+0] = UInt8(col.x * 255); px[i*4+1] = UInt8(col.y * 255)
+            px[i*4+2] = UInt8(col.z * 255); px[i*4+3] = 255
+        }
+        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: n, height: 1, mipmapped: false)
+        d.usage = .shaderRead
+        guard let t = device.makeTexture(descriptor: d) else { return nil }
+        t.replace(region: MTLRegionMake2D(0, 0, n, 1), mipmapLevel: 0, withBytes: px, bytesPerRow: n * 4)
+        lightshaftRampCache[key] = t
+        return t
     }
 
     private static func parseFloats(_ any: Any?) -> [Float] {
@@ -799,24 +858,34 @@ final class WEEffectChain {
         // 修法:为每个 FBO 名预解析一个**唯一**尺寸 —— 取该名**首次**作为 target 出现时的 targetScale 算出的
         // 尺寸,后续所有引用(预填 / 渲染 / swap)都用它。单 scale 特效里每个名只一种尺寸 → 与旧行为完全一致。
         var nameSize: [String: (w: Int, h: Int)] = [:]
+        // R5:每个命名 FBO 的像素格式(取该名**首次**作为渲染 target 出现时的 targetFormat;无 = 默认 bgra8)
+        // 与跨帧持久标记 unique。同名 FBO 恒同 format/unique(WE 按 fbos[] 名定义)→ 取首次即可。
+        var nameFormat: [String: MTLPixelFormat] = [:]
+        var nameUnique: Set<String> = []
         for p in def.passes {
             guard let tname = p.target, nameSize[tname] == nil else { continue }
             let s = max(1, p.targetScale ?? 1)
             nameSize[tname] = (max(1, w / s), max(1, h / s))
+            nameFormat[tname] = Self.pixelFormat(for: p.targetFormat)
+            if p.targetUnique == true { nameUnique.insert(tname) }
         }
-        // 本 run 内按 FBO 名拿目标纹理(用一致尺寸键),供 swap / 渲染共用,避免重算 scale 取错块。
+        func fmtFor(_ name: String) -> MTLPixelFormat { nameFormat[name] ?? .bgra8Unorm }
+        // 跨帧持久键:format 入键(与 renderTarget 完全一致)。供预填 / swap / copy 对齐,避免浮点块与默认块串桶。
+        func rtKey(_ name: String, _ sz: (w: Int, h: Int), _ fmt: MTLPixelFormat) -> String {
+            fmt == .bgra8Unorm ? "\(name)@\(sz.w)x\(sz.h)" : "\(name)@\(sz.w)x\(sz.h)#\(fmt.rawValue)"
+        }
+        // 本 run 内按 FBO 名拿目标纹理(用一致尺寸键 + 格式),供 swap / 渲染共用,避免重算 scale 取错块。
         func targetForName(_ name: String) -> MTLTexture? {
             let sz = nameSize[name] ?? (w, h)
-            return renderTarget(name, width: sz.w, height: sz.h)
+            return renderTarget(name, width: sz.w, height: sz.h, format: fmtFor(name))
         }
         // "previous" = 特效的**输入图**(恒定;如 godrays/bloom apply 要把光束/辉光叠回原图),不是滚动的上一 pass 输出。
         var named: [String: MTLTexture] = ["previous": input]
         // 跨帧累积预填(motionblur 等):named 每次 run() 重置,但持久(unique)FBO 的内容已留在跨帧
-        // 存活的 rtPool 里。把本 effect 各 pass 的命名 target 从 rtPool 预填进 named(尺寸用上面解析的
-        // 一致尺寸键),让首 pass 读到上一帧累积。仅预填已存在(跑过≥1帧)的;首帧没有 → pass0 的历史槽退白,1~2 帧收敛。
+        // 存活的 rtPool 里。把本 effect 各 pass 的命名 target 从 rtPool 预填进 named(尺寸/格式用上面解析的
+        // 一致键),让首 pass 读到上一帧累积。仅预填已存在(跑过≥1帧)的;首帧没有 → pass0 的历史槽退白,1~2 帧收敛。
         for (tname, sz) in nameSize {
-            let key = "\(tname)@\(sz.w)x\(sz.h)"
-            if let t = rtPool[key] { named[tname] = t }
+            if let t = rtPool[rtKey(tname, sz, fmtFor(tname))] { named[tname] = t }
         }
         var lastOut: MTLTexture = input
 
@@ -826,7 +895,7 @@ final class WEEffectChain {
             if p.command != nil || p.copy == true {
                 if (p.command == "copy" || p.copy == true),
                    let srcName = p.source, let dstName = p.target, let src = named[srcName],
-                   let dst = renderTarget(dstName, width: src.width, height: src.height),
+                   let dst = renderTarget(dstName, width: src.width, height: src.height, format: src.pixelFormat),
                    let blit = cmd.makeBlitCommandEncoder() {
                     blit.copy(from: src, sourceSlice: 0, sourceLevel: 0,
                               sourceOrigin: MTLOrigin(x: 0, y: 0, z: 0),
@@ -851,26 +920,37 @@ final class WEEffectChain {
                     // 尺寸推断,避免源退成全分辨率与对端(半分辨率)错配。两端都缺则退输入全分辨率。
                     let bSz = nameSize[bName] ?? nameSize[aName] ?? (w, h)
                     let aSz = nameSize[aName] ?? bSz
-                    if let aTex = named[aName] ?? renderTarget(aName, width: aSz.w, height: aSz.h),
-                       let bTex = named[bName] ?? renderTarget(bName, width: bSz.w, height: bSz.h) {
+                    // R5:乒乓两端格式相同(WE 同名定义);swap 源若只作 swap、不作渲染 target(不在 nameFormat)
+                    // 则用对端格式推断,确保浮点速度/压力场不退成 bgra8。
+                    let bFmt = nameFormat[bName] ?? nameFormat[aName] ?? .bgra8Unorm
+                    let aFmt = nameFormat[aName] ?? bFmt
+                    if let aTex = named[aName] ?? renderTarget(aName, width: aSz.w, height: aSz.h, format: aFmt),
+                       let bTex = named[bName] ?? renderTarget(bName, width: bSz.w, height: bSz.h, format: bFmt) {
                         // named 引用对调(同 run 内后续 pass 取到对调后的块)。
                         named[aName] = bTex
                         named[bName] = aTex
-                        // 持久 rtPool 引用对调(用与 renderTarget 完全一致的尺寸键,保证跨帧预填命中)。
-                        rtPool["\(aName)@\(aSz.w)x\(aSz.h)"] = bTex
-                        rtPool["\(bName)@\(bSz.w)x\(bSz.h)"] = aTex
+                        // 持久 rtPool 引用对调(用与 renderTarget 完全一致的尺寸/格式键,保证跨帧预填命中)。
+                        rtPool[rtKey(aName, aSz, aFmt)] = bTex
+                        rtPool[rtKey(bName, bSz, bFmt)] = aTex
                     }
                 }
                 continue
             }
-            guard let ps = pipeline(p), let vstage = p.vert, let fstage = p.frag else { continue }
+            // R5:管线 colorAttachment 格式必须匹配目标 FBO 格式(浮点目标用浮点管线)。无 target 的最终输出
+            // 恒 bgra8。targetForName/makeTarget 已按格式分配,这里把同一格式喂给 pipeline。
+            let outFmt: MTLPixelFormat = (p.target != nil) ? fmtFor(p.target!) : .bgra8Unorm
+            guard let ps = pipeline(p, colorFormat: outFmt), let vstage = p.vert, let fstage = p.frag else { continue }
             // 有 target → 命名 FBO(按**本 run 内一致**的尺寸键复用,审计修复 #3:用 targetForName 取该名
             // 首次出现时解析的尺寸,而非每 pass 重算 scale,避免同名 FBO 在不同 scale 间取错块、断反馈链);
             // 无 target(最终输出)→ 每次新建,避免多图层共享被覆盖。
             let out: MTLTexture
+            // R5:unique 累积缓冲若已在 rtPool(跑过≥1帧,本 run 预填进 named)→ loadAction=.load 保留上一帧累积,
+            // 不 clear(motionblur 的 _rt_FullCompoBuffer / fluidsim 速度·压力·dye 场跨帧累积)。首帧未初始化 → 仍 clear。
+            var loadAction: MTLLoadAction = .clear
             if let target = p.target {
                 guard let t = targetForName(target) else { continue }
                 out = t
+                if nameUnique.contains(target), named[target] != nil { loadAction = .load }
             } else {
                 guard let t = makeTarget(width: w, height: h) else { continue }   // 最终输出恒全分辨率
                 out = t
@@ -878,7 +958,7 @@ final class WEEffectChain {
 
             let pass = MTLRenderPassDescriptor()
             pass.colorAttachments[0].texture = out
-            pass.colorAttachments[0].loadAction = .clear
+            pass.colorAttachments[0].loadAction = loadAction
             pass.colorAttachments[0].storeAction = .store
             pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)
             guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { continue }
@@ -931,6 +1011,21 @@ final class WEEffectChain {
                     // WE 渲染目标(如 frame_builder 的 g_Texture3 = backgroundTexture 默认 _rt_FullFrameBuffer
                     // = 整帧合成缓冲)。喂引擎合成好的「该层之下场景」底图(屏幕UV采样),否则退白 → 边框外全白。
                     tex = fb
+                }
+                else if s.name == "g_Texture2", comboInts["RENDERING"] == 1,
+                        ProcessInfo.processInfo.environment["WP_NO_LIGHTSHAFT_COLOR"] == nil,
+                        !p.bind.contains(where: { "g_Texture\($0.index)" == s.name }),
+                        let ceStr = params["colorend"] as? String {
+                    // ⭐lightshafts RENDERING=1(gradient 模式)颜色取自 g_Texture2 渐变图。真 WE 编辑器把作者设的
+                    //   colorastart→colorend **烘进**这张渐变图;lwe(及我们)却绑死静态 `gradient_iridescent`(彩虹)
+                    //   → 丢了 pkg 的 colorastart"1 1 1"→colorend(凯尔希"0.435 0.886 1"=青)→ 光束渲成彩虹紫青而非白→青。
+                    //   仅当作者**显式设了 colorend**(params 含)时,合成 colorastart→colorend 的 1D 渐变图喂 g_Texture2
+                    //   (作用域:g_Texture2 + RENDERING=1 + 无自定义绑定 → 不影响其他特效/未自定义颜色的 lightshafts)。
+                    //   WP_NO_LIGHTSHAFT_COLOR=1 退回静态彩虹图(A/B)。
+                    let cs = Self.parseFloats((params["colorastart"] as? String) ?? "1 1 1")
+                    let ce = Self.parseFloats(ceStr)
+                    tex = lightshaftRamp(start: cs, end: ce) ?? whiteTex
+                    flags = nil
                 }
                 else if let def = p.uniformMeta[s.name]?.default?.value as? String, def.contains("/") {
                     // 采样器默认贴图:WE 内置 ref(util/noise|white|black、particle/halo_6 等)。

@@ -60,6 +60,11 @@ final class PreferencesStore {
         get { d.bool(forKey: "sortDescending") }
         set { d.set(newValue, forKey: "sortDescending") }
     }
+    /// 壁纸库网格缩略图大小:small/medium/large(默认 medium)。
+    var gridSizeRaw: String {
+        get { d.string(forKey: "gridSize") ?? "medium" }
+        set { d.set(newValue, forKey: "gridSize") }
+    }
 
     /// 上一次下载的平均速度(MB/s)。steamcmd 不汇报实时进度,用历史速度估算进度条。默认 6。
     var lastDownloadSpeedMBps: Double {
@@ -114,11 +119,13 @@ final class PreferencesStore {
         set { d.set(newValue, forKey: "fxaaEnabled") }
     }
     /// 壁纸缩放模式(屏幕长宽比 ≠ 壁纸时):0=cover 填满+裁切(WE 默认)、1=fit 适应+黑边(全可见有黑边)、
-    /// 2=stretch 拉伸填满(全屏无黑边全可见,但画面被拉伸变形)。默认 0。
+    /// 2=stretch 拉伸填满(全屏无黑边全可见,但画面被拉伸变形)、3=自适应(比例差大如 16:9→cover 零变形裁空边;
+    /// 比例接近屏幕<6%→拉伸填满、形变可忽略;追求人物比例永远正常、无黑边)。默认 0。
     var wallpaperScaleMode: Int {
         get {
             if ProcessInfo.processInfo.environment["WP_FIT"] == "1" { return 1 }
             if ProcessInfo.processInfo.environment["WP_STRETCH"] == "1" { return 2 }
+            if ProcessInfo.processInfo.environment["WP_BALANCED"] == "1" { return 3 }
             return d.integer(forKey: "wallpaperScaleMode")
         }
         set { d.set(newValue, forKey: "wallpaperScaleMode") }

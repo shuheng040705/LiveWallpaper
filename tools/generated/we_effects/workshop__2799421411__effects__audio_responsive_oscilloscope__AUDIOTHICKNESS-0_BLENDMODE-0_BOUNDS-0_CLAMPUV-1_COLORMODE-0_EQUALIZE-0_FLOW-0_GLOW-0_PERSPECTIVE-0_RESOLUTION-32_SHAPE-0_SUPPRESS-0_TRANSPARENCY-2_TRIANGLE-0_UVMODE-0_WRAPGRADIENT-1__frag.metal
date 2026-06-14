@@ -124,7 +124,7 @@ fragment main0_out main0(main0_in in [[stage_in]], constant _Globals& _46 [[buff
         for (int ai = 0; ai < 32; ai++)
         {
             float amplitude = (_46.g_AudioSpectrum32Left[ai].x * 0.5) + (_46.g_AudioSpectrum32Right[ai].x * 0.5);
-            audioData[ai] = powr(amplitude + amplitude, _46.u_ampExponent + 0.001000000047497451305389404296875);
+            audioData[ai] = powr(fast::max(0.0, amplitude + amplitude), _46.u_ampExponent + 0.001000000047497451305389404296875);
         }
         for (int ai = 0; ai < 32; ai += 4)
         {
@@ -149,7 +149,7 @@ fragment main0_out main0(main0_in in [[stage_in]], constant _Globals& _46 [[buff
             float f = float(i);
             float amp = audioValue[i >> 2][i & 3];
             float flow = _46.u_flowSpeed * amp;
-            float frequencyFactor = exp((f * _46.u_freqExponent) / 6.400000095367431640625);
+            float frequencyFactor = exp((f * _46.u_freqExponent) / 32.0);
             float waveY = sin((((X + f) + flow) * frequencyFactor) * scope);
             avgAmplitude += amp;
             value += (waveY * amp);

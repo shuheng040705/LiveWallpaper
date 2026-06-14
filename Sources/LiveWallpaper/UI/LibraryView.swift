@@ -54,7 +54,19 @@ struct LibraryView: View {
         }
     }
 
-    private let columns = [GridItem(.adaptive(minimum: 230, maximum: 320), spacing: 18)]
+    /// 网格缩略图大小(小/中/大),改变 adaptive 列的最小宽度 → 每行卡片数与卡片尺寸。
+    enum GridSize: String, CaseIterable {
+        case small, medium, large
+        var title: String { switch self { case .small: return "小"; case .medium: return "中"; case .large: return "大" } }
+        var icon: String { switch self { case .small: return "square.grid.3x3"; case .medium: return "square.grid.2x2"; case .large: return "square" } }
+        /// adaptive 列 (最小宽, 最大宽)。小→更密更小、大→更稀更大。
+        var range: (min: CGFloat, max: CGFloat) { switch self { case .small: return (165, 220); case .medium: return (230, 320); case .large: return (320, 440) } }
+    }
+    @State private var gridSize = GridSize(rawValue: PreferencesStore.shared.gridSizeRaw) ?? .medium
+    private var columns: [GridItem] {
+        let r = gridSize.range
+        return [GridItem(.adaptive(minimum: r.min, maximum: r.max), spacing: 18)]
+    }
 
     /// 排序方式。
     enum SortKey: String, CaseIterable {
@@ -349,6 +361,7 @@ struct LibraryView: View {
                     }
                     Spacer()
                     if section != .settings {
+                        gridSizeControl
                         sortControl
                         searchField
                     }
@@ -469,6 +482,29 @@ struct LibraryView: View {
             .buttonStyle(.plain)
             .help(sortDesc ? "降序" : "升序")
         }
+    }
+
+    /// 网格大小切换:小/中/大三段(改 adaptive 列最小宽 → 卡片尺寸)。持久化到 PreferencesStore。
+    private var gridSizeControl: some View {
+        HStack(spacing: 2) {
+            ForEach(GridSize.allCases, id: \.self) { sz in
+                let on = gridSize == sz
+                Button {
+                    withAnimation(.easeOut(duration: 0.18)) { gridSize = sz }
+                    PreferencesStore.shared.gridSizeRaw = sz.rawValue
+                } label: {
+                    Image(systemName: sz.icon)
+                        .font(.system(size: 12, weight: on ? .semibold : .regular))
+                        .frame(width: 28, height: 24)
+                        .foregroundStyle(on ? AnyShapeStyle(LinearGradient(colors: [.pink, .purple], startPoint: .top, endPoint: .bottom)) : AnyShapeStyle(Color.secondary))
+                        .background(RoundedRectangle(cornerRadius: 6).fill(on ? Color.pink.opacity(0.14) : .clear))
+                }
+                .buttonStyle(.plain)
+                .help("\(sz.title)图标")
+            }
+        }
+        .padding(2)
+        .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.6)))
     }
 
     private var searchField: some View {

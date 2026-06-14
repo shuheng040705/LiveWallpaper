@@ -220,6 +220,13 @@ struct LayerDesc {
     //   引擎把这些层留到 postChain 跑完后再叠到已后处理画面上(时钟/日期文本保持亮白,不被 darkambient tint 压暗)。
     var abovePost: Bool = false
     var regionFit: Bool = false      // 区域性 composelayer(非 pulse):特效在该层 region [0,1] 空间跑(裁场景+遮罩到 region)。pulse/打雷=false(走全屏画布 UV,不动)。
+    // 自绘满画布特效层(shape="quad" + image=nil + DIRECTDRAW 自绘特效,如 lightshafts 阳光/光束):
+    //   WE 真义 = 该 effect 是 group="colorize" 的全屏后处理,DIRECTDRAW=1 时 frag `albedo=CAST4(0)` 忽略
+    //   g_Texture0,自绘光束到透明全屏 quad 上(`albedo.a=max(a, fx)`),光束足迹由 shader 的 point0..3 透视
+    //   UV(EffectPerspectiveUV gizmo)决定、不靠 quad 尺寸/对象 origin。故建成**满画布透明底 + additive 合成**层
+    //   (effectedTexture 自带逐像素 alpha=光束强度,合成保留 alpha、不乘对象色)。lwe 把 shape 当 VolumeLight
+    //   直接报错丢弃(ObjectParser.cpp:78),此为补真 WE 行为。WP_NO_LIGHTSHAFTS=1 退回旧跳过(A/B)。
+    var selfDrawFullscreen: Bool = false
     var autosize: Bool = false       // model.json "autosize":尺寸取纹理像素(无显式 size 时)
     var noPadding: Bool = false      // model.json "nopadding"
     var modelWidth: Int? = nil       // model.json "width"(可选)
@@ -760,7 +767,7 @@ struct SceneDocument {
                 // pulse/blurprecise 等特效被静默丢弃(违反"不漏用任何 pkg 数据")。与图像层一致解析进 effects
                 // 链(SceneRenderEngine 的统一图层循环会据此建 mask/aux/特效链并跑 WEEffectChain;文本纹理每秒
                 // 刷新、effectedTexture 每帧重算)。effectVisible 仍过滤引用未定义属性/条件不命中的特效。
-                tl.effects = Self.parseEffects(obj["effects"], keepWENamed: true)
+                tl.effects = Self.parseEffects(obj["effects"], keepWENamed: true, source: source)
                 tl.effectPassOverrides = Self.parseEffectPassOverridesPerEffect(obj["effects"])
                 tl.sceneObjIndex = sceneObjIndex
                 layers.append(tl); continue
@@ -774,7 +781,51 @@ struct SceneDocument {
                 continue
             }
             if obj["image"] == nil, obj["shape"] != nil {
-                Log.write("scene: shape/VolumeLight object not supported (id=\((obj["id"] as? NSNumber)?.intValue ?? -1), name=\(obj["name"] as? String ?? ""))")
+                let sid = (obj["id"] as? NSNumber)?.intValue ?? -1
+                let sname = obj["name"] as? String ?? ""
+                // ⭐自绘满画布特效 shape quad(如 lightshafts 阳光/光束):shape="quad" 且无 image,但挂一个
+                //   **DIRECTDRAW 自绘后处理特效**(group="colorize" 的 lightshafts,combo DIRECTDRAW=1 时 frag
+                //   `albedo=CAST4(0)` 忽略基底、把光束自绘到透明全屏 quad)。旧码无条件当 VolumeLight 丢 → 凯尔希
+                //   ×Mon3tr(3462491575)龙上方阳光缺失。误分类修正:这种带自绘特效的 shape quad 应建成满画布
+                //   透明底 + additive 合成的特效承载层(光束足迹由 shader 的 point0..3 透视 UV 决定,不靠 quad 尺寸)。
+                //   只在对象**可见**(effectiveVisible:自身 + 父链 visible,默认开)且 WP_NO_LIGHTSHAFTS 未设时建。
+                let shapeVisible = sid >= 0 ? effectiveVisible(sid) : Self.parseVisible(obj["visible"])
+                let shapeFx = Self.parseEffects(obj["effects"], keepWENamed: true, source: source)
+                let hasSelfDraw = ProcessInfo.processInfo.environment["WP_NO_LIGHTSHAFTS"] == nil
+                    && shapeFx.contains { $0.weCombos["DIRECTDRAW"] == "1" }
+                if shapeVisible, hasSelfDraw {
+                    // ⭐**严格按 pkg**(不再猜):shape:"quad" 无 size 字段 → 用**画布尺寸**(=WE 无 size 时
+                    //   fullscreen-model 的忠实回退,CImage.cpp:233-235;全库 17 个 shape quad 全无 size=普遍形式);
+                    //   origin 用**对象的绝对 origin**(2094,2406,含父链),不再用画布中心;angles 用绝对 z 弧度
+                    //   (1.05964≈60.7°)。lightshafts.vert `gl_Position=MVP·a_Position`:MVP(origin/size/angles)
+                    //   把光束 UV[0,1] 盒子映射到屏幕这个 quad 足迹上 → 光束足迹 = 该 quad。之前**猜的 size×1.5+居中**
+                    //   把整片光束盒子拉成 1.5× 全屏 = 用户指出「光占满屏」的直接原因;改回 ×1.0 + 真实 origin →
+                    //   光束限制在画布尺寸的旋转 quad 足迹内、锚在头顶附近。15 个 constantshadervalues 已全部忠实喂入。
+                    let lsAngle = sid >= 0 ? absoluteAngle(sid) : VecParse.f3(obj["angles"]).z
+                    let lsOrigin = sid >= 0 ? absoluteOrigin(sid) : VecParse.f3(obj["origin"])
+                    var ls = LayerDesc(
+                        id: sid,
+                        name: sname,
+                        originPx: SIMD3(lsOrigin.x, lsOrigin.y, 0),
+                        sizePx: SIMD2(canvas.x, canvas.y),
+                        scale: SIMD3(1, 1, 1),
+                        anglesDeg: SIMD3(0, 0, lsAngle),
+                        parallax: SIMD2(0, 0),
+                        visible: shapeVisible,
+                        texturePath: nil,
+                        color: SIMD4(1, 1, 1, 1),
+                        blend: .additive,        // DIRECTDRAW 光束:加性合成(shader 已写 alpha=光束强度)
+                        isSolid: false,
+                        effects: shapeFx
+                    )
+                    ls.effectPassOverrides = Self.parseEffectPassOverridesPerEffect(obj["effects"])
+                    ls.selfDrawFullscreen = true
+                    ls.sceneObjIndex = sceneObjIndex
+                    layers.append(ls)
+                    Log.write("scene: lightshafts self-draw quad built (id=\(sid), name=\(sname), fx=\(shapeFx.map { $0.weName }))")
+                    continue
+                }
+                Log.write("scene: shape/VolumeLight object not supported (id=\(sid), name=\(sname))")
                 continue
             }
             guard let imageRef = obj["image"] as? String else { continue }  // 只取 image 图层
@@ -789,7 +840,7 @@ struct SceneDocument {
                 //   只活**最后一个**,前面的(玻璃水珠雨 raindrop_on_glass + 调色 tint)全被丢 → "雨的特效没了"。
                 //   按场景顺序 append,保留全部后处理链的正确先后。单后处理层壁纸 `+=` 等价于 `=`,零影响。
                 if Self.parseVisible(obj["visible"]) {
-                    let added = Self.parseEffects(obj["effects"], keepWENamed: true)
+                    let added = Self.parseEffects(obj["effects"], keepWENamed: true, source: source)
                     if !added.isEmpty {
                         postChain += added
                         // 此刻 layers.count = 该后处理层之下(渲染序在前)的图层数 → 其上的图层从此下标起。
@@ -843,7 +894,7 @@ struct SceneDocument {
                 if var barsLayer = Self.makeAudioBarsLayer(obj, bars: bars, id: (obj["id"] as? NSNumber)?.intValue ?? -1,
                                                            effectiveVisible: effectiveVisible,
                                                            absoluteOrigin: absoluteOrigin,
-                                                           absoluteScale: absoluteScale) {
+                                                           absoluteScale: absoluteScale, source: source) {
                     barsLayer.sceneObjIndex = sceneObjIndex
                     layers.append(barsLayer)
                 }
@@ -873,8 +924,19 @@ struct SceneDocument {
             // 画一遍**。实例化未实现时,直接当 solid 渲染模板会按其占位 transform 画出一整块(本例 color=「0 0 0」、
             // size 256×256 × scale 16.4×10.66 = 4199×2729 的纯黑块)盖在最上层 → 黑死整个场景。故跳过该模板。
             if (modelJSON?["instanced"] as? NSNumber)?.boolValue == true {
-                Log.write("scene: skip instanced placeholder layer (id=\((obj["id"] as? NSNumber)?.intValue ?? -1), name=\(obj["name"] as? String ?? ""))")
-                continue
+                // ⭐**例外:带 alpha 关键帧的 instanced 占位 = 开场淡出层**(2026-06-14,修「开场动画一直不渲染」):
+                //   如 3147346398 id=535「Solid Placeholder」,alpha 关键帧 frame0=1→末帧=0(黑层淡出露出场景)。
+                //   旧码无条件跳过(为绕开「永久黑块盖死场景」)——但那黑块的真因是 **alpha 关键帧没动画**(=刚修的
+                //   hasKeyframeAnim:纯关键帧场景被当静态→只画 t=0 黑帧)。alpha 能动画后,这种占位应**渲染+淡出**
+                //   (t=0 黑→淡到透明露出场景,末了 alpha=0 不可见、无残留黑块)= 正确开场动画。仅**无 alpha 关键帧**
+                //   的纯静态占位模板才跳过(防满屏黑)。WP_NO_INSTANCED_INTRO=1 退回全部跳过(A/B)。
+                let hasAlphaKeyframe = (obj["alpha"] as? [String: Any])?["animation"] != nil
+                    && ProcessInfo.processInfo.environment["WP_NO_INSTANCED_INTRO"] == nil
+                if !hasAlphaKeyframe {
+                    Log.write("scene: skip instanced placeholder layer (id=\((obj["id"] as? NSNumber)?.intValue ?? -1), name=\(obj["name"] as? String ?? ""))")
+                    continue
+                }
+                Log.write("scene: instanced 占位含 alpha 关键帧(开场淡出)→ 渲染+动画(不跳过,id=\((obj["id"] as? NSNumber)?.intValue ?? -1))")
             }
             var mdlSolid = false, mdlFullscreen = false, mdlPassthrough = false, mdlAutosize = false, mdlNoPadding = false
             var mdlWidth: Int? = nil, mdlHeight: Int? = nil, mdlPuppet: String? = nil
@@ -1024,7 +1086,7 @@ struct SceneDocument {
 
             // keepWENamed:保留所有有 weName 的真 WE 转译特效(godrays/iris/shimmer/swing/blur/
             // twirl 等没有旧 kind 映射的也照样跑真 shader),不再被 kind==.none 门丢掉。
-            let effects = Self.parseEffects(obj["effects"], keepWENamed: true)
+            let effects = Self.parseEffects(obj["effects"], keepWENamed: true, source: source)
             // effect pass override(ObjectParser.cpp:381-394):与 effects 一一对应(保序、含被滤掉的位置→空)。
             let passOverrides = Self.parseEffectPassOverridesPerEffect(obj["effects"])
             // animationlayers(puppet warp,ObjectParser.cpp:439-463):rate/visible/blend/animation,解析存下。
@@ -1412,7 +1474,9 @@ struct SceneDocument {
             var status = "未渲染", reason = ""
             if layerIds.contains(id) {
                 status = "已渲染"
-                reason = (obj["text"] != nil) ? "文本层" : (image.contains("solidlayer") || mdlSolid ? "纯色/音频条层" : "图层")
+                reason = (obj["text"] != nil) ? "文本层"
+                    : (image.isEmpty && obj["shape"] != nil ? "自绘满画布特效层(DIRECTDRAW 光束/lightshafts,additive 合成)"
+                    : (image.contains("solidlayer") || mdlSolid ? "纯色/音频条层" : "图层"))
             } else if projIds.contains(id) {
                 status = "已渲染"; reason = "projectlayer 组合层(FBO 链)"
             } else if soundIds.contains(id) {
@@ -1577,7 +1641,7 @@ struct SceneDocument {
         pl.sizePx = size.count >= 2 ? SIMD2(size[0], size[1]) : nil
         pl.visible = Self.parseVisible(obj["visible"])
         // 转译特效链(若该层有真 shader 内容);与普通层一致用 keepWENamed。
-        pl.effects = Self.parseEffects(obj["effects"], keepWENamed: true)
+        pl.effects = Self.parseEffects(obj["effects"], keepWENamed: true, source: source)
         // 读各 effect 的 effect.json,抽 fbos[] + passes 的 command/source/target/bind(EffectParser.cpp:47-114)。
         guard let effects = obj["effects"] as? [[String: Any]] else { return pl }
         for e in effects {
@@ -1700,7 +1764,9 @@ struct SceneDocument {
     /// 含义随类型(见 SceneRenderEngine 的 effect shader)。原始 GLSL 参数名见各 .frag。
     /// keepWENamed=true 时不丢弃 kind==.none 但有真 WE effect(weName 非空)的 effect
     /// —— 供后处理链(bloom/filmgrain/localcontrast 这类纯 WE 转译特效)解析。
-    static func parseEffects(_ raw: Any?, keepWENamed: Bool = false) -> [LayerEffect] {
+    /// source(缺陷 3):传进后 resolveMask 能走多级 fallback(materials/<ref>.tex / <ref>.tex / 内置),
+    /// 解开遮罩 .tex 不在 materials/<base>.tex 时被静默丢弃的 bug。为 nil 时退回旧单级解析(无 source 调用点)。
+    static func parseEffects(_ raw: Any?, keepWENamed: Bool = false, source: SceneSource? = nil) -> [LayerEffect] {
         guard let arr = raw as? [[String: Any]] else { return [] }
         var out: [LayerEffect] = []
         for e in arr {
@@ -1761,20 +1827,46 @@ struct SceneDocument {
             var maskPath: String? = nil   // opacitymask 贴图(pkg 内路径)
             // **opacitymask 槽按 manifest 的 g_Texture<N> combo=="MASK" 判定(转译已捕获),不靠贴图名**。
             //   旧逻辑靠名含 "mask" → 漏掉叫「影子」等的遮罩(opacity 效果)→ MASK combo 没设 → 大方框/不裁形状。
-            let maskSlots = Self.weMaskSlots[weName] ?? []
+            // 缺陷 2:weName 是去前后缀相对路径,直查 weMaskSlots[weName] 对 workshop 副本(带前缀完整 key)
+            //   会 miss → 走 basename 回退(同名=同副本 shader 同 → mask slot 声明一致)。
+            let maskSlots = Self.weMaskSlotsFor(weName)
+            // 缺陷 1(slot-occupancy):某 slot 在 manifest 声明了任意 combo(MASK/OPACITYMASK/…)→ scene pass
+            //   给该 slot 绑非空贴图时,镜像 lwe ShaderUnit.cpp:531-619 自动启用该 combo(textureSlotUsed→1)。
+            //   收集本 effect 实际被绑了非空贴图的 slot 的 combo 名,稍后据此置位 weCombos(不覆盖 pkg 显式 combo)。
+            let slotCombos = Self.weSlotCombosFor(weName)
+            var occupancyCombos = Set<String>()   // 据被占用 slot 派生的 combo 名
             // 辅助贴图(含 opacitymask)可绑在**任意一个 pass** 的 textures[] 上,不只首 pass。
             //   典型:blur 的 Fade 遮罩(blur_combine_mask)绑在第 4 个 pass(blur_combine,combo=MASK)的
             //   textures[1],而首 pass(downsample)无 textures → 旧逻辑只读 passes.first 永远找不到遮罩,
             //   MASK combo 不置位 → 走 MASK-0 变体(mask 恒=1)→ 整层均匀模糊(漏掉「中间清晰、两边模糊」的
             //   边缘渐变 Fade)。改:遍历所有 pass 收集 textures[](先出现的 slot 优先,与 WE 逐 pass 绑定等价——
             //   每个 g_TextureN 槽只被声明它的那个 pass 用,跨 pass 无歧义)。
+            let env = ProcessInfo.processInfo.environment
+            let noSlotOcc = env["WP_NO_MASK_SLOT_OCCUPANCY"] != nil
+            let noSourceResolve = env["WP_NO_MASK_SOURCE_RESOLVE"] != nil   // 缺陷 3 A/B 退回(resolveMask 不传 source)
             for ps in passes {
                 guard let texs = ps["textures"] as? [Any] else { continue }
                 for (idx, t) in texs.enumerated() where idx >= 1 {
                     guard let s = VecParse.unwrap(t) as? String, !s.isEmpty else { continue }
                     if weAux[idx] == nil { weAux[idx] = s }
-                    if maskPath == nil, maskSlots.contains(idx) || s.lowercased().contains("mask") {
-                        maskPath = Self.resolveMask(s)
+                    // 缺陷 1:slot 被绑了非空贴图 → 启用该 slot manifest 声明的 combo(lwe slot-occupancy)。
+                    if !noSlotOcc, let combo = slotCombos[idx] { occupancyCombos.insert(combo) }
+                    // 缺陷 3:传 source 让 resolveMask 走多级 fallback(否则只找 materials/<base>.tex → 遮罩静默丢)。
+                    // maskSlots / occupancy(MASK)命中 MASK 槽,或贴图名含 mask(兜底)→ 视作遮罩贴图。
+                    let isMaskSlot = maskSlots.contains(idx) || (!noSlotOcc && slotCombos[idx] == "MASK")
+                    if maskPath == nil, isMaskSlot || s.lowercased().contains("mask") {
+                        maskPath = Self.resolveMask(s, source: noSourceResolve ? nil : source)
+                        // 缺陷 3 诊断:source-on(实际)vs source-off(旧)解析路径不同 → 旧路径会丢遮罩。
+                        if env["WP_MASK_DIAG"] != nil {
+                            let withSrc = Self.resolveMask(s, source: source)
+                            let noSrc = Self.resolveMask(s, source: nil)
+                            if withSrc != noSrc {
+                                let okSrc = source?.data(for: withSrc) != nil
+                                let okNo = source?.data(for: noSrc) != nil
+                                Log.write("MASKDIAG-D3 fx=\(weName) ref=\(s) withSource=\(withSrc)(exists=\(okSrc)) "
+                                    + "oldNoSource=\(noSrc)(exists=\(okNo))")
+                            }
+                        }
                     }
                 }
             }
@@ -1815,10 +1907,29 @@ struct SceneDocument {
                 guard let cb = ps["combos"] as? [String: Any] else { continue }
                 for (k, v) in cb { if let n = v as? NSNumber { weCombos[k] = "\(n.intValue)" } else { weCombos[k] = "\(v)" } }
             }
+            let pkgMaskExplicit = weCombos["MASK"]   // pkg 显式 MASK combo(在 occupancy/缺陷5 置位**之前**取,缺陷5诊断用)
+            // 缺陷 1:slot-occupancy 派生的 combo(被绑非空贴图的 slot 声明的 combo)置 1。
+            //   镜像 lwe 合并顺序(ShaderUnit.cpp:668-690)——m_combos(pkg 显式 combo)先 #define、
+            //   m_discoveredCombos(slot-occupancy)仅在未定义时补:**pkg 显式 combo 优先**,不覆盖。
+            //   覆盖 MASK 以外的遮罩类(OPACITYMASK)及其它 slot 声明 combo(NORMALMAP/PBRMASKS…)。
+            for combo in occupancyCombos where weCombos[combo] == nil { weCombos[combo] = "1" }
             // 遮罩是隐式 combo:分配了含 "mask" 的辅助槽 → MASK=1(让 shader 走 #if MASK 分支采样
             // opacitymask 限定白区)。对没有 MASK combo 的 effect(如 waterflow,其 g_Texture1 是 flowmask)
             // 此 combo 无对应变体,selectVariant 自动回退 base,无害;真正的 localization 由 weAux 字面绑定提供。
-            if maskPath != nil { weCombos["MASK"] = "1" }
+            // 缺陷 5:仅在 pkg **未显式**给 MASK combo 时才置位(对齐 lwe ShaderUnit.cpp:597 / 合并顺序:
+            //   m_combos 先于 m_discoveredCombos)。pkg 显式 MASK:0(作者关闭遮罩)必须保留,不能被无条件 1 覆盖。
+            //   WP_NO_MASK_EXPLICIT_RESPECT=1 退回旧无条件置 1(A/B)。
+            let respectExplicit = env["WP_NO_MASK_EXPLICIT_RESPECT"] == nil
+            if maskPath != nil, !respectExplicit || weCombos["MASK"] == nil { weCombos["MASK"] = "1" }
+            // 诊断(WP_MASK_DIAG=1):逐项报告每个缺陷的修复是否实际改变了本 effect 的结果。
+            if env["WP_MASK_DIAG"] != nil {
+                let directMask = weMaskSlots[weName] != nil
+                let viaBasename = !directMask && !weMaskSlotsFor(weName).isEmpty
+                if !occupancyCombos.isEmpty || maskPath != nil || viaBasename || (pkgMaskExplicit == "0") {
+                    Log.write("MASKDIAG fx=\(weName) maskPath=\(maskPath ?? "nil") occCombos=\(occupancyCombos.sorted()) "
+                        + "viaBasename=\(viaBasename) pkgMASK=\(pkgMaskExplicit ?? "nil") finalMASK=\(weCombos["MASK"] ?? "nil")")
+                }
+            }
             var le = LayerEffect(kind: kind, p: p, maskPath: maskPath,
                                  weName: weName, weParams: weParams,
                                  weParamsPerPass: weParamsPerPass, weCombos: weCombos,
@@ -1896,7 +2007,8 @@ struct SceneDocument {
     private static func makeAudioBarsLayer(_ obj: [String: Any], bars: AudioBarsDesc, id objId: Int,
                                            effectiveVisible: (Int) -> Bool,
                                            absoluteOrigin: (Int) -> SIMD3<Float>,
-                                           absoluteScale: (Int) -> SIMD3<Float>) -> LayerDesc? {
+                                           absoluteScale: (Int) -> SIMD3<Float>,
+                                           source: SceneSource? = nil) -> LayerDesc? {
         let visible = objId >= 0 ? effectiveVisible(objId) : Self.parseVisible(obj["visible"])
         guard visible else { return nil }
         let size = VecParse.floats(obj["size"])
@@ -1908,7 +2020,7 @@ struct SceneDocument {
         // ANTIALIAS/CLIP_*)把条画到透明底图上;perspective(单应变换)用 4 角 point0-3 把条贴到场景梯形
         // (地板/水面)。两者均已转译进 manifest。keepWENamed=true 保留这些 kind==.none 的真 WE 特效
         // (否则被 `kind != .none` 门滤掉),且**保序**(Simple_Audio_Bars 先画、perspective 后扭)。
-        let fx = SceneDocument.parseEffects(obj["effects"], keepWENamed: true)
+        let fx = SceneDocument.parseEffects(obj["effects"], keepWENamed: true, source: source)
         return LayerDesc(
             id: objId,
             name: obj["name"] as? String ?? "AudioBars",
@@ -1997,6 +2109,79 @@ struct SceneDocument {
         }
         return [:]
     }()
+
+    /// **缺陷 1(slot-occupancy combo)** & **缺陷 2(basename fallback)** 数据源:
+    /// 每个 effect 的「g_Texture<N> sampler 声明的 combo 名」映射(manifest uniformMeta 里 g_Texture<N>.combo,
+    /// 不限 MASK——含 OPACITYMASK/NORMALMAP/PBRMASKS/… 全部)。镜像 lwe ShaderUnit.cpp:531-619:某 scene pass
+    /// 给某 slot 绑了**非空贴图** → 该 sampler 声明的 combo 自动启用(textureSlotUsed → comboValue=1)。
+    /// 旧引擎只对「贴图名含 mask」或「manifest 已声明该 slot 的 MASK combo」启用 → 遮罩贴图叫 shadow/影子/fade
+    /// 且变体 manifest 没显式声明该 slot MASK combo 时漏判 → MASK-1 变体没选 → shader 硬编码 mask=1 → 整矩形。
+    static let weSlotCombos: [String: [Int: String]] = {
+        let paths = [
+            Bundle.main.resourceURL?.appendingPathComponent("WEEffects.json"),
+            URL(fileURLWithPath: NSString(string: "~/Developer/LiveWallpaper/Tools/generated/WEEffects.json").expandingTildeInPath)
+        ].compactMap { $0 }
+        for p in paths {
+            guard let d = try? Data(contentsOf: p),
+                  let j = try? JSONSerialization.jsonObject(with: d) as? [String: Any] else { continue }
+            var out: [String: [Int: String]] = [:]
+            for (name, val) in j {
+                guard let e = val as? [String: Any], let variants = e["variants"] as? [[String: Any]] else { continue }
+                var slots: [Int: String] = [:]
+                for v in variants {
+                    for pass in (v["passes"] as? [[String: Any]] ?? []) {
+                        guard let um = pass["uniformMeta"] as? [String: Any] else { continue }
+                        for (un, meta) in um {
+                            guard un.hasPrefix("g_Texture"), let md = meta as? [String: Any],
+                                  let combo = md["combo"] as? String,
+                                  let n = Int(un.dropFirst("g_Texture".count)) else { continue }
+                            // 同 slot 在不同变体里 combo 名一致(同 sampler 声明);首次记下即可。
+                            if slots[n] == nil { slots[n] = combo }
+                        }
+                    }
+                }
+                if !slots.isEmpty { out[name] = slots }
+            }
+            return out
+        }
+        return [:]
+    }()
+
+    /// **缺陷 2(basename fallback)**:weMaskSlots / weSlotCombos 的 key 是完整 manifest 路径
+    /// (workshop 副本带前缀,甚至双层嵌套);壁纸 effect 的 weName(去前后缀的相对路径)往往不等于该完整 key
+    /// → 直查 weMaskSlots[weName]=nil → 漏掉遮罩。镜像 WEEffectChain.resolvedKey 的 basenameIndex
+    /// (SceneModel.swift basenameIndex 同口径):basename(最后一段)→ 任意已转译同名 key(同名=同副本 shader 同
+    /// → mask slot 声明相同)。供 weMaskSlotsFor / weSlotCombosFor 在 weName 直查失败时回退。
+    static let weSlotComboBasenameIndex: [String: String] = {
+        var idx: [String: String] = [:]
+        for k in weSlotCombos.keys where !k.hasPrefix("material/") {
+            let base = k.components(separatedBy: "/").last ?? k
+            // 平局取最短路径 key(最接近「通用」),与 WEEffectChain.basenameIndex 取向一致。
+            if let cur = idx[base], cur.count <= k.count { continue }
+            idx[base] = k
+        }
+        return idx
+    }()
+
+    /// weName → mask slot 集合(缺陷 2:原 key 优先,失败按 basename 回退到同名副本)。
+    static func weMaskSlotsFor(_ weName: String) -> Set<Int> {
+        if let s = weMaskSlots[weName] { return s }
+        if ProcessInfo.processInfo.environment["WP_NO_MASK_BASENAME"] != nil { return [] }
+        guard weName.contains("/") else { return [] }
+        let base = weName.components(separatedBy: "/").last ?? weName
+        if let k = weSlotComboBasenameIndex[base], let s = weMaskSlots[k] { return s }
+        return []
+    }
+
+    /// weName → {slot: comboName}(缺陷 1/2:slot-occupancy combo 派生;原 key 优先,失败按 basename 回退)。
+    static func weSlotCombosFor(_ weName: String) -> [Int: String] {
+        if let s = weSlotCombos[weName] { return s }
+        if ProcessInfo.processInfo.environment["WP_NO_MASK_BASENAME"] != nil { return [:] }
+        guard weName.contains("/") else { return [:] }
+        let base = weName.components(separatedBy: "/").last ?? weName
+        if let k = weSlotComboBasenameIndex[base], let s = weSlotCombos[k] { return s }
+        return [:]
+    }
 
     /// manifest 里声明了 g_AudioSpectrum* 的 effect 名集合(= 需系统音频频谱的音频可视化 effect)。
     /// 按 manifest **真值**识别音频层,覆盖汉化/全下划线路径(英文文件名匹配会漏,如本库 2846660316 的
@@ -2125,6 +2310,25 @@ struct SceneDocument {
         let isAnchor = isMediaText || (boxSize.map { $0.y < Float(pt) } ?? false)
         text.boxSizePx = isAnchor ? nil : boxSize
         text.useScreenPointSize = isAnchor
+
+        // ── 描边/阴影/字重(R15)── 严格按 pkg(实据见 TextLayerDesc 注释)──────────────
+        // 描边走特效链(textoutline7x7,下方 tl.effects 解析,已支持);粗斜体由字体文件承载(FontRegistry)。
+        // 这里只补两件「数据真存在却此前没渲」的事:
+        //   ① castshadow(WE 真实对象字段,bool):true → 文本投影。pkg 无投影色/偏移/模糊字段 → 用 WE 默认软黑投影
+        //      (色黑、偏移与模糊按渲染字号比例,缩到盒子后比例稳定)。全库恒 false,故零回归;仅未来开了的壁纸生效。
+        //   ② 字体名暗示粗/斜但系统体不粗/不斜时,用 CoreText trait 合成兜底(resolveFont 内施加)——
+        //      不改变已正确加载的粗体字(那些字体本身就粗),只补「取不到带 weight 变体、落了 regular」的退化情形。
+        if VecParse.unwrap(obj["castshadow"]) as? Bool == true {
+            text.castShadow = true
+            text.shadowColor = SIMD3(0, 0, 0)
+            // WE 编辑器文本投影默认是细软黑投影;pkg 不带参数 → 取与渲染字号成比例的小偏移/模糊近似。
+            let rp = Float(renderPt)
+            text.shadowOffsetPx = SIMD2(rp * 0.04, rp * 0.04)
+            text.shadowBlurPx = CGFloat(rp * 0.03)
+        }
+        let fnLower = fontName.lowercased()
+        text.wantsBold = ["-bold", " bold", "_bold", "black", "heavy", "-semibold"].contains { fnLower.contains($0) }
+        text.wantsItalic = ["italic", "oblique"].contains { fnLower.contains($0) }
 
         // 有显式 size:屏上尺寸 = size×scale 盒子(WE 行为),引擎按字形纵横比适配进盒子并按 align 放置
         //   → 这里 sizePx=nil(引擎对 text 层走 boxSizePx 专路,不用 LayerDesc.sizePx 的拉伸贴满)。
