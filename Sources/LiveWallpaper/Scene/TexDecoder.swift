@@ -417,11 +417,18 @@ enum TexDecoder {
                     }
                 }
                 return finish(out, w, h)
-            case 9:        // R8:WE TEX0FORMAT=9 约定 RGBA=(R,R,R,1)——R 广播到 RGB,alpha 恒 1
+            case 9:        // R8:单通道 → RGBA=(R,R,R,**R**)。R 既广播到 RGB、又作 alpha。
+                // ⚠ 旧实现 alpha 恒=255(不透明)→ 粒子辉光/烟雾(fog1 等 R8,R=密度)整张 quad 不透明 →
+                //   渲成硬边黑方块(实测 getsuga 的 red_fire 精灵 fog1:1024² R8 全不透明 × 暗红 = 黑色色块,
+                //   真 WE 是软红烟)。R8 的单通道对粒子=密度/alpha,故 alpha 必须=R 才有软衰减/透明背景。
+                //   遮罩类读 .r 不受影响(.r 仍=R);仅「用 alpha 的」(粒子)从恒不透明→按 R 透明=修复。
+                //   WP_R8_OPAQUE=1 退回旧的 alpha=255。
                 guard raw.count >= w * h else { return nil }
+                let r8Opaque = ProcessInfo.processInfo.environment["WP_R8_OPAQUE"] != nil
                 var out = [UInt8](repeating: 255, count: w * h * 4)
                 for i in 0..<(w * h) {
                     let v = raw[i]; out[i*4] = v; out[i*4+1] = v; out[i*4+2] = v
+                    if !r8Opaque { out[i*4+3] = v }
                 }
                 return finish(out, w, h)
             // --- HDR / 高位深(保守:线性截断到 [0,1] 的 RGBA8,见 HDRFormat 注释)---
