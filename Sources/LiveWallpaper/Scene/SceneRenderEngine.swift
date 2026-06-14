@@ -2293,9 +2293,26 @@ final class SceneRenderEngine {
             let sub = 1.0 / 60.0
             let nSub = max(1, Int((dt / sub).rounded(.up)))
             let sdt = Float(dt / Double(nSub))
+            // ── eventdeath 中继(本轮唯一的 SceneRenderEngine 改动区域,Fix 3)─────────────────────────
+            // 各 sim 互不通信(逐组独立 step)。eventdeath 烟花需把**父**死亡末位置中继给同
+            // eventDeathGroupTag 的 **eventdeath child** sim,后者在该位置 burst(spawnEventDeathBurst)。
+            // particleGroups 保持 document.emitters 顺序(父 desc 先于其 eventdeath child desc,见 ParticleParser),
+            // 故按数组序:步进每组后若是父(tag>=0 且非 child)则 drainDeaths() 入 map;步进每组前若是 child 则
+            // 从 map 取本帧父死亡位置 burst → 零延迟(burst 粒子在本组本帧 step 中即被积分)。tag<0 的普通粒子零开销。
+            var deathMap: [Int: [SIMD2<Float>]] = [:]
             for g in particleGroups {
                 if g.sim.desc.followsCursor { g.sim.cursorOrigin = cursorCanvas }   // 拖尾跟随光标
+                // eventdeath child:先吃下本帧父死亡位置,各 anchor burst 一次(在 step 前,使爆发粒子本帧被积分)。
+                if g.sim.desc.isEventDeath, g.sim.desc.eventDeathGroupTag >= 0,
+                   let anchors = deathMap[g.sim.desc.eventDeathGroupTag] {
+                    for a in anchors { g.sim.spawnEventDeathBurst(at: a) }
+                }
                 for _ in 0..<nSub { g.sim.step(dt: sdt, time: t) }
+                // eventdeath 父:步进后取走本帧死亡末位置,累积给后续同 tag 的 child 组消费。
+                if g.sim.desc.eventDeathGroupTag >= 0, !g.sim.desc.isEventDeath {
+                    let deaths = g.sim.drainDeaths()
+                    if !deaths.isEmpty { deathMap[g.sim.desc.eventDeathGroupTag, default: []].append(contentsOf: deaths) }
+                }
                 // rope/ropetrail:每帧用当前粒子链重建带状网格(三角形列表),走专属管线。
                 // 审计修复#2:写入本帧选用的缓冲套(frameIndex % 3),不再每帧覆写同一块。
                 let ring = frameIndex % Self.kBufferRing

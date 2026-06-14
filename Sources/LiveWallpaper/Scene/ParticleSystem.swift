@@ -66,6 +66,16 @@ struct ParticleEmitterDesc {
     var mapSeqControlPoint = 0, mapSeqCount = 1
     var mapSeqSpeedMin: SIMD3<Float> = .zero, mapSeqSpeedMax: SIMD3<Float> = SIMD3(0, 0, 100)
     var colorMin: SIMD3<Float> = SIMD3(1,1,1), colorMax: SIMD3<Float> = SIMD3(1,1,1)
+    // hsvcolorrandom 初始化器(WE 真特性,lwe 无:穷尽搜 ObjectParser 只有 colorrandom,hsv2rgb 只在脚本 ColorModule)。
+    // spawn 时各通道独立随机 h∈[hueMin,hueMax] s∈[satMin,satMax] v∈[valMin,valMax],经标准 HSV→RGB 扇区
+    // 公式得 RGB(0-1)当粒子色。Artoria「Chispa de color」用它(hue 0.49→0.93 = 青→品红)。无此初始化器 →
+    // 退默认白星(additive 白)。WP_NO_HSVCOLOR=1 退回(忽略此初始化器,回到 colorMin/Max 默认白)。
+    // 默认:huemin/max 0/1(整色环)、saturationmin/max 0/1、valuemin/max 0/1(WE 未声明时的安全全域;
+    //   实库声明缺省字段如本壁纸只给 huemin/huemax/satmin/valmin → 缺的 max 取 1 = 全饱和全亮)。
+    var hasHSVColor = false
+    var hueMin: Float = 0, hueMax: Float = 1
+    var satMin: Float = 0, satMax: Float = 1
+    var valMin: Float = 0, valMax: Float = 1
     var alphaMin: Float = 1, alphaMax: Float = 1
     // rotationrandom 初始化器(3 轴初始旋转,默认 max.z=2π);我们的精灵只有单轴 2D 旋转 → 取 .z 当初始角。
     // rotation = rand3(min,max).z × speedOverride。对照 CParticle.cpp:802 + ObjectParser.cpp:881-884。
@@ -262,6 +272,23 @@ struct ParticleEmitterDesc {
     var efHeadLifeMin: Float = 11, efHeadLifeMax: Float = 16   // 父头 lifetimerandom
     var efHeadRate: Float = 1                          // 父头 emitter.rate
     var efHeadMaxCount: Int = 10                        // 父头单列 maxcount(static child 覆盖值)
+
+    // ── eventdeath 烟花子粒子(child `type:"eventdeath"`:父粒子死亡瞬间在其末位置爆发一次)─────────────
+    // WE 的 child `type:"eventdeath"`:每当**父粒子**(如 fireworks1 上升的火箭)到寿死亡,在它当时所处位置
+    // 触发该子粒子系统一次「瞬时爆发」(burst):子系统按其 emitter.instantaneous(及 rate)发射一团碎片。
+    // Artoria FGO「Fireworks 1/2/3」即火箭(maxcount 4,velocity 向上、gravity 下、drag)死亡 → fireworks1flare
+    // (1 个亮闪)+ fireworks1hit(150 个 spritetrail 飞溅)+ fireworkshitdistort(refract,本壁纸 probability 隐含 1)。
+    // **lwe 无 child 处理**(穷尽搜:CParticle 只处理 renderers[0] 单发射器,无 eventdeath/eventfollow),故按真 WE 语义实现。
+    //
+    // 架构:父 desc 与各 eventdeath child desc 各成独立 ParticleSimulator(各自纹理/材质)。父 sim 在删除循环里
+    // 收集本帧死亡粒子的**层局部**末位置(drainDeaths()),SceneRenderEngine 把它中继给同 eventDeathGroupTag
+    // 的 eventdeath child sim,后者在每个死亡位置 burst 一次(spawnEventDeathBurst,复用 eventFollowAnchor 锚点路径)。
+    // 父子共用同一对象层变换(同 layerOrigin/Scale),层局部坐标直接通用。WP_NO_EVENTDEATH=1 全关(child 不建)。
+    var isEventDeath = false
+    var eventDeathProbability: Float = 1   // child probability(0 → 跳过不建该 child)
+    // eventdeath 父子配对标签(= 发射对象 scene id):父 desc 与其 eventdeath child desc 同值,运行期中继用。
+    // <0 = 无 eventdeath 关系(普通粒子)。
+    var eventDeathGroupTag: Int = -1
     // spritetrail 渲染器:粒子按速度方向拉伸成拖尾带(genericparticle.vert TRAILRENDERER 分支)。
     // 长轴 = size·clamp(speed·trailLength, trailMinLength, trailMaxLength)·textureRatio,短轴 = size。
     // 默认值照 ObjectParser.cpp:1004-1006(length 0.05 / maxlength 10 / minlength 0)。
@@ -358,6 +385,15 @@ final class ParticleSimulator {
     /// 鼠标拖尾:当前光标在画布像素中的位置(每帧由引擎更新)。nil = 不跟随。
     var cursorOrigin: SIMD2<Float>? = nil
 
+    // eventdeath:父 sim 本步死亡粒子的**层局部**末位置(供 SceneRenderEngine 中继给 eventdeath child sim)。
+    // step() 删除循环里累积,drainDeaths() 取走并清空。父非 eventdeath-tagged 时恒空(零开销)。
+    private var deathPositions: [SIMD2<Float>] = []
+    /// 取走并清空本帧死亡末位置(层局部)。仅 eventDeathGroupTag>=0 的父 sim 有内容。
+    func drainDeaths() -> [SIMD2<Float>] {
+        if deathPositions.isEmpty { return [] }
+        let d = deathPositions; deathPositions.removeAll(keepingCapacity: true); return d
+    }
+
     /// 当前活跃粒子数(诊断用)。
     var liveCount: Int { particles.count }
 
@@ -400,6 +436,28 @@ final class ParticleSimulator {
     private func rotate(_ v: SIMD3<Float>, _ k: SIMD3<Float>, _ a: Float) -> SIMD3<Float> {
         let c = cos(a), s = sin(a)
         return v * c + cross(k, v) * s + k * (dot(k, v) * (1 - c))
+    }
+
+    /// HSV→RGB(标准 6 扇区公式;供 hsvcolorrandom 用)。h/s/v ∈ [0,1],输出 RGB ∈ [0,1]。
+    /// 与 WE 脚本 ColorModule wecolor_hsv2rgb 同算法(那里 hue 是 0..360°,此处 hue 归一 ×6 取扇区,等价)。
+    /// h=0.49→青、h=0.93→品红(Artoria「Chispa de color」)。
+    private static func hsv2rgb(_ h: Float, _ s: Float, _ v: Float) -> SIMD3<Float> {
+        let hue = h - floor(h)               // 卷绕到 [0,1)
+        let sat = max(0, min(1, s))
+        let val = max(0, min(1, v))
+        let hi = Int(hue * 6) % 6            // 扇区 0..5
+        let f = hue * 6 - Float(Int(hue * 6))
+        let p = val * (1 - sat)
+        let q = val * (1 - sat * f)
+        let t = val * (1 - sat * (1 - f))
+        switch hi {
+        case 0:  return SIMD3(val, t, p)
+        case 1:  return SIMD3(q, val, p)
+        case 2:  return SIMD3(p, val, t)
+        case 3:  return SIMD3(p, q, val)
+        case 4:  return SIMD3(t, p, val)
+        default: return SIMD3(val, p, q)     // 5
+        }
     }
 
     /// 分形布朗噪声(fBm):多个 octave 的 perlin 噪声按 amplitude(gain)/frequency(lacunarity)倍增叠加,
@@ -478,10 +536,16 @@ final class ParticleSimulator {
         // lwe rope 与 ropetrail 走同一条 renderRope 路径(CParticle.cpp:36-48/182-186/203-207,
         // m_useRopeRenderer 对两者都 true),故二者删除策略一致:desc.isRope(=ropetrail 也置位)即判据。
         let preserveOrder = desc.isRope
+        // eventdeath 父:本步死亡粒子的末位置(层局部)记入 deathPositions,供 child sim burst。
+        // 仅「打了 tag 且自身不是 eventdeath child」的 sim 是触发源(child 自己死亡不再二次 burst)。
+        let collectDeaths = desc.eventDeathGroupTag >= 0 && !desc.isEventDeath
         var i = 0
         while i < particles.count {
             particles[i].age += d
             if particles[i].age >= particles[i].life {
+                if collectDeaths {
+                    deathPositions.append(SIMD2(particles[i].pos.x, particles[i].pos.y))
+                }
                 if preserveOrder {
                     particles.remove(at: i)        // 有序删除:保持 rope 链的生成序(O(n) 但仅此类用)
                     continue
@@ -661,6 +725,10 @@ final class ParticleSimulator {
             return
         }
 
+        // eventdeath 子:**不自动发射**(不在 t=0 instantaneous、不按 rate 持续喷),只由父死亡运行期驱动
+        //(SceneRenderEngine 中继父 deathPositions → spawnEventDeathBurst)。粒子积分/受力/到寿删除仍走上面循环。
+        if desc.isEventDeath { return }
+
         // 发射新粒子。拖尾粒子只在光标已知时发射(没光标位置就不喷)。
         if desc.followsCursor && cursorOrigin == nil { return }
 
@@ -737,6 +805,20 @@ final class ParticleSimulator {
                 em -= 1
                 particles.append(spawn(eventFollowAnchor: ghostHeads[hi].pos))
             }
+        }
+    }
+
+    /// eventdeath 爆发:父粒子在 anchor(**层局部**)死亡时,该 child sim 在此位置 burst 一次。
+    /// WE 语义 = 触发子系统一次瞬时发射,数量 = child emitter.instantaneous(fireworks1hit 150 / flare 1 / distort 1);
+    /// 缺 instantaneous(=0)则退发 1 个(单次触发)。复用 spawn(eventFollowAnchor:) 把粒子出生平移到 anchor。
+    /// 受 maxCount 上限保护(child sim 的活粒子总数封顶);多个父粒子同帧死亡 → 各 anchor 各 burst,共享 maxCount。
+    func spawnEventDeathBurst(at anchor: SIMD2<Float>) {
+        guard desc.isEventDeath else { return }
+        let burst = desc.emitterInstantaneous > 0 ? desc.emitterInstantaneous : 1
+        var n = burst
+        while n > 0, particles.count < desc.maxCount {
+            n -= 1
+            particles.append(spawn(eventFollowAnchor: anchor))
         }
     }
 
@@ -908,7 +990,12 @@ final class ParticleSimulator {
         // 异色时单参数=色带、逐通道=色立方体角,设计者语义是前者。lwe≠真WE 又一处(同 ropetrail 先例)。
         // WP_COLORRAND_PERCH=1 退回 lwe 逐通道(A/B 诊断)。
         let spawnColor: SIMD3<Float>
-        if ProcessInfo.processInfo.environment["WP_COLORRAND_PERCH"] != nil {
+        if desc.hasHSVColor {
+            // hsvcolorrandom:各通道独立随机 h/s/v → HSV→RGB(WE 真特性,lwe 无;见 desc.hasHSVColor 注释)。
+            spawnColor = ParticleSimulator.hsv2rgb(rnd(desc.hueMin, desc.hueMax),
+                                                   rnd(desc.satMin, desc.satMax),
+                                                   rnd(desc.valMin, desc.valMax))
+        } else if ProcessInfo.processInfo.environment["WP_COLORRAND_PERCH"] != nil {
             spawnColor = rnd3(desc.colorMin, desc.colorMax)
         } else {
             let t = rnd(); spawnColor = desc.colorMin + (desc.colorMax - desc.colorMin) * t
@@ -1360,8 +1447,10 @@ enum ParticleParser {
                 // (frameBufferInput),load() 会把本粒子组渲进该 composelayer 的 FBO 而非主场景(见 parentObjId 注释)。
                 desc.parentObjId = (obj["parent"] as? NSNumber)?.intValue
             }
+            // 父 desc 在 result 中的下标(eventdeath child 存在时需回填 eventDeathGroupTag 到父)。
+            var parentResultIndex: Int? = nil
             if var desc = build(from: pj, source: source) {
-                applyObjectLayer(&desc); result.append(desc)
+                applyObjectLayer(&desc); parentResultIndex = result.count; result.append(desc)
             }
             // 子粒子发射器(children):WE 把第二个/更多发射器放在 children(如落叶的第二种叶贴图、火上的烟),
             // 当独立粒子系统、继承父图层变换。漏加 → 粒子稀疏单一(枫叶"劣质"主因:只渲 10 片单贴图而非 60 片双贴图)。
@@ -1388,6 +1477,25 @@ enum ParticleParser {
                     let cPath = (child["particle"] as? String) ?? (child["name"] as? String)
                     guard let cPath, let cpj = source.json(for: cPath), cpj["emitter"] != nil,
                           var cdesc = build(from: cpj, source: source) else { continue }
+                    let childType = child["type"] as? String
+                    // ── eventdeath 子(烟花爆发):按 child type 分流,标 isEventDeath + 同对象 tag 配对父子,
+                    // honor probability(0 → 跳过不建)。**不**在 t=0 自动 instantaneous(由父死亡运行期驱动)。
+                    // WP_NO_EVENTDEATH=1 整体关闭(不建任何 eventdeath child → 父子均如基线无 burst)。
+                    if childType == "eventdeath" {
+                        if ProcessInfo.processInfo.environment["WP_NO_EVENTDEATH"] != nil { continue }
+                        let prob = (child["probability"] as? NSNumber)?.floatValue ?? 1
+                        if prob <= 0 { continue }   // probability 0 = 该 child 不参与(fireworkshitdistort 等可被作者关掉)
+                        cdesc.isEventDeath = true
+                        cdesc.eventDeathProbability = prob
+                        cdesc.eventDeathGroupTag = objId
+                        if let mc = (child["maxcount"] as? NSNumber)?.intValue { cdesc.maxCount = mc }
+                        applyObjectLayer(&cdesc)
+                        applyChildTransform(&cdesc, child)
+                        // 父也打同 tag,运行期把父死亡末位置中继给该 child sim。
+                        if let pi = parentResultIndex { result[pi].eventDeathGroupTag = objId }
+                        result.append(cdesc)
+                        continue
+                    }
                     // 子条目 maxcount 覆盖 preset(matrix 每列 child maxcount=10,而 matrix_code preset 只 1
                     // → 不覆盖则每列仅 1 个字符=矩阵雨极稀疏)。先于 applyObjectLayer,让对象级 io count 仍能叠乘。
                     let childMaxCount = (child["maxcount"] as? NSNumber)?.intValue
@@ -1528,8 +1636,24 @@ enum ParticleParser {
                 d.rotMin = VecParse.f3(ini["min"], default: .zero)
                 d.rotMax = VecParse.f3(ini["max"], default: SIMD3(0, 0, 6.2831853))
             case "colorrandom":
-                d.colorMin = VecParse.f3(ini["min"], default: SIMD3(255,255,255)) / 255
+                // WE/lwe 权威默认:min=Black、max=White(ObjectParser.cpp:649-652
+                //   it.color("min", …, Builders::ColorBuilder::Black) / ("max", …, ColorBuilder::White))。
+                // 旧实现 min 默认白 → 缺 min 的 colorrandom(如 getsuga 拖尾 child max"0 0 0" 无 min)
+                // 渲成 lerp(白,黑)=灰,WE 真值是 lerp(黑,黑)=纯黑。WP_NO_COLORRAND_BLACK_DEFAULT=1 退回旧白默认(A/B)。
+                let colorMinDefault: SIMD3<Float> =
+                    ProcessInfo.processInfo.environment["WP_NO_COLORRAND_BLACK_DEFAULT"] != nil
+                    ? SIMD3(255, 255, 255) : SIMD3(0, 0, 0)
+                d.colorMin = VecParse.f3(ini["min"], default: colorMinDefault) / 255
                 d.colorMax = VecParse.f3(ini["max"], default: SIMD3(255,255,255)) / 255
+            case "hsvcolorrandom":
+                // WE 真特性(lwe 无):h/s/v 各通道独立随机范围,spawn 时 hsv2rgb 得粒子色。
+                // 缺省取全域(h 0..1 / s 0..1 / v 0..1);本壁纸只给 huemin/huemax/satmin/valmin → max 默认 1。
+                if ProcessInfo.processInfo.environment["WP_NO_HSVCOLOR"] == nil {
+                    d.hasHSVColor = true
+                    d.hueMin = num(ini["huemin"], 0);        d.hueMax = num(ini["huemax"], 1)
+                    d.satMin = num(ini["saturationmin"], 0); d.satMax = num(ini["saturationmax"], 1)
+                    d.valMin = num(ini["valuemin"], 0);      d.valMax = num(ini["valuemax"], 1)
+                }
             case "alpharandom":
                 // WE 默认 min 0.05 / max 1(ObjectParser.cpp:870)。
                 d.alphaMin = num(ini["min"], 0.05); d.alphaMax = num(ini["max"], 1)
