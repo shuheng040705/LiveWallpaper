@@ -12,12 +12,6 @@ struct WallpaperSettingsPanel: View {
     @ObservedObject private var store = WallpaperPropertyStore.shared
     private let accent = Color(red: 0.92, green: 0.36, blue: 0.62)
 
-    // 通用属性(全局引擎设置,引擎每帧实时读 PreferencesStore → 改即生效;onApply 再 nudge 重渲)。
-    // WE 风格:属性面板顶部先列通用属性,分隔线后才是该壁纸专属属性。
-    @State private var scaleMode = PreferencesStore.shared.wallpaperScaleMode
-    @State private var frameCap = PreferencesStore.shared.frameRateCap
-    @State private var renderQ = PreferencesStore.shared.renderScale
-
     /// 直接从 item 派生,绝不为空/失步(修「时全时空」)。
     private var allProperties: [WallpaperProperty] {
         store.properties(forID: item.id, folderURL: item.folderURL)
@@ -43,8 +37,7 @@ struct WallpaperSettingsPanel: View {
             }
         }
     }
-    private var renderUnits: [RenderUnit] {
-        let props = visibleProperties
+    private func renderUnits(for props: [WallpaperProperty]) -> [RenderUnit] {
         var units: [RenderUnit] = []
         var i = 0
         while i < props.count {
@@ -64,36 +57,29 @@ struct WallpaperSettingsPanel: View {
             header
             Divider().opacity(0.4)
             let props = visibleProperties
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    // WE 风格:先通用属性(全局引擎设置),分隔线后才是该壁纸专属属性。
-                    generalSection
-                    if props.isEmpty {
-                        sectionLabel("壁纸专属属性")
-                        Text("这个壁纸没有专属可调属性")
-                            .font(.system(size: 11)).foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    } else {
-                        sectionLabel("壁纸专属属性")
-                        ForEach(renderUnits) { unit in
-                            switch unit {
-                            case .single(let prop):
-                                PropertyControl(item: item, prop: prop, accent: accent,
-                                                onChange: { version += 1; onApply() })
-                            case .group(let title, let members):
-                                PropertyGroupSection(item: item, title: title, props: members, accent: accent,
-                                                     onChange: { version += 1; onApply() })
-                            }
+            // WE 属性面板:无 index 的 WE 标准属性(schemecolor 等)在分隔线**上**(通用「属性」);
+            // 有 index 的作者自定义属性在分隔线**下**(该壁纸专属可调属性)。分区依据来自 pkg(见 isGeneral)。
+            let generalUnits = renderUnits(for: props.filter { $0.isGeneral })
+            let customUnits = renderUnits(for: props.filter { !$0.isGeneral })
+            if props.isEmpty {
+                emptyState
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(generalUnits) { unit in unitView(unit) }      // 分隔线上:通用属性
+                        if !generalUnits.isEmpty && !customUnits.isEmpty {
+                            Divider().opacity(0.55).padding(.vertical, 2)      // WE 分隔线
                         }
+                        ForEach(customUnits) { unit in unitView(unit) }        // 分隔线下:壁纸专属
                     }
+                    .padding(.horizontal, 18).padding(.vertical, 16)
+                    // 不再用 .id(...version...) 破坏性重建子树 —— 那会在选色时销毁正与系统颜色面板
+                    // 绑定的 ColorPicker、令其脱钩(色块不跟手)。store 现为 ObservableObject,改值
+                    // 会发通知让 body 自然重算重读 value,无需强制重建。
                 }
-                .padding(.horizontal, 18).padding(.vertical, 16)
-                // 不再用 .id(...version...) 破坏性重建子树 —— 那会在选色时销毁正与系统颜色面板
-                // 绑定的 ColorPicker、令其脱钩(色块不跟手)。store 现为 ObservableObject,改值
-                // 会发通知让 body 自然重算重读 value,无需强制重建。
+                Divider().opacity(0.4)
+                resetBar
             }
-            Divider().opacity(0.4)
-            resetBar
             // 取消订阅栏(始终在底部,即使无可调属性也可用)。
             if onUnsubscribe != nil {
                 Divider().opacity(0.4)
@@ -105,43 +91,16 @@ struct WallpaperSettingsPanel: View {
         .id(item.id)   // 切换壁纸时强制重建,彻底避免状态残留
     }
 
-    /// 分节标题 + 上方分隔线(WE 风格:通用属性 ↔ 壁纸专属属性间)。
+    /// 渲染一个 RenderUnit(单条属性 / 折叠组),供分隔线上下两段复用。
     @ViewBuilder
-    private func sectionLabel(_ text: String) -> some View {
-        Divider().opacity(0.5).padding(.top, 4).padding(.bottom, 2)
-        Text(text).font(.system(size: 10.5, weight: .semibold)).foregroundStyle(.tertiary).textCase(.uppercase)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    /// 通用属性(全局引擎设置,引擎每帧实时读 PreferencesStore → 改即生效):屏幕适配 / 帧率上限 / 渲染画质。
-    private var generalSection: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            Text("通用").font(.system(size: 10.5, weight: .semibold)).foregroundStyle(.tertiary).textCase(.uppercase)
-                .frame(maxWidth: .infinity, alignment: .leading)
-            HStack {
-                Text("屏幕适配").font(.system(size: 12.5)); Spacer()
-                Picker("", selection: Binding(get: { scaleMode }, set: {
-                    scaleMode = $0; PreferencesStore.shared.wallpaperScaleMode = $0; onApply()
-                })) {
-                    Text("填满").tag(0); Text("黑边").tag(1); Text("拉伸").tag(2); Text("自适应").tag(3)
-                }.labelsHidden().fixedSize()
-            }
-            HStack {
-                Text("帧率上限").font(.system(size: 12.5)); Spacer()
-                Picker("", selection: Binding(get: { frameCap }, set: {
-                    frameCap = $0; PreferencesStore.shared.frameRateCap = $0; onApply()
-                })) {
-                    Text("30").tag(30); Text("60").tag(60); Text("不限").tag(0)
-                }.labelsHidden().fixedSize()
-            }
-            HStack {
-                Text("渲染画质").font(.system(size: 12.5)); Spacer()
-                Picker("", selection: Binding(
-                    get: { renderQ < 0.625 ? 0.5 : (renderQ < 0.875 ? 0.75 : 1.0) },
-                    set: { renderQ = $0; PreferencesStore.shared.renderScale = $0; onApply() })) {
-                    Text("流畅").tag(0.5); Text("均衡").tag(0.75); Text("高清").tag(1.0)
-                }.labelsHidden().fixedSize()
-            }
+    private func unitView(_ unit: RenderUnit) -> some View {
+        switch unit {
+        case .single(let prop):
+            PropertyControl(item: item, prop: prop, accent: accent,
+                            onChange: { version += 1; onApply() })
+        case .group(let title, let members):
+            PropertyGroupSection(item: item, title: title, props: members, accent: accent,
+                                 onChange: { version += 1; onApply() })
         }
     }
 

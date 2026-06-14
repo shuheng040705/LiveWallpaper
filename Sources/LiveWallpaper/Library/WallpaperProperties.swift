@@ -17,6 +17,10 @@ struct WallpaperProperty: Identifiable {
     var group: String? = nil
     // type=None 的说明文本(作者头/分节说明 HTML 文本):只显示不可交互,渲染为次要文字。
     var isText: Bool = false
+    // ⭐WE 属性面板分区:**无 `index` 字段**的属性 = WE 标准属性(如 schemecolor)→ 放分隔线**上**(通用「属性」);
+    // **有 `index` 字段**的(作者在编辑器自定义添加的)→ 放分隔线**下**(该壁纸专属可调属性)。实测土星
+    // 3589454154:仅 schemecolor 无 index(order=0)在上,其余 100+ 全有 index 在下。这是 pkg 自带的分区说明。
+    var isGeneral: Bool = false
     // 各类型的取值约束
     var sliderMin: Double = 0
     var sliderMax: Double = 1
@@ -107,6 +111,7 @@ final class WallpaperPropertyStore: ObservableObject {
                 var t = WallpaperProperty(id: e.key, type: .label, label: plain, order: e.order)
                 t.group = currentGroup
                 t.isText = true
+                t.isGeneral = (p["index"] == nil)   // 无 index = WE 标准属性 → 分隔线上
                 out.append(t)
                 continue
             }
@@ -125,6 +130,7 @@ final class WallpaperPropertyStore: ObservableObject {
 
             var prop = WallpaperProperty(id: e.key, type: kind, label: label, order: e.order)
             prop.group = currentGroup
+            prop.isGeneral = (p["index"] == nil)   // 无 index = WE 标准属性(schemecolor 等)→ 分隔线上
             prop.condition = (p["condition"] as? String) ?? ""
             prop.supported = Self.isSupported(key: e.key, kind: kind, label: label)
             if kind == .slider {
