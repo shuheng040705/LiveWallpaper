@@ -63664,5 +63664,576 @@
     ]
    }
   ]
+ },
+ "workshop/3485726739/phantomtransitionfx": {
+  "variants": [
+   {
+    "combos": {},
+    "passes": [
+     {
+      "shader": "workshop/3485726739/effects/phantomtransitionfx",
+      "target": null,
+      "bind": [],
+      "uniformMeta": {
+       "g_Texture0": {
+        "material": "framebuffer",
+        "default": null,
+        "combo": null
+       },
+       "g_Texture1": {
+        "material": "framebuffer",
+        "default": "util/white",
+        "combo": null
+       },
+       "g_Texture2": {
+        "material": null,
+        "default": "util/white",
+        "combo": "OPACITYMASK"
+       },
+       "u_DirectionAngle": {
+        "material": "Direction",
+        "default": 0,
+        "combo": null
+       },
+       "u_Amount": {
+        "material": "Amount",
+        "default": 16,
+        "combo": null
+       },
+       "u_Feather": {
+        "material": "Feather",
+        "default": 0.02,
+        "combo": null
+       },
+       "u_Speed": {
+        "material": "Speed",
+        "default": 1,
+        "combo": null
+       },
+       "u_BlendAmount": {
+        "material": "A_BlendAmount",
+        "default": 0,
+        "combo": null
+       },
+       "u_NoiseScale": {
+        "material": "NoiseScale",
+        "default": 5.0,
+        "combo": null
+       },
+       "u_NoiseSpeed": {
+        "material": "NoiseSpeed",
+        "default": 1.0,
+        "combo": null
+       }
+      },
+      "targetScale": 1,
+      "vert": {
+       "metal": "workshop__3485726739__effects__phantomtransitionfx__STYLE-1__vert.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_ModelViewProjectionMatrix",
+         "offset": 0,
+         "type": "mat4"
+        },
+        {
+         "name": "g_Texture0Resolution",
+         "offset": 64,
+         "type": "vec4"
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      },
+      "frag": {
+       "metal": "workshop__3485726739__effects__phantomtransitionfx__STYLE-1__frag.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_Time",
+         "offset": 0,
+         "type": "float"
+        },
+        {
+         "name": "u_DirectionAngle",
+         "offset": 4,
+         "type": "float"
+        },
+        {
+         "name": "u_Amount",
+         "offset": 8,
+         "type": "float"
+        },
+        {
+         "name": "u_Feather",
+         "offset": 12,
+         "type": "float"
+        },
+        {
+         "name": "u_Speed",
+         "offset": 16,
+         "type": "float"
+        },
+        {
+         "name": "u_BlendAmount",
+         "offset": 20,
+         "type": "float"
+        },
+        {
+         "name": "u_NoiseScale",
+         "offset": 24,
+         "type": "float"
+        },
+        {
+         "name": "u_NoiseSpeed",
+         "offset": 28,
+         "type": "float"
+        }
+       ],
+       "samplers": [
+        {
+         "name": "g_Texture0",
+         "texIndex": 0,
+         "sampIndex": 0
+        },
+        {
+         "name": "g_Texture1",
+         "texIndex": 1,
+         "sampIndex": 1
+        }
+       ],
+       "ubuf": 0
+      }
+     }
+    ]
+   },
+   {
+    "combos": {
+     "MASK": "1",
+     "STYLE": "12"
+    },
+    "passes": [
+     {
+      "shader": "workshop/3485726739/effects/phantomtransitionfx",
+      "target": null,
+      "bind": [],
+      "uniformMeta": {
+       "g_Texture0": {
+        "material": "framebuffer",
+        "default": null,
+        "combo": null
+       },
+       "g_Texture1": {
+        "material": "framebuffer",
+        "default": "util/white",
+        "combo": null
+       },
+       "g_Texture2": {
+        "material": null,
+        "default": "util/white",
+        "combo": "OPACITYMASK"
+       },
+       "u_DirectionAngle": {
+        "material": "Direction",
+        "default": 0,
+        "combo": null
+       },
+       "u_Amount": {
+        "material": "Amount",
+        "default": 16,
+        "combo": null
+       },
+       "u_Feather": {
+        "material": "Feather",
+        "default": 0.02,
+        "combo": null
+       },
+       "u_Speed": {
+        "material": "Speed",
+        "default": 1,
+        "combo": null
+       },
+       "u_BlendAmount": {
+        "material": "A_BlendAmount",
+        "default": 0,
+        "combo": null
+       },
+       "u_NoiseScale": {
+        "material": "NoiseScale",
+        "default": 5.0,
+        "combo": null
+       },
+       "u_NoiseSpeed": {
+        "material": "NoiseSpeed",
+        "default": 1.0,
+        "combo": null
+       }
+      },
+      "targetScale": 1,
+      "vert": {
+       "metal": "workshop__3485726739__effects__phantomtransitionfx__MASK-1_STYLE-12__vert.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_ModelViewProjectionMatrix",
+         "offset": 0,
+         "type": "mat4"
+        },
+        {
+         "name": "g_Texture0Resolution",
+         "offset": 64,
+         "type": "vec4"
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      },
+      "frag": {
+       "metal": "workshop__3485726739__effects__phantomtransitionfx__MASK-1_STYLE-12__frag.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_Time",
+         "offset": 0,
+         "type": "float"
+        },
+        {
+         "name": "u_DirectionAngle",
+         "offset": 4,
+         "type": "float"
+        },
+        {
+         "name": "u_Amount",
+         "offset": 8,
+         "type": "float"
+        },
+        {
+         "name": "u_Feather",
+         "offset": 12,
+         "type": "float"
+        },
+        {
+         "name": "u_Speed",
+         "offset": 16,
+         "type": "float"
+        },
+        {
+         "name": "u_BlendAmount",
+         "offset": 20,
+         "type": "float"
+        },
+        {
+         "name": "u_NoiseScale",
+         "offset": 24,
+         "type": "float"
+        },
+        {
+         "name": "u_NoiseSpeed",
+         "offset": 28,
+         "type": "float"
+        }
+       ],
+       "samplers": [
+        {
+         "name": "g_Texture0",
+         "texIndex": 0,
+         "sampIndex": 0
+        },
+        {
+         "name": "g_Texture1",
+         "texIndex": 1,
+         "sampIndex": 1
+        }
+       ],
+       "ubuf": 0
+      }
+     }
+    ]
+   },
+   {
+    "combos": {
+     "STYLE": "12"
+    },
+    "passes": [
+     {
+      "shader": "workshop/3485726739/effects/phantomtransitionfx",
+      "target": null,
+      "bind": [],
+      "uniformMeta": {
+       "g_Texture0": {
+        "material": "framebuffer",
+        "default": null,
+        "combo": null
+       },
+       "g_Texture1": {
+        "material": "framebuffer",
+        "default": "util/white",
+        "combo": null
+       },
+       "g_Texture2": {
+        "material": null,
+        "default": "util/white",
+        "combo": "OPACITYMASK"
+       },
+       "u_DirectionAngle": {
+        "material": "Direction",
+        "default": 0,
+        "combo": null
+       },
+       "u_Amount": {
+        "material": "Amount",
+        "default": 16,
+        "combo": null
+       },
+       "u_Feather": {
+        "material": "Feather",
+        "default": 0.02,
+        "combo": null
+       },
+       "u_Speed": {
+        "material": "Speed",
+        "default": 1,
+        "combo": null
+       },
+       "u_BlendAmount": {
+        "material": "A_BlendAmount",
+        "default": 0,
+        "combo": null
+       },
+       "u_NoiseScale": {
+        "material": "NoiseScale",
+        "default": 5.0,
+        "combo": null
+       },
+       "u_NoiseSpeed": {
+        "material": "NoiseSpeed",
+        "default": 1.0,
+        "combo": null
+       }
+      },
+      "targetScale": 1,
+      "vert": {
+       "metal": "workshop__3485726739__effects__phantomtransitionfx__STYLE-12__vert.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_ModelViewProjectionMatrix",
+         "offset": 0,
+         "type": "mat4"
+        },
+        {
+         "name": "g_Texture0Resolution",
+         "offset": 64,
+         "type": "vec4"
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      },
+      "frag": {
+       "metal": "workshop__3485726739__effects__phantomtransitionfx__STYLE-12__frag.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_Time",
+         "offset": 0,
+         "type": "float"
+        },
+        {
+         "name": "u_DirectionAngle",
+         "offset": 4,
+         "type": "float"
+        },
+        {
+         "name": "u_Amount",
+         "offset": 8,
+         "type": "float"
+        },
+        {
+         "name": "u_Feather",
+         "offset": 12,
+         "type": "float"
+        },
+        {
+         "name": "u_Speed",
+         "offset": 16,
+         "type": "float"
+        },
+        {
+         "name": "u_BlendAmount",
+         "offset": 20,
+         "type": "float"
+        },
+        {
+         "name": "u_NoiseScale",
+         "offset": 24,
+         "type": "float"
+        },
+        {
+         "name": "u_NoiseSpeed",
+         "offset": 28,
+         "type": "float"
+        }
+       ],
+       "samplers": [
+        {
+         "name": "g_Texture0",
+         "texIndex": 0,
+         "sampIndex": 0
+        },
+        {
+         "name": "g_Texture1",
+         "texIndex": 1,
+         "sampIndex": 1
+        }
+       ],
+       "ubuf": 0
+      }
+     }
+    ]
+   },
+   {
+    "combos": {
+     "STYLE": "2"
+    },
+    "passes": [
+     {
+      "shader": "workshop/3485726739/effects/phantomtransitionfx",
+      "target": null,
+      "bind": [],
+      "uniformMeta": {
+       "g_Texture0": {
+        "material": "framebuffer",
+        "default": null,
+        "combo": null
+       },
+       "g_Texture1": {
+        "material": "framebuffer",
+        "default": "util/white",
+        "combo": null
+       },
+       "g_Texture2": {
+        "material": null,
+        "default": "util/white",
+        "combo": "OPACITYMASK"
+       },
+       "u_DirectionAngle": {
+        "material": "Direction",
+        "default": 0,
+        "combo": null
+       },
+       "u_Amount": {
+        "material": "Amount",
+        "default": 16,
+        "combo": null
+       },
+       "u_Feather": {
+        "material": "Feather",
+        "default": 0.02,
+        "combo": null
+       },
+       "u_Speed": {
+        "material": "Speed",
+        "default": 1,
+        "combo": null
+       },
+       "u_BlendAmount": {
+        "material": "A_BlendAmount",
+        "default": 0,
+        "combo": null
+       },
+       "u_NoiseScale": {
+        "material": "NoiseScale",
+        "default": 5.0,
+        "combo": null
+       },
+       "u_NoiseSpeed": {
+        "material": "NoiseSpeed",
+        "default": 1.0,
+        "combo": null
+       }
+      },
+      "targetScale": 1,
+      "vert": {
+       "metal": "workshop__3485726739__effects__phantomtransitionfx__STYLE-2__vert.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_ModelViewProjectionMatrix",
+         "offset": 0,
+         "type": "mat4"
+        },
+        {
+         "name": "g_Texture0Resolution",
+         "offset": 64,
+         "type": "vec4"
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      },
+      "frag": {
+       "metal": "workshop__3485726739__effects__phantomtransitionfx__STYLE-2__frag.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_Time",
+         "offset": 0,
+         "type": "float"
+        },
+        {
+         "name": "u_DirectionAngle",
+         "offset": 4,
+         "type": "float"
+        },
+        {
+         "name": "u_Amount",
+         "offset": 8,
+         "type": "float"
+        },
+        {
+         "name": "u_Feather",
+         "offset": 12,
+         "type": "float"
+        },
+        {
+         "name": "u_Speed",
+         "offset": 16,
+         "type": "float"
+        },
+        {
+         "name": "u_BlendAmount",
+         "offset": 20,
+         "type": "float"
+        },
+        {
+         "name": "u_NoiseScale",
+         "offset": 24,
+         "type": "float"
+        },
+        {
+         "name": "u_NoiseSpeed",
+         "offset": 28,
+         "type": "float"
+        }
+       ],
+       "samplers": [
+        {
+         "name": "g_Texture0",
+         "texIndex": 0,
+         "sampIndex": 0
+        },
+        {
+         "name": "g_Texture1",
+         "texIndex": 1,
+         "sampIndex": 1
+        }
+       ],
+       "ubuf": 0
+      }
+     }
+    ]
+   }
+  ]
  }
 }

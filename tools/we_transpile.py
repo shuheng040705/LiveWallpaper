@@ -237,6 +237,28 @@ def rename_reserved(src):
     src = re.sub(r'(\s*)(vec3|vec2|float)\s+(\w+)\s*=\s*(texSample2D\w*\(.*\))\s*;\s*$',
                  _trunc, src, flags=re.MULTILINE)
 
+    # HLSL 允许**全局** `const` 用 uniform 表达式初始化(编译期按调用折叠);GLSL/Vulkan 禁止——全局 const
+    # 初始化必须是编译期常量,否则 glslang「global const initializers must be constant」(phantomtransitionfx
+    # 的 `const float FEATHER = u_Feather * 0.5;`,STYLE=2 圆形转场的羽化宽度)。函数体内的 const-from-uniform
+    # 是**局部** const,GLSL 合法(如 color_grading 的 `const float cosAngle = cos(radians(u_hueShift));` 在
+    # 函数 depth1 → 不触发)。修法:仅把**大括号深度 0(全局作用域)** 的 `const <type> NAME = <expr>;` 改写成
+    # `#define NAME (<expr>)`——与 HLSL「每次引用就地折叠该表达式」语义逐字等价(FEATHER 仅在各 STYLE 函数体内的
+    # smoothstep 调用里出现,宏展开恒等)。类型/深度双感知:跳过 #if 分支内的预处理行不计深度;只命中真·全局 const。
+    _global_const_re = re.compile(r'^[ \t]*const\s+(?:float|vec2|vec3|vec4|int|uint|bool)\s+(\w+)\s*=\s*([^;{}]*);[ \t]*$')
+    out_lines, depth = [], 0
+    for ln in src.split("\n"):
+        # 预处理指令行(#if/#define/...)不含可执行括号,跳过深度统计(但保留)。
+        stripped = ln.lstrip()
+        is_pp = stripped.startswith("#")
+        m = _global_const_re.match(ln) if (depth == 0 and not is_pp) else None
+        if m:
+            out_lines.append(f"#define {m.group(1)} ({m.group(2).strip()})")
+        else:
+            out_lines.append(ln)
+        if not is_pp:
+            depth += ln.count("{") - ln.count("}")
+    src = "\n".join(out_lines)
+
     # vec4 varying 实为 2D 坐标:个别 shader 把坐标 varying 过声明成 vec4(vert 只写 .xy、.zw 恒未用),
     # frag 却拿它整体做 2D 向量算术(clipping_mask 的 `varying vec4 v_TexCoord` → `v_TexCoord*2.0-1.0-
     # texScaleCenter`,后者 vec2)。HLSL 把 vec4 截断到 vec2 再算;GLSL 的 vec4±vec2 直接类型错。修法:

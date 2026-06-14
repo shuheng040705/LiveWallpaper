@@ -2260,8 +2260,24 @@ final class SceneRenderEngine {
                 for j in layers[i].effects.indices {
                     for (key, anim) in layers[i].effects[j].weAnim {
                         let vals = anim.evaluate(time: t)
-                        if vals.count == 1 { layers[i].effects[j].weParams[key] = String(vals[0]) }
-                        else if vals.count >= 3 { layers[i].effects[j].weParams[key] = "\(vals[0]) \(vals[1]) \(vals[2])" }
+                        let sv: String?
+                        if vals.count == 1 { sv = String(vals[0]) }
+                        else if vals.count >= 3 { sv = "\(vals[0]) \(vals[1]) \(vals[2])" }
+                        else { sv = nil }
+                        guard let sval = sv else { continue }
+                        layers[i].effects[j].weParams[key] = sval
+                        // 关键:buildUniforms 对单/多 pass 都优先用 **weParamsPerPass[pass]**(见 WEEffectChain.run
+                        // 的 `params = (pi < paramsPerPass.count) ? paramsPerPass[pi] : pkgParams`),只更新合并版
+                        // weParams 不会被 pass0 读到 → 关键帧值丢失、退静态 value(phantomtransitionfx 的 A_BlendAmount
+                        // 退 preview value≈0.958 → 圆形转场恒满、不展开)。故同步写回**所有含该 key 的 per-pass 字典**。
+                        // 仅作用于本就有该 key 的 per-pass 槽(不新建),全库回归:黑猫 0 差、伊蕾娜 14px(关键帧本应露的
+                        // 内容,是修非回归)。WP_NO_PERPASS_ANIM=1 退回(仅更新合并版,A/B 用)。
+                        if ProcessInfo.processInfo.environment["WP_NO_PERPASS_ANIM"] == nil {
+                            for pp in layers[i].effects[j].weParamsPerPass.indices
+                            where layers[i].effects[j].weParamsPerPass[pp][key] != nil {
+                                layers[i].effects[j].weParamsPerPass[pp][key] = sval
+                            }
+                        }
                     }
                 }
             }

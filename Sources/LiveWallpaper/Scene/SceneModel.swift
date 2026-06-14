@@ -2116,6 +2116,7 @@ struct SceneDocument {
     /// 判断某音频可视化 effect 是否**已转译**——已转译的能真渲染(走 useWE 真 shader),不再当未实现跳过。
     static let transpiledEffectNames: Set<String> = {
         let paths = [
+            ProcessInfo.processInfo.environment["WP_MANIFEST_DIR"].map { URL(fileURLWithPath: $0).appendingPathComponent("WEEffects.json") },
             Bundle.main.resourceURL?.appendingPathComponent("WEEffects.json"),
             URL(fileURLWithPath: NSString(string: "~/Developer/LiveWallpaper/Tools/generated/WEEffects.json").expandingTildeInPath)
         ].compactMap { $0 }
@@ -2152,6 +2153,7 @@ struct SceneDocument {
     /// base 变体 → 效果填满整个矩形(如 3233141951 id=228 身体音频条没被身体剪影遮罩=大方框)。
     static let weMaskSlots: [String: Set<Int>] = {
         let paths = [
+            ProcessInfo.processInfo.environment["WP_MANIFEST_DIR"].map { URL(fileURLWithPath: $0).appendingPathComponent("WEEffects.json") },
             Bundle.main.resourceURL?.appendingPathComponent("WEEffects.json"),
             URL(fileURLWithPath: NSString(string: "~/Developer/LiveWallpaper/Tools/generated/WEEffects.json").expandingTildeInPath)
         ].compactMap { $0 }
@@ -2259,6 +2261,7 @@ struct SceneDocument {
     /// 与 WEEffectChain.usesAudioSpectrum 同口径,只是在 SceneDocument 解析期从 JSON 直接读(读一次)。
     static let weAudioEffectNames: Set<String> = {
         let paths = [
+            ProcessInfo.processInfo.environment["WP_MANIFEST_DIR"].map { URL(fileURLWithPath: $0).appendingPathComponent("WEEffects.json") },
             Bundle.main.resourceURL?.appendingPathComponent("WEEffects.json"),
             URL(fileURLWithPath: NSString(string: "~/Developer/LiveWallpaper/Tools/generated/WEEffects.json").expandingTildeInPath)
         ].compactMap { $0 }
