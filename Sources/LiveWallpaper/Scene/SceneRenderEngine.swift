@@ -805,6 +805,12 @@ final class SceneRenderEngine {
                 let camDist = Float(ProcessInfo.processInfo.environment["WP_3D_CAMDIST"] ?? "") ?? 4.54
                 eye = SIMD3(0, 0, camDist); center = .zero; up = SIMD3(0, 1, 0)
                 fovDeg = Float(ProcessInfo.processInfo.environment["WP_3D_FOV"] ?? "") ?? 66
+            } else if let objEye = cam.objEye {
+                // ⭐运行时相机对象(camera:"default" 静态 origin=eye)看 -z:替代顶层编辑器残留 scene.camera。
+                // 实测土星 3589454154:顶层 scene.camera eye=(3.66,..) 看 (3.30,..) → 土星(x=0)渲到左偏 0.36 不居中;
+                // 相机对象 id=243 origin=(0,0,2.3) 看 -z → 土星 x=0 居中(用户:土星应在中间)。与太阳系(0,0,4.54)同理。
+                eye = objEye; center = SIMD3(objEye.x, objEye.y, objEye.z - 1); up = SIMD3(0, 1, 0)
+                fovDeg = cam.objFov ?? cam.fov
             } else {
                 eye = cam.eye; center = cam.center; up = cam.up; fovDeg = cam.fov
             }

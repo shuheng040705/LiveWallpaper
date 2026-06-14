@@ -418,6 +418,12 @@ struct CameraDesc {
     // 接口语义建:perspective(radians(fov), aspect, nearz, farz) · lookAt(eye,center,up)(Camera.cpp:13 lookAt、
     // :36-40 getFov/getNearZ/getFarZ;CParticle.cpp:1892 glm::perspective(fov,aspect,nearz,farz) 用法移植)。
     var isPerspective: Bool = false
+    // 3D 透视场景的**运行时相机对象**(objects 里 camera:"default"、静态 origin=eye)。顶层 scene["camera"]
+    // 的 eye/center 常是**编辑器残留视角**(实测土星 3589454154:顶层 eye=(3.66,1.39,2.30) 看 (3.30,1.17,1.39)
+    // → 土星 x=0 渲到左偏 0.36 不居中;而相机对象 id=243 camera:"default" origin=(0,0,2.3) 看 -z → 土星正中)。
+    // 与太阳系(运行时相机 eye=(0,0,4.54))同理。非 nil 时引擎用它(eye=objEye 看 -z)替代顶层 scene.camera。
+    var objEye: SIMD3<Float>? = nil
+    var objFov: Float? = nil
 }
 
 /// 2D 场景**相机运镜**(per-object camera path 的 origin/zoom 关键帧动画)。
@@ -869,6 +875,17 @@ struct SceneDocument {
             // 承载 origin/zoom 关键帧 = 2D 场景**运镜**(开场推近再回弹等)。lwe 完全不读此对象(见 CameraPathAnim 注释)。
             // 只在**确有 origin 或 zoom 关键帧动画**时建 cameraAnim(无 → 不启用,相机静态,零回归)。取首个即可
             //(scene 一般只一个 camera 路径对象)。WP_NO_CAMERA_ANIM=1 整体退回静态相机(A/B 诊断/逃生开关)。
+            // 3D 透视场景的运行时相机对象(camera:"default"、**静态** origin=eye,String 而非关键帧 dict):
+            // 取它当真正的相机眼位(看 -z),替代顶层编辑器残留 scene.camera(土星 id=243 origin=(0,0,2.3)→土星居中;
+            // 顶层 eye=(3.66,...)→土星左偏)。WP_NO_CAMERA_OBJ=1 退回顶层 scene.camera。
+            if camera.isPerspective, obj["camera"] != nil, obj["image"] == nil, camera.objEye == nil,
+               let originStr = obj["origin"] as? String,
+               ProcessInfo.processInfo.environment["WP_NO_CAMERA_OBJ"] == nil {
+                camera.objEye = VecParse.f3(originStr, default: .zero)
+                if let fv = (obj["fov"] as? NSNumber)?.floatValue { camera.objFov = fv }
+                Log.write("scene: 3D runtime camera object (id=\((obj["id"] as? NSNumber)?.intValue ?? -1)) " +
+                          "eye=\(camera.objEye!) fov=\(camera.objFov ?? camera.fov) (替代顶层编辑器残留 scene.camera eye=\(camera.eye))")
+            }
             if obj["image"] == nil, obj["camera"] != nil,
                ProcessInfo.processInfo.environment["WP_NO_CAMERA_ANIM"] == nil,
                cameraAnim == nil {
