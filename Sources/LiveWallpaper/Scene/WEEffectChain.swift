@@ -882,7 +882,8 @@ final class WEEffectChain {
                                pkgParams: [String: Any], time: Float, cursor: SIMD2<Float>,
                                texW: Int, texH: Int, sceneW: Int, sceneH: Int,
                                audio: AudioSpectrum,
-                               auxResolutions: [String: SIMD4<Float>] = [:]) -> [UInt8] {
+                               auxResolutions: [String: SIMD4<Float>] = [:],
+                               pointerXform: SIMD4<Float> = SIMD4(1, 0, -1, 1)) -> [UInt8] {
         // 数组 uniform 要把 offset+元素数×步长 都算进上界(否则数组尾巴越界)。
         var size = 16
         for u in stage.uniforms {
@@ -922,7 +923,12 @@ final class WEEffectChain {
                     // ⚠ Y 轴约定:lwe(CScene.cpp:387 `mouseY = 1.0 - normalizedMouseY`)把 g_PointerPosition.y 存成
                     //   **y 向下**(屏幕顶=0);xray.vert 也假设 y 向下(自带 `pointer.y = 1.0 - pointer.y`)。本引擎
                     //   cursor.y 是 y 向上 → 这里翻 Y 对齐 lwe,否则揭示框竖直镜像(鼠标往上→揭示往下)。居中仍 0.5。
-                    vals = [cursor.x, 1.0 - cursor.y]
+                    // ⭐pointerXform=(ax,bx,ay,by):把屏幕 UV pointer 变换到**层 texcoord 空间**。层 scale≠1 或
+                    //   origin 偏心时,effect 跑在缩放后的 quad 上(texcoord 0-1 = 缩放 quad ≠ 画布),不校正则
+                    //   xray 揭示框/视差按未缩放定位 → 随距中心放大偏移(实测 3605892961 层 scale=1.3,揭示框偏 1.3×)。
+                    //   引擎按层 origin/sizePx/canvas 算 xform;全画布层=(1,0,-1,1)→退回 [cursor.x,1-cursor.y] 零回归。
+                    vals = [pointerXform.x * cursor.x + pointerXform.y,
+                            pointerXform.z * cursor.y + pointerXform.w]
                 } else if u.name == "g_Time" {
                     vals = [time]
                 } else if u.name == "g_TexelSize" {
@@ -1049,6 +1055,7 @@ final class WEEffectChain {
              audio: AudioSpectrum = AudioSpectrum(),
              frameBuffer: MTLTexture? = nil,
              sceneFootprint: (mvp: simd_float4x4, outW: Int, outH: Int)? = nil,
+             pointerXform: SIMD4<Float> = SIMD4(1, 0, -1, 1),
              commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
         guard let key = comboAwareKey(effect, combos: combos), let edef = manifest[key], let def = selectVariant(edef, combos: combos) else {
             // 一次性诊断:manifest 缺失或变体不命中(静默失败的头号嫌疑),打出请求 combos vs 可用变体。
@@ -1220,8 +1227,8 @@ final class WEEffectChain {
 
             // 逐 pass 参数优先(bloom 各 pass strength 可不同);否则合并版。
             let params: [String: Any] = (pi < paramsPerPass.count) ? paramsPerPass[pi] : pkgParams
-            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio, auxResolutions: auxResolutions)
-            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio, auxResolutions: auxResolutions)
+            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio, auxResolutions: auxResolutions, pointerXform: pointerXform)
+            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio, auxResolutions: auxResolutions, pointerXform: pointerXform)
             // 大 UBO 走 MTLBuffer:setVertex/FragmentBytes 适合小块常量数据,实测本机对 ~3.6KB 的 UBO 上传会丢数据
             //   (audio_base 的 g_AudioSpectrum16/32/64 Left/Right 全段 → frag UBO 3664 字节,用 setFragmentBytes 后
             //    shader 读到的频谱恒 0、音频线完全不动;改 makeBuffer+setBuffer 后正常响应)。audioline(2112 字节)

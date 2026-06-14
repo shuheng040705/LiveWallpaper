@@ -209,7 +209,10 @@ final class SceneRenderer: WallpaperRenderer {
         renderLock.unlock()
 
         frameCount += 1
-        if frameCount % 180 == 1 { Log.write("SceneRenderer: frame \(frameCount) t=\(String(format: "%.1f", t))s mouse=(\(String(format: "%.2f", mn.x)),\(String(format: "%.2f", mn.y)))") }
+        if frameCount % 180 == 1 {
+            let d = engine.debugCursorInfo
+            Log.write("SceneRenderer: frame \(frameCount) t=\(String(format: "%.1f", t))s mouse=(\(String(format: "%.2f", mn.x)),\(String(format: "%.2f", mn.y))) drawable=\(Int(layer.drawableSize.width))x\(Int(layer.drawableSize.height)) aspectMouse=(\(String(format: "%.3f", d.aspect.x)),\(String(format: "%.3f", d.aspect.y))) cursorUV=(\(String(format: "%.3f", d.cursorUV.x)),\(String(format: "%.3f", d.cursorUV.y))) canvas=\(Int(d.canvas.x))x\(Int(d.canvas.y))")
+        }
     }
 
     private func drawOnce() {

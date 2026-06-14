@@ -344,6 +344,7 @@ final class SceneRenderEngine {
     private var pipelineBlitMix: MTLRenderPipelineState?          // 常量-alpha 混合:把后处理层结果按 opacity 叠回前一画面
     private var pipelineBlitFXAA: MTLRenderPipelineState?          // FXAA 呈现(画质设置开时用)
     private var pipelineBlitAspect: MTLRenderPipelineState?        // 屏幕适配呈现(uvScale 居中裁切/留黑边,= lwe updateTextureUVs)
+    private var pipelineCursorMark: MTLRenderPipelineState?        // 诊断(WP_CURSOR_MARK):在引擎认为的 cursorUV 处画十字+环,核对 vs 物理光标
     // MARK: 3D 透视场景(太阳系3662790108/土星3589454154 等;.mdl 几何模型 + 透视相机 + 深度缓冲)
     private struct Material3DGPU { let tex: MTLTexture?; let color: SIMD3<Float>; let brightness: Float; let alpha: Float; let translucent: Bool; let lighting: Bool }
     private struct Submesh3DGPU { let mat: Material3DGPU; let start: Int; let count: Int }
@@ -617,6 +618,18 @@ final class SceneRenderEngine {
                 df.vertexFunction = fsv; df.fragmentFunction = fxaa
                 df.colorAttachments[0].pixelFormat = .bgra8Unorm
                 pipelineBlitFXAA = try? device.makeRenderPipelineState(descriptor: df)
+            }
+            // 光标标记诊断管线(blend 叠在呈现画面上)。
+            if let cm = lib.makeFunction(name: "cursor_marker") {
+                let dc = MTLRenderPipelineDescriptor()
+                dc.vertexFunction = fsv; dc.fragmentFunction = cm
+                let a = dc.colorAttachments[0]!
+                a.pixelFormat = .bgra8Unorm
+                a.isBlendingEnabled = true
+                a.rgbBlendOperation = .add; a.alphaBlendOperation = .add
+                a.sourceRGBBlendFactor = .sourceAlpha; a.destinationRGBBlendFactor = .oneMinusSourceAlpha
+                a.sourceAlphaBlendFactor = .one; a.destinationAlphaBlendFactor = .oneMinusSourceAlpha
+                pipelineCursorMark = try? device.makeRenderPipelineState(descriptor: dc)
             }
         }
         // 3D 透视场景模型管线(深度测试 + 透视 MVP);不透明(写深度)+ 透明(alpha 混合、只读深度)两条。
@@ -2374,6 +2387,10 @@ final class SceneRenderEngine {
     /// 且视差已收敛+鼠标未动时为 false → SceneRenderer 跳过本帧渲染(空闲 CPU 趋近 0)。默认 true(首帧必画)。
     private(set) var frameDidChange = true
     private var lastMouseForChange = SIMD2<Float>(-999, -999)   // 上帧鼠标(变化检测;初值异常 → 首帧必变)
+    /// 诊断用(WP_CURSOR_LOG):实时 aspectMouse(ndc 校正)/ cursorUV(喂 xray/视差的 pointer)/ canvas。
+    var debugCursorInfo: (aspect: SIMD2<Float>, cursorUV: SIMD2<Float>, canvas: SIMD2<Float>) {
+        (aspectMouse, cursorUV, canvas)
+    }
     /// 正交投影矩阵(load 时算好,每帧视差更新复用)。
     private var proj = matrix_identity_float4x4
 
@@ -3020,7 +3037,9 @@ final class SceneRenderEngine {
                                     paramsPerPass: eff.weParamsPerPass.map { $0 as [String: Any] },
                                     time: currentTime, cursor: cursorUV,
                                     audio: currentAudio, frameBuffer: fb,
-                                    sceneFootprint: footprint, commandBuffer: cmd)
+                                    sceneFootprint: footprint,
+                                    pointerXform: pointerXform(forLayer: i),
+                                    commandBuffer: cmd)
                 if let out = runOut {
                     fxDiag("RAN combos=\(eff.weCombos)")
                     current = out
@@ -3031,6 +3050,22 @@ final class SceneRenderEngine {
                 }
             }
             layers[i].effectedTexture = (current !== layers[i].texture) ? current : nil
+    }
+
+    /// 把屏幕 UV pointer(cursorUV,y 向上)变换到该层 effect 的 texcoord 空间的仿射系数 (ax,bx,ay,by):
+    ///   feed.x = ax·cursor.x+bx,feed.y = ay·cursor.y+by。effect 跑在该层的缩放 quad 上(texcoord 0-1 = 缩放
+    ///   quad ≠ 画布);层 scale≠1 或 origin 偏心时不校正,xray 揭示框 / depthparallax 会按未缩放定位 → 随距
+    ///   中心放大偏移(实测 3605892961 层 scale=1.3 → 揭示框偏 1.3×)。全画布层 = (1,0,-1,1) → 退回
+    ///   [cursor.x,1-cursor.y] 零回归。WP_NO_POINTER_SCALE_FIX=1 退回。
+    private func pointerXform(forLayer i: Int) -> SIMD4<Float> {
+        guard ProcessInfo.processInfo.environment["WP_NO_POINTER_SCALE_FIX"] == nil,
+              i >= 0, i < layers.count else { return SIMD4(1, 0, -1, 1) }
+        let sp = layers[i].sizePx, og = layers[i].origin
+        guard sp.x > 0, sp.y > 0, canvas.x > 0, canvas.y > 0 else { return SIMD4(1, 0, -1, 1) }
+        // feed.x = (cursor.x·canvas.x − og.x)/sp.x + 0.5(光标在 quad 内的 texcoord u);
+        // feed.y = 0.5 − (cursor.y·canvas.y − og.y)/sp.y(y 向上→texcoord v 翻)。og=originPx(y 向上),sp=size×scale。
+        return SIMD4(canvas.x / sp.x, 0.5 - og.x / sp.x,
+                     -canvas.y / sp.y, 0.5 + og.y / sp.y)
     }
 
     /// 把整帧(图层 + 非折射粒子 → [折射粒子] → [后处理])渲染进 finalTarget。
@@ -4122,6 +4157,22 @@ final class SceneRenderEngine {
             enc.setFragmentTexture(srcTex, index: 0)
             enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); enc.endEncoding()
         }
+        // 诊断:WP_CURSOR_MARK=1 在引擎 cursorUV 对应的屏幕位置叠画十字+环(走与 halo 一致的 nd 映射:
+        // 屏幕 uv = 0.5+(canvasUV-0.5)*nd;cursorUV.y 是 y 向上,屏幕 y 向下 → 取 1-cursorUV.y 再过 nd)。
+        if ProcessInfo.processInfo.environment["WP_CURSOR_MARK"] != nil, let cmPipe = pipelineCursorMark {
+            let mp = MTLRenderPassDescriptor()
+            mp.colorAttachments[0].texture = drawable.texture
+            mp.colorAttachments[0].loadAction = .load
+            mp.colorAttachments[0].storeAction = .store
+            if let me = cmd.makeRenderCommandEncoder(descriptor: mp) {
+                me.setRenderPipelineState(cmPipe)
+                var info = SIMD4<Float>(0.5 + (cursorUV.x - 0.5) * aspectMouse.x,
+                                        0.5 + ((1.0 - cursorUV.y) - 0.5) * aspectMouse.y,
+                                        Float(w) / Float(max(1, h)), 0)
+                me.setFragmentBytes(&info, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
+                me.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); me.endEncoding()
+            }
+        }
         let tex = srcTex   // 下方抓帧/保存沿用最终呈现源
         let save = captureEnabled && (liveFrameCount % captureStep == 0) && liveFrameCount <= captureMax
         let n = liveFrameCount; if captureEnabled { liveFrameCount += 1 }
@@ -4661,6 +4712,17 @@ final class SceneRenderEngine {
         float3 rgbB = rgbA*0.5 + 0.25*(t.sample(s, uv+dir*-0.5).rgb + t.sample(s, uv+dir*0.5).rgb);
         float lB = dot(rgbB, luma);
         return float4((lB < lMin || lB > lMax) ? rgbA : rgbB, mC.a);
+    }
+    // 诊断:在 info.xy(屏幕 UV,y 向下)处画绿十字 + 红环;info.z=屏幕宽高比(环做圆形校正)。
+    // 标记 = 引擎认为的光标位置;与物理鼠标对比即知 cursor 链路是否准。WP_CURSOR_MARK 启用。
+    fragment float4 cursor_marker(VOut in [[stage_in]], constant float4& info [[buffer(0)]]) {
+        float2 d = (in.uv - info.xy) * float2(info.z, 1.0);
+        float r = length(d);
+        if (r < 0.006) return float4(0,1,0,1);                       // 绿心
+        if (abs(r - 0.028) < 0.0035) return float4(1,0,0,1);         // 红环
+        if (abs(d.x) < 0.0012 && r < 0.07) return float4(0,1,0,1);   // 竖线
+        if (abs(d.y) < 0.0012 && r < 0.07) return float4(0,1,0,1);   // 横线
+        discard_fragment();
     }
     """
 }
