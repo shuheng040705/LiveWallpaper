@@ -1232,6 +1232,18 @@ final class SceneRenderEngine {
                     //   主 puppet(龙/刀/朱鹤/头发/衣物,非眼)走平面蒙皮(use3D=false,丢 rx/ry)=旧行为零回归
                     //   (朱鹤 anim458 bone2 rx→π/2 在 2D 无深度下出平面旋转会折叠成色块,故主 puppet 不上 3D)。
                     //   WP_NO_EYE_SKIN=1 退回旧静态 bind 绕过(A/B 对比)。
+                    //
+                    // ⭐**use3D 改按动画实际是否出平面判定(2026-06-14d,逐部件 pkg 数据驱动,替代旧「眼名即 3D」)**:
+                    //   逐部件扒 pkg(/tmp/anim_tracks.py)实证两类眼部动画:
+                    //     ① 出平面折叠(需 trs3D):凯尔希×Mon3tr 3462491575「眼睛」anim1405 bone2 rx→π/2 + tz→−61
+                    //        —— 虹膜绕 X 翻转后退,正交下 x/y 收缩闭眼。平面 trs 丢 rx/tz → 眼恒睁。
+                    //     ② 平面眨眼(只 tx/ty/rz/scale,rx=ry=0):凯尔希×Mon3tr「m眼睛」anim1038(sy→0.77);
+                    //        Esperanta 3719111841「右眼上眼睑」anim164(ty 平移盖)/「眼睛组合」anim176(14 骨 sy→0.18 挤眼)。
+                    //        这些**眼睑/挤眼是平面动画**,该走 flat trs;trs3D 在 rx=ry=0 时逐元素退化==trs(隔离渲染
+                    //        像素 diff=0 实证),故走 isAnimationPlanar 门控:平面 → use3D=false(明确表达「眼睑不是 3D 折叠」)。
+                    //   旧「眼名即 use3D=true」对平面眼睑虽数学等价(无回归),但语义错误(把眼睑当 3D 折叠对待);
+                    //   现按 anim 真实轨道判定,只有真出平面(rx/ry≠0)才上 trs3D,与各部件 pkg 数据一一对应。
+                    //   WP_EYE_FLAT=1 强制全眼部平面(诊断);WP_EYE_3D=1 强制全眼部 3D(诊断)。
                     let nm = layer.name.lowercased()
                     let isEye = layer.name.contains("眼") || nm.contains("eye")
                     let eyeSkinOn = ProcessInfo.processInfo.environment["WP_NO_EYE_SKIN"] == nil
@@ -1239,13 +1251,18 @@ final class SceneRenderEngine {
                     if attachOK {
                         puppetMesh = mesh; puppetAnimId = al.animation; puppetAnimRate = al.rate
                         if isEye {
-                            eyeUse3D = true
-                            switch ProcessInfo.processInfo.environment["WP_EYE_CULL"] {
+                            // 数据驱动:动画含出平面 rx/ry → trs3D 闭合;纯平面眨眼/挤眼 → flat trs(眼睑)。
+                            let outOfPlane = !mesh.isAnimationPlanar(al.animation)
+                            let env = ProcessInfo.processInfo.environment
+                            if env["WP_EYE_FLAT"] != nil { eyeUse3D = false }
+                            else if env["WP_EYE_3D"] != nil { eyeUse3D = true }
+                            else { eyeUse3D = outOfPlane }
+                            switch env["WP_EYE_CULL"] {
                             case "back":  eyeCull = .back
                             case "front": eyeCull = .front
-                            default:      eyeCull = .none   // 默认不剔除;3D 蒙皮自身闭合眼睛
+                            default:      eyeCull = .none   // 默认不剔除;3D 蒙皮自身闭合眼睛(平面眼睑亦无翻面)
                             }
-                            Log.write("puppet: \(layer.name) 眼睛部件 → 3D 蒙皮 anim\(al.animation)(cull=\(eyeCull == .back ? "back" : eyeCull == .front ? "front" : "none"))")
+                            Log.write("puppet: \(layer.name) 眼睛部件 → \(eyeUse3D ? "3D 蒙皮(出平面 rx/ry)" : "平面蒙皮(眼睑/挤眼)") anim\(al.animation)(cull=\(eyeCull == .back ? "back" : eyeCull == .front ? "front" : "none"))")
                         }
                     } else if isEye {
                         Log.write("puppet: \(layer.name) 眼睛部件 → WP_NO_EYE_SKIN 退回静态 bind")

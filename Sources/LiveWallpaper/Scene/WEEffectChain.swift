@@ -108,6 +108,7 @@ final class WEEffectChain {
     private var pipeCache: [String: MTLRenderPipelineState] = [:]
     private var pipeFailed: Set<String> = []                 // 建管线失败的 key:负缓存,避免每帧重试+刷日志
     private var diagLogged: Set<String> = []                 // 诊断:无变体/无manifest 每组合只打一行
+    private var comboKeyFallbackLogged: Set<String> = []     // 诊断:combo 感知 key 回退(副本缺 MASK 变体→通用)每次只打一行
     private var rtPool: [String: MTLTexture] = [:]            // 命名 FBO
     private let quadBuf: MTLBuffer                            // 全屏 quad: pos.xyz + uv.xy
     private let whiteTex: MTLTexture                          // 1x1 白:兜底
@@ -264,6 +265,50 @@ final class WEEffectChain {
         guard effect.contains("/") else { return nil }
         let base = effect.components(separatedBy: "/").last ?? effect
         return basenameIndex[base]
+    }
+
+    /// combo 感知的 key 解析(修黑猫 3299228616 护猫遮罩失效):resolvedKey 的「原 key 优先」会命中
+    /// workshop 副本(如 workshop/2655151285/opacity)——但 WE 上传时该副本**只转译了 base 变体**
+    /// (we_build_effects.py scene_combos 把 `effects/workshop/<id>/opacity` 的 combos 错记到 key="workshop"
+    ///  而非该副本名 → 副本漏掉 MASK-1 变体)。于是 pkg 请求 combos=[MASK:1] 时 selectVariant 退回 base
+    /// (frag `mask=1.0`,**遮罩不采样** → 护猫洞完全失效、加色涟漪盖满整只猫)。
+    /// 修法:若**原 key 的任何变体都没声明**某个被请求的 combo(如 MASK),而 basename 索引到的通用特效
+    /// (shader 与副本同源,见 workshop-effect-basename-index)**有**声明该 combo 的变体 → 改用通用 key。
+    /// 作用域极窄:仅当 ①请求的 effect 本身是 **workshop 副本路径**(workshop/<id>/<name>)且原 key 命中
+    /// 该副本 ②原 key 缺失某请求 combo 的全部变体 且 ③该缺失 combo 是**遮罩类**(MASK/OPACITYMASK——只有
+    /// 这类是「shader 不采样遮罩 = 静默失效」的可见 bug;其它 combo 如 waterflow 的 flowmask 槽不带 MASK、
+    /// audio 的 SHAPE 几何在 build 期烘进各变体,不走这条回退)且 ④通用 key 有该 combo 变体。
+    /// ⚠ 关键约束:**只对 workshop 副本→通用 回退,绝不反向**(pkg 显式引用裸名 `waterflow` 时 basenameIndex
+    ///   可能指向某 workshop 副本——那是另一份 shader,不能改;waterflow 的 g_Texture1 是流向场非 opacity 遮罩,
+    ///   引擎对它的隐式 MASK 注入是 no-op,回退会误换 shader → 3174556087 屋檐水流变样)。
+    /// 已正确转译副本(自带全变体)不受影响 → 零回归。WP_NO_COMBO_KEY_FALLBACK=1 退回纯 resolvedKey(A/B)。
+    func comboAwareKey(_ effect: String, combos: [String: Any]) -> String? {
+        let base = resolvedKey(effect)
+        guard let base, let edef = manifest[base] else { return base }
+        if ProcessInfo.processInfo.environment["WP_NO_COMBO_KEY_FALLBACK"] != nil { return base }
+        // 约束①:仅当请求的是 workshop 副本路径、且 resolvedKey 命中该副本本身(base == effect)。
+        //   裸名(waterflow)或 resolvedKey 已回退到 basename 的情形不动 —— 那是 pkg 显式选定的 shader。
+        guard effect.hasPrefix("workshop/"), base == effect else { return base }
+        // 原 key 各变体声明过的 combo 名集合(只看「键」:base 缺整个遮罩维度才需回退)。
+        var declared = Set<String>()
+        for v in edef.variants { for k in v.combos.keys { declared.insert(k) } }
+        // 约束③:只看遮罩类 combo(opacity 遮罩才会「shader 不采样 = 加色层盖住被护对象」)。
+        let maskCombos: Set<String> = ["MASK", "OPACITYMASK"]
+        let wantKeys = Set(combos.keys).intersection(maskCombos)
+        let missing = wantKeys.subtracting(declared)
+        guard !missing.isEmpty else { return base }
+        // 约束④:通用(basename)特效有该缺失遮罩 combo 的变体 → 改用通用 key。
+        let bn = effect.components(separatedBy: "/").last ?? effect
+        guard let generic = basenameIndex[bn], generic != base, let gdef = manifest[generic] else { return base }
+        var gdeclared = Set<String>()
+        for v in gdef.variants { for k in v.combos.keys { gdeclared.insert(k) } }
+        if missing.contains(where: { gdeclared.contains($0) }) {
+            if comboKeyFallbackLogged.insert("\(base)→\(generic)|\(missing.sorted())").inserted {
+                Log.write("WEFX combo-key-fallback \(effect): \(base)(缺\(missing.sorted()))→\(generic)")
+            }
+            return generic
+        }
+        return base
     }
     func has(_ effect: String) -> Bool { resolvedKey(effect) != nil }
 
@@ -811,7 +856,7 @@ final class WEEffectChain {
              frameBuffer: MTLTexture? = nil,
              sceneFootprint: (mvp: simd_float4x4, outW: Int, outH: Int)? = nil,
              commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
-        guard let key = resolvedKey(effect), let edef = manifest[key], let def = selectVariant(edef, combos: combos) else {
+        guard let key = comboAwareKey(effect, combos: combos), let edef = manifest[key], let def = selectVariant(edef, combos: combos) else {
             // 一次性诊断:manifest 缺失或变体不命中(静默失败的头号嫌疑),打出请求 combos vs 可用变体。
             let dk = "\(effect)|\(Self.comboInts(combos))"
             if diagLogged.insert(dk).inserted {
