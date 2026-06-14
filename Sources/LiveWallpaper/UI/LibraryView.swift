@@ -1,16 +1,18 @@
 import SwiftUI
 
-/// 主界面:左侧毛玻璃侧边栏(分类导航 + 设置)+ 右侧内容区(卡片网格 或 设置表单)。
+/// 主界面(原生 macOS 风格):NavigationSplitView 左侧原生侧边栏 + 右侧内容区,
+/// 选中壁纸时右侧再滑出壁纸设置检视面板。配色全部使用系统强调色(Color.accentColor),
+/// 不再硬编码品牌渐变,以贴合 macOS 原生审美(随用户系统强调色变化)。
 struct LibraryView: View {
     @ObservedObject var library: WallpaperLibrary
     var currentID: String?
     var actions: LibraryActions
 
-    @State private var section: Section = .all
+    @State private var section: Section =
+        ProcessInfo.processInfo.environment["WP_PREVIEW_SETTINGS"] != nil ? .settings : .all
     @State private var search = ""
     @State private var favVersion = 0   // 收藏变更后强制刷新
-    @State private var settingsItem: WallpaperItem?   // 正在设置的壁纸(弹 sheet)
-    @State private var ratingsExpanded = false   // 「全部」是否展开年龄段子项
+    @State private var settingsItem: WallpaperItem?   // 正在设置的壁纸(右侧检视面板)
 
     enum Section: Hashable {
         case all, favorites
@@ -29,13 +31,13 @@ struct LibraryView: View {
         }
         var icon: String {
             switch self {
-            case .all: return "square.grid.2x2.fill"
-            case .favorites: return "heart.fill"
-            case .workshop: return "cart.fill"
-            case .settings: return "gearshape.fill"
+            case .all: return "square.grid.2x2"
+            case .favorites: return "heart"
+            case .workshop: return "bag"
+            case .settings: return "gearshape"
             case .type(let t):
                 switch t {
-                case .video: return "film.fill"
+                case .video: return "film"
                 case .scene: return "sparkles"
                 case .web: return "globe"
                 default: return "questionmark"
@@ -44,12 +46,12 @@ struct LibraryView: View {
         }
     }
 
-    /// 年龄段图标(复选框行用)。
+    /// 年龄段图标(筛选菜单用)。
     private func ratingIcon(_ r: ContentRating) -> String {
         switch r {
-        case .everyone: return "person.fill"
-        case .questionable: return "exclamationmark.shield.fill"
-        case .mature: return "18.circle.fill"
+        case .everyone: return "person"
+        case .questionable: return "exclamationmark.shield"
+        case .mature: return "18.circle"
         case .unknown: return "questionmark"
         }
     }
@@ -146,11 +148,110 @@ struct LibraryView: View {
         return sortDesc ? s.reversed() : s
     }
 
+    // MARK: - 布局
+
     var body: some View {
+        NavigationSplitView {
+            sidebar
+                .navigationSplitViewColumnWidth(min: 204, ideal: 220, max: 280)
+        } detail: {
+            detail
+                .navigationSplitViewColumnWidth(min: 560, ideal: 760)
+        }
+        .navigationSplitViewStyle(.balanced)
+        .frame(minWidth: 1000, minHeight: 640)
+        .onAppear {
+            // 截图验证用:WP_PREVIEW_PANEL=1 直接展开第一张壁纸的检视面板(不触发应用壁纸)。
+            if ProcessInfo.processInfo.environment["WP_PREVIEW_PANEL"] != nil, settingsItem == nil {
+                settingsItem = filtered.first
+            }
+        }
+    }
+
+    /// 切换分区(切到工坊/设置时收起壁纸检视面板)。
+    private func select(_ s: Section) {
+        if s == .workshop || s == .settings {
+            withAnimation(.easeOut(duration: 0.2)) { settingsItem = nil }
+        }
+        section = s
+    }
+
+    // MARK: - 侧边栏(原生 List)
+
+    private var sidebar: some View {
+        List(selection: Binding<Section?>(get: { section }, set: { if let v = $0 { select(v) } })) {
+            Label(Section.all.title, systemImage: Section.all.icon)
+                .badge(ratingFilteredItems.count)
+                .tag(Section.all)
+            Label(Section.favorites.title, systemImage: Section.favorites.icon)
+                .badge(filteredFavCount)
+                .tag(Section.favorites)
+            Label(Section.workshop.title, systemImage: Section.workshop.icon)
+                .tag(Section.workshop)
+
+            SwiftUI.Section("类型") {
+                ForEach([WallpaperType.video, .scene, .web], id: \.self) { t in
+                    Label(t.displayName, systemImage: Section.type(t).icon)
+                        .badge(filteredTypeCount(t))
+                        .tag(Section.type(t))
+                }
+            }
+        }
+        .listStyle(.sidebar)
+        .safeAreaInset(edge: .bottom) {
+            // 底部固定:设置 + 重新扫描(原生小工具条)。
+            VStack(spacing: 2) {
+                Divider()
+                Button { select(.settings) } label: {
+                    Label("设置", systemImage: "gearshape")
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .foregroundStyle(section == .settings ? Color.accentColor : .primary)
+                .padding(.horizontal, 10).padding(.vertical, 5)
+
+                Button { library.scan() } label: {
+                    HStack(spacing: 8) {
+                        if library.isScanning {
+                            ProgressView().controlSize(.small).scaleEffect(0.75).frame(width: 16)
+                        } else {
+                            Image(systemName: "arrow.clockwise").frame(width: 16)
+                        }
+                        Text(library.isScanning ? "扫描中…" : "重新扫描")
+                        Spacer()
+                    }
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(library.isScanning)
+                .padding(.horizontal, 10).padding(.vertical, 5)
+            }
+            .padding(.bottom, 8)
+            .background(.ultraThinMaterial)
+        }
+    }
+
+    private var filteredFavCount: Int {
+        let fav = PreferencesStore.shared.favorites
+        return ratingFilteredItems.filter { fav.contains($0.id) }.count
+    }
+    private func filteredTypeCount(_ t: WallpaperType) -> Int {
+        ratingFilteredItems.filter { $0.type == t }.count
+    }
+
+    // MARK: - 详情区
+
+    @ViewBuilder
+    private var detail: some View {
         HStack(spacing: 0) {
-            sidebar.frame(width: 248)
-            mainArea
-            // 选中壁纸时右侧滑出设置边栏。
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .toolbar { toolbarContent }
+                .navigationTitle(section.title)
+                .navigationSubtitle(section == .settings || section == .workshop ? "" : "\(filtered.count) 张壁纸")
+            // 选中壁纸时右侧滑出壁纸检视面板。
             if let item = settingsItem {
                 Divider()
                 WallpaperSettingsPanel(
@@ -167,227 +268,71 @@ struct LibraryView: View {
                 .transition(.move(edge: .trailing).combined(with: .opacity))
             }
         }
-        .frame(minWidth: 980, minHeight: 640)
-        .background(VisualEffectView(material: .underWindowBackground).ignoresSafeArea())
     }
 
-    // MARK: - 侧边栏(放大版)
-
-    private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            HStack(spacing: 11) {
-                Image(systemName: "photo.stack.fill")
-                    .font(.system(size: 24))
-                    .foregroundStyle(LinearGradient(colors: [.pink, .purple],
-                                                    startPoint: .topLeading, endPoint: .bottomTrailing))
-                Text("壁纸库").font(.system(size: 20, weight: .bold))
-            }
-            .padding(.leading, 20).padding(.top, 40).padding(.bottom, 22)
-
-            VStack(spacing: 4) {
-                allRow
-                if ratingsExpanded {
-                    ForEach([ContentRating.everyone, .questionable, .mature], id: \.self) { r in
-                        ratingRow(r)
-                    }
-                }
-                navRow(.favorites, count: filteredFavCount)
-                navRow(.workshop, count: nil)
-
-                Text("类型")
-                    .font(.system(size: 12, weight: .semibold)).foregroundStyle(.tertiary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.leading, 16).padding(.top, 18).padding(.bottom, 6)
-
-                ForEach([WallpaperType.video, .scene, .web], id: \.self) { t in
-                    navRow(.type(t), count: filteredTypeCount(t))
-                }
-            }
-            .padding(.horizontal, 12)
-
-            Spacer()
-
-            // 设置 + 重新扫描
-            VStack(spacing: 4) {
-                navRow(.settings, count: nil)
-                Button { library.scan() } label: {
-                    HStack(spacing: 12) {
-                        if library.isScanning {
-                            ProgressView().controlSize(.small).scaleEffect(0.8).frame(width: 24)
-                        } else {
-                            Image(systemName: "arrow.clockwise").font(.system(size: 15)).frame(width: 24)
-                        }
-                        Text(library.isScanning ? "扫描中…" : "重新扫描").font(.system(size: 14))
-                        Spacer()
-                    }
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12).padding(.vertical, 9)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(library.isScanning)
-            }
-            .padding(.horizontal, 12).padding(.bottom, 14)
-        }
-        .frame(maxHeight: .infinity)
-        .background(VisualEffectView(material: .sidebar).ignoresSafeArea())
-    }
-
-    private func navRow(_ s: Section, count: Int?) -> some View {
-        let selected = section == s
-        return Button {
-            withAnimation(.easeOut(duration: 0.15)) {
-                section = s
-                // 切到创意工坊/设置时关闭右侧壁纸属性栏(避免「全部」里选的壁纸属性栏残留)。
-                if s == .workshop || s == .settings { settingsItem = nil }
-            }
-        } label: {
-            HStack(spacing: 13) {
-                Image(systemName: s.icon)
-                    .font(.system(size: 16)).frame(width: 26)
-                    .foregroundStyle(selected ? .white : (s == .favorites ? .pink : Color.secondary))
-                Text(s.title)
-                    .font(.system(size: 15, weight: selected ? .semibold : .regular))
-                    .foregroundStyle(selected ? .white : .primary)
-                Spacer()
-                if let count {
-                    Text("\(count)")
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(selected ? .white.opacity(0.9) : .secondary)
-                        .padding(.horizontal, 7).padding(.vertical, 2)
-                        .background(Capsule().fill(selected ? Color.white.opacity(0.18) : Color.secondary.opacity(0.12)))
-                }
-            }
-            .padding(.horizontal, 12).padding(.vertical, 10)
-            .background(
-                RoundedRectangle(cornerRadius: 10).fill(
-                    selected ? AnyShapeStyle(LinearGradient(colors: [.pink, .purple],
-                                                            startPoint: .leading, endPoint: .trailing))
-                             : AnyShapeStyle(Color.clear))
-            )
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    /// 「全部」行:点击主体显示全部;右侧 chevron 切换展开三个年龄段子项。
-    private var allRow: some View {
-        let selected = section == .all
-        return HStack(spacing: 13) {
-            Image(systemName: Section.all.icon)
-                .font(.system(size: 16)).frame(width: 26)
-                .foregroundStyle(selected ? .white : Color.secondary)
-            Text(Section.all.title)
-                .font(.system(size: 15, weight: selected ? .semibold : .regular))
-                .foregroundStyle(selected ? .white : .primary)
-            Spacer()
-            Text("\(ratingFilteredItems.count)")
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(selected ? .white.opacity(0.9) : .secondary)
-                .padding(.horizontal, 7).padding(.vertical, 2)
-                .background(Capsule().fill(selected ? Color.white.opacity(0.18) : Color.secondary.opacity(0.12)))
-            Button {
-                withAnimation(.easeOut(duration: 0.15)) { ratingsExpanded.toggle() }
-            } label: {
-                Image(systemName: "chevron.right")
-                    .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(selected ? .white.opacity(0.9) : .secondary)
-                    .rotationEffect(.degrees(ratingsExpanded ? 90 : 0))
-                    .frame(width: 18, height: 18)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-        }
-        .padding(.horizontal, 12).padding(.vertical, 10)
-        .background(
-            RoundedRectangle(cornerRadius: 10).fill(
-                selected ? AnyShapeStyle(LinearGradient(colors: [.pink, .purple],
-                                                        startPoint: .leading, endPoint: .trailing))
-                         : AnyShapeStyle(Color.clear))
-        )
-        .contentShape(Rectangle())
-        .onTapGesture { withAnimation(.easeOut(duration: 0.15)) { section = .all } }
-    }
-
-    private var filteredFavCount: Int {
-        let fav = PreferencesStore.shared.favorites
-        return ratingFilteredItems.filter { fav.contains($0.id) }.count
-    }
-    private func filteredTypeCount(_ t: WallpaperType) -> Int {
-        ratingFilteredItems.filter { $0.type == t }.count
-    }
-
-    /// 年龄段复选行:勾选框控制全局筛选(多选);徽章=该档**总**数量。点击切换勾选。
-    private func ratingRow(_ r: ContentRating) -> some View {
-        let on = selectedRatings.contains(r)
-        let count = library.ratingCounts[r] ?? 0
-        return Button {
-            withAnimation(.easeOut(duration: 0.15)) { toggleRating(r) }
-        } label: {
-            HStack(spacing: 10) {
-                Image(systemName: on ? "checkmark.square.fill" : "square")
-                    .font(.system(size: 15)).frame(width: 20)
-                    .foregroundStyle(on ? AnyShapeStyle(LinearGradient(colors: [.pink, .purple],
-                                                                       startPoint: .top, endPoint: .bottom))
-                                        : AnyShapeStyle(Color.secondary))
-                Image(systemName: ratingIcon(r))
-                    .font(.system(size: 12)).frame(width: 18)
-                    .foregroundStyle(on ? .primary : .secondary)
-                Text(r.displayName)
-                    .font(.system(size: 13, weight: on ? .medium : .regular))
-                    .foregroundStyle(on ? .primary : .secondary)
-                Spacer()
-                Text("\(count)")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 7).padding(.vertical, 2)
-                    .background(Capsule().fill(Color.secondary.opacity(0.12)))
-            }
-            .padding(.leading, 26).padding(.trailing, 12).padding(.vertical, 7)
-            .contentShape(Rectangle())
-        }
-        .buttonStyle(.plain)
-    }
-
-    // MARK: - 主区
-
-    private var mainArea: some View {
-        VStack(spacing: 0) {
-            if section != .workshop {
-                HStack(spacing: 12) {
-                    VStack(alignment: .leading, spacing: 1) {
-                        Text(section.title).font(.system(size: 20, weight: .bold))
-                        Text(subtitle).font(.system(size: 12)).foregroundStyle(.secondary)
-                    }
-                    Spacer()
-                    if section != .settings {
-                        gridSizeControl
-                        sortControl
-                        searchField
-                    }
-                }
-                .padding(.horizontal, 24).padding(.top, 30).padding(.bottom, 16)
-            }
-
-            switch section {
-            case .workshop:
-                WorkshopView()
-            case .settings:
-                SettingsForm(actions: actions,
-                             currentItem: currentID.flatMap { id in library.items.first { $0.id == id } })
-            default:
-                if library.items.isEmpty { emptyState }
-                else if filtered.isEmpty { noResultsState }
-                else { grid }
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var subtitle: String {
+    @ViewBuilder
+    private var content: some View {
         switch section {
-        case .settings: return "偏好与控制"
-        default: return "\(filtered.count) 张壁纸"
+        case .workshop:
+            WorkshopView()
+        case .settings:
+            SettingsForm(actions: actions,
+                         currentItem: currentID.flatMap { id in library.items.first { $0.id == id } })
+        default:
+            if library.items.isEmpty { emptyState }
+            else if filtered.isEmpty { noResultsState }
+            else { grid }
+        }
+    }
+
+    // MARK: - 工具栏
+
+    @ToolbarContentBuilder
+    private var toolbarContent: some ToolbarContent {
+        if section != .workshop && section != .settings {
+            ToolbarItemGroup {
+                // 内容分级筛选菜单(原生 Mail 式筛选)。
+                Menu {
+                    ForEach([ContentRating.everyone, .questionable, .mature], id: \.self) { r in
+                        Toggle(isOn: Binding(get: { selectedRatings.contains(r) },
+                                             set: { _ in toggleRating(r) })) {
+                            Label("\(r.displayName) (\(library.ratingCounts[r] ?? 0))", systemImage: ratingIcon(r))
+                        }
+                    }
+                } label: {
+                    Label("筛选", systemImage: "line.3.horizontal.decrease.circle")
+                }
+                .help("内容分级筛选")
+
+                // 排序菜单。
+                Menu {
+                    Picker("排序方式", selection: Binding(get: { sortKey }, set: {
+                        sortKey = $0; PreferencesStore.shared.sortKeyRaw = $0.rawValue
+                    })) {
+                        ForEach(SortKey.allCases, id: \.self) { Label($0.title, systemImage: $0.icon).tag($0) }
+                    }
+                    Divider()
+                    Picker("顺序", selection: Binding(get: { sortDesc }, set: {
+                        sortDesc = $0; PreferencesStore.shared.sortDescending = $0
+                    })) {
+                        Label("升序", systemImage: "arrow.up").tag(false)
+                        Label("降序", systemImage: "arrow.down").tag(true)
+                    }
+                } label: {
+                    Label("排序", systemImage: "arrow.up.arrow.down")
+                }
+                .help("排序方式")
+
+                // 网格大小切换。
+                Picker("图标大小", selection: Binding(get: { gridSize }, set: { newSize in
+                    withAnimation(.easeOut(duration: 0.18)) { gridSize = newSize }
+                    PreferencesStore.shared.gridSizeRaw = newSize.rawValue
+                })) {
+                    ForEach(GridSize.allCases, id: \.self) { Image(systemName: $0.icon).tag($0) }
+                }
+                .pickerStyle(.segmented)
+                .help("图标大小")
+            }
         }
     }
 
@@ -405,7 +350,7 @@ struct LibraryView: View {
         }
     }
 
-    /// 选中壁纸:应用它 + 滑出右侧设置边栏(切换到该壁纸的设置)。
+    /// 选中壁纸:应用它 + 滑出右侧设置检视面板。
     private func selectAndConfigure(_ item: WallpaperItem) {
         actions.onSelect(item)
         withAnimation(.easeOut(duration: 0.22)) { settingsItem = item }
@@ -444,117 +389,57 @@ struct LibraryView: View {
                     }
                 }
             }
-            .padding(.horizontal, 24).padding(.bottom, 24)
+            .padding(20)
             .id(favVersion)
         }
-    }
-
-    /// 排序控件:菜单选排序字段 + 一个升/降序切换按钮。
-    private var sortControl: some View {
-        HStack(spacing: 6) {
-            Menu {
-                ForEach(SortKey.allCases, id: \.self) { key in
-                    Button {
-                        sortKey = key
-                        PreferencesStore.shared.sortKeyRaw = key.rawValue
-                    } label: {
-                        Label(key.title, systemImage: sortKey == key ? "checkmark" : key.icon)
-                    }
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    Image(systemName: "arrow.up.arrow.down").font(.system(size: 11))
-                    Text(sortKey.title).font(.system(size: 12))
-                }
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-
-            Button {
-                sortDesc.toggle()
-                PreferencesStore.shared.sortDescending = sortDesc
-            } label: {
-                Image(systemName: sortDesc ? "chevron.down" : "chevron.up")
-                    .font(.system(size: 11, weight: .semibold))
-                    .frame(width: 24, height: 24)
-                    .background(RoundedRectangle(cornerRadius: 7).fill(.quaternary.opacity(0.6)))
-            }
-            .buttonStyle(.plain)
-            .help(sortDesc ? "降序" : "升序")
-        }
-    }
-
-    /// 网格大小切换:小/中/大三段(改 adaptive 列最小宽 → 卡片尺寸)。持久化到 PreferencesStore。
-    private var gridSizeControl: some View {
-        HStack(spacing: 2) {
-            ForEach(GridSize.allCases, id: \.self) { sz in
-                let on = gridSize == sz
-                Button {
-                    withAnimation(.easeOut(duration: 0.18)) { gridSize = sz }
-                    PreferencesStore.shared.gridSizeRaw = sz.rawValue
-                } label: {
-                    Image(systemName: sz.icon)
-                        .font(.system(size: 12, weight: on ? .semibold : .regular))
-                        .frame(width: 28, height: 24)
-                        .foregroundStyle(on ? AnyShapeStyle(LinearGradient(colors: [.pink, .purple], startPoint: .top, endPoint: .bottom)) : AnyShapeStyle(Color.secondary))
-                        .background(RoundedRectangle(cornerRadius: 6).fill(on ? Color.pink.opacity(0.14) : .clear))
-                }
-                .buttonStyle(.plain)
-                .help("\(sz.title)图标")
-            }
-        }
-        .padding(2)
-        .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.6)))
-    }
-
-    private var searchField: some View {
-        HStack(spacing: 6) {
-            Image(systemName: "magnifyingglass").font(.system(size: 12)).foregroundStyle(.secondary)
-            TextField("搜索…", text: $search)
-                .textFieldStyle(.plain).font(.system(size: 13)).frame(width: 160)
-            if !search.isEmpty {
-                Button { search = "" } label: {
-                    Image(systemName: "xmark.circle.fill").font(.system(size: 12)).foregroundStyle(.tertiary)
-                }.buttonStyle(.plain)
-            }
-        }
-        .padding(.horizontal, 10).padding(.vertical, 7)
-        .background(RoundedRectangle(cornerRadius: 8).fill(.quaternary.opacity(0.6)))
+        .searchable(text: $search, placement: .toolbar, prompt: "搜索壁纸")
     }
 
     private var emptyState: some View {
-        VStack(spacing: 10) {
-            Spacer()
-            Image(systemName: library.isScanning ? "hourglass" : "tray")
-                .font(.system(size: 44)).foregroundStyle(.secondary)
-            Text(library.isScanning ? "正在扫描壁纸…" : "没找到壁纸")
-                .font(.system(size: 15, weight: .medium)).foregroundStyle(.secondary)
-            Text(library.rootURL.path)
-                .font(.caption).foregroundStyle(.tertiary)
-                .lineLimit(2).multilineTextAlignment(.center).padding(.horizontal, 40)
-            Spacer()
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        EmptyStateView(
+            label: library.isScanning ? "正在扫描壁纸…" : "没找到壁纸",
+            systemImage: library.isScanning ? "hourglass" : "tray",
+            description: library.rootURL.path
+        )
     }
 
     private var noResultsState: some View {
-        VStack(spacing: 10) {
-            Spacer()
-            Image(systemName: section == .favorites ? "heart.slash" : "magnifyingglass")
-                .font(.system(size: 40)).foregroundStyle(.tertiary)
-            Text(section == .favorites ? "还没有收藏" : "没有匹配的壁纸")
-                .font(.system(size: 14)).foregroundStyle(.secondary)
-            if section == .favorites {
-                Text("把喜欢的壁纸点上 ♥,这里就会出现")
-                    .font(.caption).foregroundStyle(.tertiary)
+        EmptyStateView(
+            label: section == .favorites ? "还没有收藏" : "没有匹配的壁纸",
+            systemImage: section == .favorites ? "heart.slash" : "magnifyingglass",
+            description: section == .favorites ? "把喜欢的壁纸点上 ♥,这里就会出现" : "试试别的搜索词"
+        )
+    }
+}
+
+/// 占位空态(macOS 13 没有系统 ContentUnavailableView,这里自绘一个对齐风格的版本)。
+struct EmptyStateView: View {
+    let label: String
+    let systemImage: String
+    var description: String? = nil
+    var body: some View {
+        VStack(spacing: 8) {
+            Image(systemName: systemImage)
+                .font(.system(size: 38, weight: .regular))
+                .foregroundStyle(.tertiary)
+            Text(label)
+                .font(.title3.weight(.semibold))
+                .foregroundStyle(.secondary)
+            if let description {
+                Text(description)
+                    .font(.callout)
+                    .foregroundStyle(.tertiary)
+                    .multilineTextAlignment(.center)
+                    .lineLimit(2)
+                    .padding(.horizontal, 40)
             }
-            Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
 /// 单张壁纸卡片:16:9 预览 + 悬停放大/阴影 + 渐变标题 + 播放中角标 + 收藏心形。
+/// 选中描边使用系统强调色(Color.accentColor)。
 struct WallpaperCard: View {
     let item: WallpaperItem
     var isCurrent: Bool
@@ -587,12 +472,12 @@ struct WallpaperCard: View {
                     Spacer()
                 }
                 .padding(.horizontal, 10).padding(.bottom, 8).padding(.top, 24)
-                .background(LinearGradient(colors: [.clear, .black.opacity(0.75)], startPoint: .top, endPoint: .bottom))
+                .background(LinearGradient(colors: [.clear, .black.opacity(0.72)], startPoint: .top, endPoint: .bottom))
             }
 
             if hovering {
                 Image(systemName: "play.circle.fill")
-                    .font(.system(size: 40)).foregroundStyle(.white.opacity(0.9)).shadow(radius: 6)
+                    .font(.system(size: 40)).foregroundStyle(.white.opacity(0.95)).shadow(radius: 6)
                     .transition(.scale.combined(with: .opacity))
             }
 
@@ -627,16 +512,14 @@ struct WallpaperCard: View {
         }
         .frame(maxWidth: .infinity)
         .background(Color.black.opacity(0.001))
-        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
         .overlay(
-            RoundedRectangle(cornerRadius: 12).strokeBorder(
-                isCurrent ? AnyShapeStyle(LinearGradient(colors: [.pink, .purple],
-                                                         startPoint: .topLeading, endPoint: .bottomTrailing))
-                          : AnyShapeStyle(Color.white.opacity(0.08)),
-                lineWidth: isCurrent ? 2.5 : 1)
+            RoundedRectangle(cornerRadius: 10).strokeBorder(
+                isCurrent ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.primary.opacity(0.08)),
+                lineWidth: isCurrent ? 3 : 1)
         )
-        .shadow(color: .black.opacity(hovering ? 0.35 : 0.15), radius: hovering ? 14 : 6, y: hovering ? 8 : 3)
-        .scaleEffect(hovering ? 1.025 : 1.0)
+        .shadow(color: .black.opacity(hovering ? 0.28 : 0.12), radius: hovering ? 12 : 5, y: hovering ? 6 : 2)
+        .scaleEffect(hovering ? 1.02 : 1.0)
         .animation(.easeOut(duration: 0.18), value: hovering)
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)

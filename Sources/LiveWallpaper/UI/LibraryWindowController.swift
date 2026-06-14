@@ -36,12 +36,12 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
 
         let hosting = NSHostingController(rootView: makeRoot())
         let w = NSWindow(contentViewController: hosting)
-        w.title = "Live Wallpaper · 壁纸库"
+        w.title = "壁纸库"
         w.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
-        // 透明标题栏 + 全尺寸内容:侧边栏毛玻璃延伸到顶部,红绿灯按钮浮在内容上。
+        // 透明标题栏 + 全尺寸内容:侧边栏毛玻璃延伸到顶部(原生 NavigationSplitView 统一工具栏外观)。
+        // 标题/副标题由 SwiftUI navigationTitle 驱动,显示在详情区工具栏(Finder 式)。
         w.titlebarAppearsTransparent = true
-        w.titleVisibility = .hidden
-        w.isMovableByWindowBackground = true
+        w.titleVisibility = .visible
         w.isReleasedWhenClosed = false
         w.delegate = self
         // 首次打开用默认大小并居中;有保存值时由 frameAutosave 立即覆盖恢复。

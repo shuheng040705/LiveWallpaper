@@ -10,7 +10,7 @@ import SwiftUI
 /// 完成时显示 steamcmd 报的**真实**总大小与**真实**平均速度(总字节 ÷ 真实耗时)。
 struct DownloadRow: View {
     let job: WorkshopDownloader.Job
-    private let accent = Color(red: 0.92, green: 0.36, blue: 0.62)
+    private let accent = Color.accentColor
 
     var body: some View {
         switch job.state {

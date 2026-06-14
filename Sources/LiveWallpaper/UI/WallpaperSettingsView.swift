@@ -10,7 +10,7 @@ struct WallpaperSettingsPanel: View {
 
     @State private var version = 0   // 改动后递增,触发条件重算 + 控件刷新
     @ObservedObject private var store = WallpaperPropertyStore.shared
-    private let accent = Color(red: 0.92, green: 0.36, blue: 0.62)
+    private let accent = Color.accentColor
 
     /// 直接从 item 派生,绝不为空/失步(修「时全时空」)。
     private var allProperties: [WallpaperProperty] {
@@ -138,7 +138,7 @@ struct WallpaperSettingsPanel: View {
             }
             .buttonStyle(.plain).help("关闭")
         }
-        .padding(.horizontal, 16).padding(.top, 36).padding(.bottom, 14)
+        .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 14)
     }
 
     private var resetBar: some View {
@@ -435,7 +435,7 @@ struct WallpaperSettingsView: View {
     @State private var properties: [WallpaperProperty] = []
     @State private var version = 0   // 改动后刷新
     private let store = WallpaperPropertyStore.shared
-    private let accent = Color(red: 0.92, green: 0.36, blue: 0.62)
+    private let accent = Color.accentColor
 
     var body: some View {
         VStack(spacing: 0) {

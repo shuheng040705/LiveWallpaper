@@ -9,7 +9,7 @@ struct WorkshopView: View {
     @ObservedObject private var downloader = WorkshopDownloader.shared
 
     private let workshopURL = "https://steamcommunity.com/app/431960/workshop/"
-    private let accent = Color(red: 0.92, green: 0.36, blue: 0.62)
+    private let accent = Color.accentColor
 
     /// 从当前 URL 解析 workshop id(详情页 …/filedetails/?id=12345)。
     private var currentItemID: String? {
@@ -156,11 +156,10 @@ struct WorkshopView: View {
 
     private func navButton(_ icon: String, enabled: Bool, _ act: @escaping () -> Void) -> some View {
         Button(action: act) {
-            Image(systemName: icon).font(.system(size: 12, weight: .medium))
-                .frame(width: 28, height: 26)
-                .background(RoundedRectangle(cornerRadius: 7).fill(.white.opacity(0.06)))
+            Image(systemName: icon).font(.system(size: 13, weight: .medium))
+                .frame(width: 26, height: 24)
         }
-        .buttonStyle(.plain).disabled(!enabled).opacity(enabled ? 1 : 0.35)
+        .buttonStyle(.borderless).disabled(!enabled).opacity(enabled ? 1 : 0.35)
     }
 }
 

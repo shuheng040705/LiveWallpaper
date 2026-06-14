@@ -3,7 +3,7 @@ import SwiftUI
 /// 「下载管理」窗口内容:集中查看所有下载任务的进度,可取消、清除已完成。
 struct DownloadsView: View {
     @ObservedObject private var downloader = WorkshopDownloader.shared
-    private let accent = Color(red: 0.92, green: 0.36, blue: 0.62)
+    private let accent = Color.accentColor
 
     @State private var showLogin = false
 

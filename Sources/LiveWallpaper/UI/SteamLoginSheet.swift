@@ -17,7 +17,7 @@ struct SteamLoginSheet: View {
     @State private var message = ""
 
     enum Phase { case credentials, guardCode, success }
-    private let accent = Color(red: 0.92, green: 0.36, blue: 0.62)
+    private let accent = Color.accentColor
 
     var body: some View {
         VStack(spacing: 0) {

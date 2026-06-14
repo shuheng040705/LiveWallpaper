@@ -24,6 +24,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
         setupMainMenu()
+        // UI 预览模式(WP_UI_PREVIEW=1,截图验证用):不启动桌面渲染/电源/轮换,
+        // 只扫描库并打开主窗口 → 可对新 UI 截图,而不干扰正在运行的壁纸实例。
+        if ProcessInfo.processInfo.environment["WP_UI_PREVIEW"] != nil {
+            library.scan { [weak self] in self?.openLibrary() }
+            return
+        }
         desktop.start()
         power.start()
         NowPlayingProvider.shared.start()   // 系统正在播放的音乐(喂 Now Playing widget 歌名/艺术家)
