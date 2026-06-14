@@ -518,9 +518,6 @@ final class Scene3DRuntime {
         let main = lights.first(where: { $0.directional }) ?? l
         let w = worldsById[main.id] ?? matrix_identity_float4x4
         let pos = SIMD3(w.columns.3.x, w.columns.3.y, w.columns.3.z)
-        // L = 世界空间「表面 → 光源」方向。土星/太阳系两张的 sun 都用脚本驱动光源**世界旋转**编码方向
-        //(土星 ldirectional.angles.y=sun 方位;太阳系 lpoint 在原点但其旋转随 sun 转)→ 世界 +Z 列即朝向。
-        // 点光若有真实离原点位置(parent 偏移)则优先 normalize(pos)(物理:原点天体 → 光源);否则退回 +Z 旋转向量。
         let fwd = SIMD3(w.columns.2.x, w.columns.2.y, w.columns.2.z)   // 世界 +Z 列(旋转编码的光源方向)
         var dir: SIMD3<Float>
         if !main.directional && simd_length(pos) > 0.05 {
@@ -530,9 +527,47 @@ final class Scene3DRuntime {
         } else {
             dir = SIMD3(0, 0, 1)
         }
-        // 强度归一(WE intensity 是物理多光源累加;这里单光源做漫反射系数,6=「全光照」→1.5,截到合理范围)。
         let i = max(0, min(main.intensity, 8)) / 8.0 * 2.0
         return ResolvedLight(dir: dir, color: main.color, intensity: min(i, 1.5), ambient: ambientColor)
+    }
+
+    // MARK: - 方向光 / 阴影(土星:scene.general.lightconfig directional+directionalshadow=1)
+    //  方向光 id=259(ldirectional)依 shared.sun_pos* 朝太阳;环(462)/陨石(479)是 shadow caster 投在行星(456)→
+    //  行星赤道出现暗带(经典土星环影),正好落在 HUD 时钟/信息文字处 → 白字得以读出。我们原 model3d_fragment
+    //  只 albedo×color×brightness 零光照 → 行星均匀亮、白字被冲掉。补 N·L 漫反射 + 环阴影暗带。
+    private(set) var directionalLightId: Int?
+    private(set) var pointLightId: Int?
+    private(set) var pointLightVisible = false
+    private(set) var sunModelId: Int?            // 视觉太阳模型(485/520);其世界位置=光源方向锚
+    private(set) var planetModelId: Int?         // 行星(球体01)
+    private(set) var ringModelId: Int?           // 土星环(投影 caster)
+
+    /// 行星中心世界坐标(阴影正交相机的注视点)。
+    func planetCenterWorld() -> SIMD3<Float> {
+        guard let pid = planetModelId, let w = worldsById[pid] else { return SIMD3(0, 0, -2) }
+        return SIMD3(w.columns.3.x, w.columns.3.y, w.columns.3.z)
+    }
+    /// 行星世界半径估计(用三轴 scale 取最大;球体01 是单位球,世界半径≈scale)。
+    func planetWorldRadius() -> Float {
+        guard let pid = planetModelId, let w = worldsById[pid] else { return 1.5 }
+        let sx = simd_length(SIMD3(w.columns.0.x, w.columns.0.y, w.columns.0.z))
+        let sy = simd_length(SIMD3(w.columns.1.x, w.columns.1.y, w.columns.1.z))
+        let sz = simd_length(SIMD3(w.columns.2.x, w.columns.2.y, w.columns.2.z))
+        return max(sx, max(sy, sz))
+    }
+    /// 指向太阳的单位方向(世界空间,= 行星→太阳模型)。N·L 与阴影相机都用它。
+    func sunWorldDirection() -> SIMD3<Float> {
+        let c = planetCenterWorld()
+        if let sid = sunModelId, let w = worldsById[sid] {
+            let sp = SIMD3(w.columns.3.x, w.columns.3.y, w.columns.3.z)
+            let d = sp - c
+            if simd_length(d) > 1e-4 { return simd_normalize(d) }
+        }
+        if let h = host {
+            let sp = SIMD3(Float(h.sharedNum("sun_posx") ?? -1), Float(h.sharedNum("sun_posy") ?? 0), Float(h.sharedNum("sun_posz") ?? 0))
+            if simd_length(sp) > 1e-4 { return simd_normalize(sp) }
+        }
+        return simd_normalize(SIMD3(-1, 0, 0))
     }
 
     init?(source: SceneSource) {
@@ -642,6 +677,19 @@ final class Scene3DRuntime {
             }
             return true
         }
+        // 光源 / 太阳 / 行星 / 环 识别(土星环影所需:方向光朝向 + caster/receiver 几何)。
+        for o in objects {
+            guard let id = intOf(o["id"]) else { continue }
+            if let lt = o["light"] as? String {
+                if lt == "ldirectional" { directionalLightId = id }
+                else if lt == "lpoint" {
+                    pointLightId = id
+                    if let n = o["visible"] as? NSNumber, CFGetTypeID(n) == CFBooleanGetTypeID() { pointLightVisible = n.boolValue }
+                    else if let bv = o["visible"] as? Bool { pointLightVisible = bv }
+                    else { pointLightVisible = true }   // 缺省可见(土星 433 显式 false → 点光关闭)
+                }
+            }
+        }
         for o in objects {
             guard let id = intOf(o["id"]), let modelPath = o["model"] as? String else { continue }
             if !modelVisible(o["visible"]) { continue }
@@ -652,7 +700,12 @@ final class Scene3DRuntime {
             var mats: [Model3DMaterial] = []
             for sm in geo.submeshes { mats.append(Self.resolveMaterial(path: sm.material, source: source)) }
             if mats.isEmpty { mats = [Model3DMaterial()] }
-            models.append(Model3DObject(id: id, name: o["name"] as? String ?? "", meshPath: modelPath,
+            let nm = o["name"] as? String ?? ""
+            // 行星(球体01)/ 环(木星环)/ 视觉太阳(name=sun) 标记。
+            if modelPath.contains("球体01") { planetModelId = id }
+            else if modelPath.contains("木星环") { ringModelId = id }
+            if nm == "sun" && sunModelId == nil { sunModelId = id }
+            models.append(Model3DObject(id: id, name: nm, meshPath: modelPath,
                                         geometry: geo, world: matrix_identity_float4x4, materials: mats))
         }
         // 场景光源(WE 3D 光照:ldirectional/lpoint;color/intensity/radius 取 pkg,缺省 WE 默认)。

@@ -40,6 +40,22 @@ private func matPerspective(fovRadians: Float, aspect: Float, nearZ: Float, farZ
 
 /// 缺口2:视图矩阵。移植 lwe Camera.cpp:13 `glm::lookAt(eye, center, up)`(右手系、列主序)。
 /// 仅在透视场景使用;正交场景照旧不用 lookAt(见 load() 中等价性证明:ortho 下 (+eye)(−eye) 相消)。
+/// 正交投影(右手系,列主序,Metal 深度 [0,1]):阴影相机用。x∈[-halfW,halfW]→[-1,1],
+/// y∈[-halfH,halfH]→[-1,1],z(视空间,看向 -z)∈[-near,-far]→[0,1]。
+private func matOrthoRH(halfW: Float, halfH: Float, nearZ: Float, farZ: Float) -> simd_float4x4 {
+    let nf = 1 / (nearZ - farZ)
+    return simd_float4x4(columns: (
+        SIMD4(1 / halfW, 0, 0, 0),
+        SIMD4(0, 1 / halfH, 0, 0),
+        SIMD4(0, 0, nf, 0),                  // z' = (z·1 + ...)·nf ; RH 看 -z → near 处 z=-near
+        SIMD4(0, 0, nearZ * nf, 1)
+    ))
+}
+/// RH lookAt(同 matLookAt;此别名供阴影相机语义清晰)。
+private func matLookAtRH(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> simd_float4x4 {
+    matLookAt(eye: eye, center: center, up: up)
+}
+
 private func matLookAt(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>) -> simd_float4x4 {
     let zf = simd_normalize(eye - center)   // glm lookAt: f = normalize(center-eye); 这里 z = -f = normalize(eye-center)
     let xf = simd_normalize(simd_cross(up, zf))
@@ -373,7 +389,12 @@ final class SceneRenderEngine {
     // MARK: 3D 透视场景(太阳系3662790108/土星3589454154 等;.mdl 几何模型 + 透视相机 + 深度缓冲)
     private struct Material3DGPU { let tex: MTLTexture?; let color: SIMD3<Float>; let brightness: Float; let alpha: Float; let translucent: Bool; let lighting: Bool }
     private struct Submesh3DGPU { let mat: Material3DGPU; let start: Int; let count: Int }
-    private struct Model3DGPU { let id: Int; let vb: MTLBuffer; let ib: MTLBuffer; var world: simd_float4x4; let submeshes: [Submesh3DGPU] }
+    // lit=接收方向光 N·L + 阴影(仅行星);castsShadow=作为环影 caster(土星环/陨石)。
+    private struct Model3DGPU { let id: Int; let vb: MTLBuffer; let ib: MTLBuffer; var world: simd_float4x4; let submeshes: [Submesh3DGPU]; var lit: Bool = false; var castsShadow: Bool = false }
+    // 方向光阴影(土星)运行参数:由 build3DModels 从 Scene3DRuntime 算出。
+    private var scene3DLightDir = SIMD3<Float>(-1, 0, 0)   // 指向太阳(世界)
+    private var scene3DLightVP = matrix_identity_float4x4  // 阴影正交相机 view·proj
+    private var scene3DHasShadow = false                   // 该场景有方向光阴影(土星)→ 跑阴影 pass
     private var models3D: [Model3DGPU] = []
     private var scene3DRuntime: Scene3DRuntime?      // 脚本+变换运行时(逐帧 live 或烘焙)
     private var scene3DPerFrame = false              // 脚本数少(土星)→ 逐帧 tick 宿主(HUD 文字 live);多(太阳系)→ 烘焙冻结
@@ -429,6 +450,9 @@ final class SceneRenderEngine {
     }
     private var depthState3DWrite: MTLDepthStencilState?     // depth test+write(不透明)
     private var depthState3DNoWrite: MTLDepthStencilState?   // depth test 只读(透明,后画)
+    private var pipeline3DShadow: MTLRenderPipelineState?    // 方向光阴影投影(土星环影):caster 几何深度-only
+    private var shadowMapTex: MTLTexture?                    // 方向光阴影深度图(2048²)
+    private static let shadowMapSize = 2048
     private var whiteTex3D: MTLTexture?                       // baseColor 缺失兜底(1×1 白)
     var has3DScene: Bool { !models3D.isEmpty }
     private var renderScaleTex: MTLTexture?                        // render-scale/MetalFX 的低分辨率编码目标
@@ -688,6 +712,14 @@ final class SceneRenderEngine {
             depthState3DWrite = device.makeDepthStencilState(descriptor: dw)
             let dn = MTLDepthStencilDescriptor(); dn.depthCompareFunction = .less; dn.isDepthWriteEnabled = false
             depthState3DNoWrite = device.makeDepthStencilState(descriptor: dn)
+            // 方向光阴影投影管线(深度-only,无 color attachment):caster→光源正交相机。
+            if let sv = lib.makeFunction(name: "model3d_shadow_vertex") {
+                let sd = MTLRenderPipelineDescriptor()
+                sd.vertexFunction = sv; sd.fragmentFunction = nil
+                sd.depthAttachmentPixelFormat = .depth32Float
+                sd.colorAttachments[0].pixelFormat = .invalid
+                pipeline3DShadow = try? device.makeRenderPipelineState(descriptor: sd)
+            }
         }
         // 轨道椭圆 shader(WE guidao.frag/guidao2.frag 转译,独立库):全屏后处理画 P1-P4(内)/P5-P9(外)椭圆。
         if let olib = try? device.makeLibrary(source: orbitShaderSource, options: nil),
@@ -3267,16 +3299,16 @@ final class SceneRenderEngine {
     /// 实时与离屏共用,保证两条路一致。
     // MARK: - 3D 透视场景渲染(.mdl 模型)
 
-    // 与 Metal shader `struct U3` 内存布局一致:float4x4(64) + float3(16,含pad) + float + float。
-    // 3D 模型 uniform:mvp + 材质 color/brightness/alpha + 光照(法线矩阵以 float4x4 传,避 float3x3 对齐坑)。
-    // SIMD3<Float> 在 Swift/Metal 都对齐 16 字节;字段顺序与 Metal `U3` 严格一致。
+    // 与 Metal shader `struct U3` 内存布局一致:
+    //  mvp(64) + model(64) + lightVP(64) + color(float3=16含pad,brightness填pad) + alpha
+    //  + lightDir(float3=16含pad,lit填pad) + ambient + shadowStrength + pad0 + pad1。
     private struct U3GPU {
-        var mvp: simd_float4x4
-        var normalMat: simd_float4x4          // world 法线矩阵(逆转置上 3×3,放进 float4x4)
-        var color: SIMD3<Float>; var brightness: Float
-        var lightDir: SIMD3<Float>; var alpha: Float
-        var lightColor: SIMD3<Float>; var lightIntensity: Float
-        var ambient: SIMD3<Float>; var lighting: Float   // lighting:1=做 N·L 漫反射,0=平涂
+        var mvp: simd_float4x4 = matrix_identity_float4x4
+        var model: simd_float4x4 = matrix_identity_float4x4
+        var lightVP: simd_float4x4 = matrix_identity_float4x4
+        var color: SIMD3<Float> = SIMD3(1, 1, 1); var brightness: Float = 1; var alpha: Float = 1
+        var lightDir: SIMD3<Float> = SIMD3(-1, 0, 0); var lit: Float = 0
+        var ambient: Float = 0.18; var shadowStrength: Float = 0.7; var pad0: Float = 0; var pad1: Float = 0
     }
 
     /// 解析并上传 3D 模型(几何 GPU 缓冲 + baseColor 纹理 + 世界矩阵)。
@@ -3378,7 +3410,10 @@ final class SceneRenderEngine {
                                           lighting: mat.lighting),
                                           start: sm.indexStart, count: sm.indexCount))
             }
-            out.append(Model3DGPU(id: o.id, vb: vb, ib: ib, world: o.world, submeshes: subs))
+            // 行星(球体01)= 受光体(N·L + 接收环影);环/陨石 = caster。
+            let lit = (rt.planetModelId == o.id)
+            let caster = (rt.ringModelId == o.id) || (o.meshPath.contains("陨石"))
+            out.append(Model3DGPU(id: o.id, vb: vb, ib: ib, world: o.world, submeshes: subs, lit: lit, castsShadow: caster))
             if ProcessInfo.processInfo.environment["WP_3D_DUMP"] != nil {
                 for (i, sm) in o.geometry.submeshes.enumerated() {
                     let mat = i < o.materials.count ? o.materials[i] : Model3DMaterial()
@@ -3387,13 +3422,32 @@ final class SceneRenderEngine {
             }
         }
         models3D = out
-        // 3D 场景方向光(N·L 漫反射昼夜终止线):rt.bake/recompute 已写 sun 驱动的光源世界位置 → 取主光。
-        // WP_NO_3D_LIGHTING=1 退回平涂(旧行为)做 before/after 对比。
-        light3D = ProcessInfo.processInfo.environment["WP_NO_3D_LIGHTING"] == nil ? rt.lightInfo() : nil
-        if let l = light3D {
-            let litSubs = out.reduce(0) { $0 + $1.submeshes.filter { $0.mat.lighting }.count }
-            let totSubs = out.reduce(0) { $0 + $1.submeshes.count }
-            Log.write("3D light: dir=\(l.dir) color=\(l.color) intensity=\(l.intensity) ambient=\(l.ambient) litSubmeshes=\(litSubs)/\(totSubs)")
+        // 方向光阴影(土星 directionalshadow=1):光源朝向 + 正交阴影相机 view·proj。
+        // 太阳系等无行星/环或被 WP_NO_RING_SHADOW 关闭 → scene3DHasShadow=false,零影响。
+        scene3DHasShadow = false
+        if ProcessInfo.processInfo.environment["WP_NO_RING_SHADOW"] == nil,
+           pipeline3DShadow != nil, rt.directionalLightId != nil, rt.planetModelId != nil,
+           out.contains(where: { $0.lit }), out.contains(where: { $0.castsShadow }) {
+            let dir = rt.sunWorldDirection()              // 指向太阳
+            let center = rt.planetCenterWorld()
+            let radius = max(0.5, rt.planetWorldRadius())
+            scene3DLightDir = dir
+            // 正交阴影相机:从行星沿 +dir(太阳侧)退到 eye,看向中心;盒半径覆盖行星+环范围。
+            let ortho = max(radius * 4.0, 4.0)
+            let eye = center + dir * (ortho * 1.5)
+            var up = SIMD3<Float>(0, 1, 0)
+            if abs(simd_dot(simd_normalize(dir), up)) > 0.95 { up = SIMD3(0, 0, 1) }
+            let lv = matLookAtRH(eye: eye, center: center, up: up)
+            let lp = matOrthoRH(halfW: ortho, halfH: ortho, nearZ: 0.01, farZ: ortho * 3.0)
+            scene3DLightVP = lp * lv
+            scene3DHasShadow = true
+            if shadowMapTex == nil {
+                let sd = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .depth32Float,
+                          width: Self.shadowMapSize, height: Self.shadowMapSize, mipmapped: false)
+                sd.usage = [.renderTarget, .shaderRead]; sd.storageMode = .private
+                shadowMapTex = device.makeTexture(descriptor: sd)
+            }
+            Log.write("3D shadow: dir=\(dir) center=\(center) r=\(radius) ortho=\(ortho) casters=\(out.filter{$0.castsShadow}.map{$0.id}) lit=\(out.filter{$0.lit}.map{$0.id}) point433visible=\(rt.pointLightVisible)")
         }
         // 太阳辉光精灵纹理(image 是材质 json → textures[0] → .tex)
         sunSpriteTex.removeAll()
@@ -3452,6 +3506,29 @@ final class SceneRenderEngine {
             dd.usage = .renderTarget; dd.storageMode = .private
             depthTex3D = device.makeTexture(descriptor: dd)
         }
+        // ── 阴影投影 pass(土星方向光环影):caster(环/陨石)深度→光源正交相机 ──
+        if scene3DHasShadow, let shadowPL = pipeline3DShadow, let smap = shadowMapTex {
+            let sp = MTLRenderPassDescriptor()
+            sp.depthAttachment.texture = smap
+            sp.depthAttachment.loadAction = .clear
+            sp.depthAttachment.clearDepth = 1.0
+            sp.depthAttachment.storeAction = .store
+            if let senc = cmd.makeRenderCommandEncoder(descriptor: sp) {
+                senc.label = "scene3d-shadow"
+                senc.setRenderPipelineState(shadowPL)
+                senc.setDepthStencilState(depthState3DWrite)
+                for m in models3D where m.castsShadow {
+                    var su = U3GPU(); su.model = m.world; su.lightVP = scene3DLightVP
+                    senc.setVertexBuffer(m.vb, offset: 0, index: 0)
+                    senc.setVertexBytes(&su, length: MemoryLayout<U3GPU>.stride, index: 1)
+                    for s in m.submeshes {
+                        senc.drawIndexedPrimitives(type: .triangle, indexCount: s.count, indexType: .uint32,
+                                                   indexBuffer: m.ib, indexBufferOffset: s.start * 4)
+                    }
+                }
+                senc.endEncoding()
+            }
+        }
         let pass = MTLRenderPassDescriptor()
         pass.colorAttachments[0].texture = finalTarget
         pass.colorAttachments[0].loadAction = .clear
@@ -3465,24 +3542,29 @@ final class SceneRenderEngine {
               let opaque = pipeline3DOpaque, let blend = pipeline3DBlend else { return }
         enc.label = "scene3d"
         var ndc = ndcScale
+        let shadowTex = scene3DHasShadow ? shadowMapTex : nil
         for translucentPass in [false, true] {
             enc.setRenderPipelineState(translucentPass ? blend : opaque)
             enc.setDepthStencilState(translucentPass ? depthState3DNoWrite : depthState3DWrite)
             enc.setVertexBytes(&ndc, length: 8, index: 3)
             enc.setFragmentSamplerState(sampler, index: 0)
-            let lit = light3D
             for m in models3D {
                 let mvp = viewProj3D * m.world
-                // 世界法线矩阵 = world 上 3×3 的逆转置(处理各天体非均匀缩放,法线不被拉歪)。放进 float4x4。
-                let nm = normalMatrix(m.world)
                 enc.setVertexBuffer(m.vb, offset: 0, index: 0)
+                // 阴影贴图槽(texture 1):受光行星才绑(否则绑兜底白阴影图避免未绑采样)。
+                enc.setFragmentTexture(shadowTex, index: 1)
                 for s in m.submeshes where s.mat.translucent == translucentPass {
-                    let doLight = (lit != nil) && s.mat.lighting
-                    var u = U3GPU(mvp: mvp, normalMat: nm,
-                                  color: s.mat.color, brightness: s.mat.brightness,
-                                  lightDir: lit?.dir ?? SIMD3(0, 0, 1), alpha: s.mat.alpha,
-                                  lightColor: lit?.color ?? SIMD3(1, 1, 1), lightIntensity: lit?.intensity ?? 0,
-                                  ambient: lit?.ambient ?? .zero, lighting: doLight ? 1 : 0)
+                    var u = U3GPU(mvp: mvp, model: m.world, color: s.mat.color,
+                                  brightness: s.mat.brightness, alpha: s.mat.alpha)
+                    if m.lit && scene3DHasShadow {
+                        u.lit = 1; u.lightDir = scene3DLightDir; u.lightVP = scene3DLightVP
+                        // 可调(诊断/微调):WP_3D_AMBIENT 暗面底光、WP_3D_SHADOW_STR 环影暗度;
+                        // WP_3D_SHADOW_ONLY=1 把 N·L 关掉(ambient=1)只看环影带落点。
+                        let env = ProcessInfo.processInfo.environment
+                        if let a = env["WP_3D_AMBIENT"].flatMap({ Float($0) }) { u.ambient = a }
+                        if let s2 = env["WP_3D_SHADOW_STR"].flatMap({ Float($0) }) { u.shadowStrength = s2 }
+                        if env["WP_3D_SHADOW_ONLY"] != nil { u.ambient = 1 }
+                    }
                     enc.setVertexBytes(&u, length: MemoryLayout<U3GPU>.stride, index: 1)
                     enc.setFragmentBytes(&u, length: MemoryLayout<U3GPU>.stride, index: 1)
                     enc.setFragmentTexture(s.mat.tex ?? whiteTex3D, index: 0)
@@ -4607,16 +4689,20 @@ final class SceneRenderEngine {
 
     // ---- 3D 透视场景:模型 pass(太阳系/土星)----
     // 顶点缓冲交错:每顶点 8 float = pos.xyz, uv.xy, normal.xyz(32 字节)。
-    // U3:mvp + 法线矩阵 + 材质 color/brightness/alpha + 光照(lightDir/color/intensity/ambient/lighting)。
-    // 字段顺序/对齐与 Swift U3GPU 严格一致(SIMD3 = float3 都 16 字节对齐)。
-    struct V3Out { float4 position [[position]]; float2 uv; float3 worldNormal; };
+    // U3:mvp + model(世界矩阵,算世界法线/世界位置) + 颜色/亮度/alpha + 方向光 + 阴影矩阵 + 标志。
+    //  土星 scene.general.lightconfig = {directional:1, directionalshadow:1, point:1, pointshadow:1}:
+    //  方向光(259)对行星做 N·L 漫反射(昼夜终止线);土星环(462)/陨石(479)做 shadow caster,
+    //  经方向光阴影贴图投在行星表面 → 经典「土星环影」暗带。这条暗带正好落在 HUD 时钟/信息所在赤道
+    //  → 白字得以读出。原 shader 零光照(只 albedo×color×brightness)→ 行星均匀亮、字被冲掉。
+    struct V3Out { float4 position [[position]]; float2 uv; float3 normal; float3 wpos; };
     struct U3 {
-        float4x4 mvp;
-        float4x4 normalMat;
-        float3 color; float brightness;
-        float3 lightDir; float alpha;
-        float3 lightColor; float lightIntensity;
-        float3 ambient; float lighting;
+        float4x4 mvp; float4x4 model; float4x4 lightVP;
+        float3 color; float brightness; float alpha;
+        float3 lightDir;      // 指向太阳的单位方向(世界)
+        float lit;            // 1=做 N·L 漫反射 + 接收阴影(仅行星);0=原样(天空盒/太阳/环)
+        float ambient;        // 暗部地面光(防止背光面纯黑);N·L 下限
+        float shadowStrength; // 阴影暗度(0..1,1=全黑)
+        float pad0; float pad1;
     };
     vertex V3Out model3d_vertex(uint vid [[vertex_id]],
                                 const device float* v [[buffer(0)]],
@@ -4628,25 +4714,54 @@ final class SceneRenderEngine {
         o.position = u.mvp * float4(pos, 1.0);
         o.position.xy *= ndcScale;          // 宽高比 cover 适配(与 2D 一致)
         o.uv = float2(v[b+3], v[b+4]);
-        // 法线变换到世界空间(逆转置上 3×3,放在 normalMat 的 float4x4 里取 .xyz)。
-        float3 n = float3(v[b+5], v[b+6], v[b+7]);
-        o.worldNormal = (u.normalMat * float4(n, 0.0)).xyz;
+        // 世界法线(用 model 的旋转/缩放;土星近似均匀缩放,直接乘上三阶足够)。
+        float3x3 m3 = float3x3(u.model[0].xyz, u.model[1].xyz, u.model[2].xyz);
+        o.normal = normalize(m3 * float3(v[b+5], v[b+6], v[b+7]));
+        o.wpos = (u.model * float4(pos, 1.0)).xyz;
         return o;
+    }
+    // 阴影投影 pass:只把 caster 几何投到方向光的正交相机,写深度。
+    vertex float4 model3d_shadow_vertex(uint vid [[vertex_id]],
+                                        const device float* v [[buffer(0)]],
+                                        constant U3& u [[buffer(1)]]) {
+        uint b = vid * 8;
+        float3 pos = float3(v[b], v[b+1], v[b+2]);
+        return u.lightVP * (u.model * float4(pos, 1.0));   // lightVP·world·pos
     }
     fragment float4 model3d_fragment(V3Out in [[stage_in]],
                                      texture2d<float> tex [[texture(0)]],
+                                     depth2d<float> shadowMap [[texture(1)]],
                                      sampler smp [[sampler(0)]],
                                      constant U3& u [[buffer(1)]]) {
         float4 albedo = tex.sample(smp, in.uv);
         float3 rgb = albedo.rgb * u.color * u.brightness;
-        // 方向光漫反射(WE 3D 模型 LIGHTING:N·L 形成昼夜终止线)。lighting=0 时平涂(genericimage4/天空盒)。
-        if (u.lighting > 0.5) {
-            float3 N = normalize(in.worldNormal);
-            float ndl = max(0.0, dot(N, normalize(u.lightDir)));   // diffuse = max(0, dot(N,L))
-            float3 lit = u.ambient + u.lightColor * (u.lightIntensity * ndl);
-            rgb = albedo.rgb * u.color * u.brightness * lit;
-        }
         float a = albedo.a * u.alpha;
+        if (u.lit > 0.5) {
+            float3 N = normalize(in.normal);
+            float3 L = normalize(u.lightDir);
+            // 双面:法线朝向相机半球(避免行星背面三角法线翻转造成的脏点)。
+            // 方向光 N·L 漫反射;ambient 作为暗面底光(土星 ambientcolor=0 但实景暗面非纯黑,
+            // 给一点底光保留材质细节、且让字在暗带上仍可读)。
+            float ndl = max(dot(N, L), 0.0);
+            float diffuse = u.ambient + (1.0 - u.ambient) * ndl;
+            // 方向光阴影贴图(土星环/陨石投影):正交相机,深度比较。
+            float shadow = 1.0;
+            float4 lp = u.lightVP * float4(in.wpos, 1.0);
+            float3 ndc = lp.xyz / lp.w;
+            float2 suv = ndc.xy * 0.5 + 0.5;
+            suv.y = 1.0 - suv.y;                 // Metal 纹理坐标 y 向下
+            if (all(suv > float2(0.0)) && all(suv < float2(1.0)) && ndc.z >= 0.0 && ndc.z <= 1.0) {
+                constexpr sampler ss(coord::normalized, address::clamp_to_edge, filter::linear, compare_func::greater);
+                // PCF 3×3:caster 比片元更靠光源(深度更小)→ 在阴影里。bias 防自阴影摩尔纹。
+                float bias = 0.0015;
+                float sum = 0.0; float texel = 1.0 / 2048.0;
+                for (int dy = -1; dy <= 1; dy++)
+                  for (int dx = -1; dx <= 1; dx++)
+                    sum += shadowMap.sample_compare(ss, suv + float2(dx, dy) * texel, ndc.z - bias);
+                shadow = 1.0 - (u.shadowStrength * (sum / 9.0));
+            }
+            rgb *= diffuse * shadow;
+        }
         return float4(rgb, a);
     }
 
