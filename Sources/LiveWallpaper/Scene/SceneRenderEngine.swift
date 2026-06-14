@@ -384,6 +384,10 @@ final class SceneRenderEngine {
     private var scene3DIntroModels = false   // 入场动画(土星):从 t0 逐帧驱动模型(从下升起+倾入,>settled 后脚本本就 hold)
     private let noIntro = ProcessInfo.processInfo.environment["WP_NO_3D_INTRO"] != nil   // 退回烘焙冻结(土星卡半升起)
     private var scene3DIntroSettle: Double = 0   // 入场结束时刻(脚本最末关键帧 t);此后停刷模型省 GPU
+    // 持续自转(土星行星/环/陨石绕 Y 轴恒转,settle 后仍转):入场结束后**仍逐帧 recompute**模型世界矩阵。
+    // 相机静态(运行时相机对象 id=243)→ 转模型不漂。WP_NO_RING_ANIM=1 退回 settle 后冻结(旧行为,环静止)。
+    private var scene3DContinuousSpin = false
+    private let noRingAnim = ProcessInfo.processInfo.environment["WP_NO_RING_ANIM"] != nil
     private var logged3DHud = false   // WP_3D_HUD_LOG 诊断:只打一次 HUD 层位置
     private var viewProj3D = matrix_identity_float4x4
     private var light3D: Scene3DRuntime.ResolvedLight?   // 3D 场景方向光(N·L 漫反射昼夜终止线);nil/WP_NO_3D_LIGHTING=平涂
@@ -3198,6 +3202,10 @@ final class SceneRenderEngine {
         let settle = rt.modelAnimEndTime
         scene3DIntroSettle = settle > 0 ? settle : .greatestFiniteMagnitude
         if scene3DIntroModels { Log.write("3D intro animation: 模型从 t=0 升起, settle=\(settle)s (scripts=\(rt.scriptCount))") }
+        // 持续自转(土星行星/环/陨石绕 Y 轴恒转;祖先链 angles 脚本用 engine.frametime 累积无终点):
+        //   入场 settle 后**仍逐帧 recompute** → 环不冻结(相机静态不漂)。WP_NO_RING_ANIM 退回旧冻结行为对照。
+        scene3DContinuousSpin = !noRingAnim && scene3DPerFrame && rt.hasContinuousModelRotation
+        if scene3DContinuousSpin { Log.write("3D continuous spin: 模型持续自转(settle 后仍逐帧 recompute)") }
         rt.bake(toTime: bakeT)
         rt.recompute()
         // 日心太阳系模拟(VSOP87D Main 写 shared.currentFocus)→ 逐帧 tick+recompute+刷新模型世界矩阵 → 行星绕太阳公转
@@ -3273,6 +3281,12 @@ final class SceneRenderEngine {
                                           start: sm.indexStart, count: sm.indexCount))
             }
             out.append(Model3DGPU(id: o.id, vb: vb, ib: ib, world: o.world, submeshes: subs))
+            if ProcessInfo.processInfo.environment["WP_3D_DUMP"] != nil {
+                for (i, sm) in o.geometry.submeshes.enumerated() {
+                    let mat = i < o.materials.count ? o.materials[i] : Model3DMaterial()
+                    Log.write("MAT id=\(o.id) \(o.name) sm[\(i)] matPath=\(sm.material) tex=\(mat.baseColorTex ?? "nil") texLoaded=\(loadTex(mat.baseColorTex) != nil) color=\(mat.color) bright=\(mat.brightness) alpha=\(mat.alpha) translucent=\(mat.translucent) lighting=\(mat.lighting)")
+                }
+            }
         }
         models3D = out
         // 3D 场景方向光(N·L 漫反射昼夜终止线):rt.bake/recompute 已写 sun 驱动的光源世界位置 → 取主光。
@@ -3311,12 +3325,14 @@ final class SceneRenderEngine {
             let t = scene3DBakeTime + Double(currentTime)
             let dt = max(0.0, min(0.1, t - scene3DLastTime)); scene3DLastTime = t
             rt.tick(time: t, dt: dt)
-            // 逐帧 recompute + 刷新模型世界矩阵的两类场景:
+            // 逐帧 recompute + 刷新模型世界矩阵的三类场景:
             //   ①日心太阳系(R4,scene3DSolarOrbit):行星按 Main 写回的 origin/scale 绕太阳公转(相机固定看原点不漂)。
             //   ②入场动画(土星,introActive):模型从底部升起+倾入到 settled(相机静态不漂);settled(currentTime>末
-            //     关键帧 t)后停刷省 CPU(脚本本就 hold)。WP_3D_LIVE_MODELS 调试时对任何 3D 场景逐帧刷新。
+            //     关键帧 t)后停刷。WP_3D_LIVE_MODELS 调试时对任何 3D 场景逐帧刷新。
+            //   ③持续自转(土星行星/环/陨石,scene3DContinuousSpin):祖先链 angles 脚本 frametime 累积绕 Y 恒转,
+            //     **settle 后仍逐帧 recompute**(相机静态不漂)→ 环不冻结。稳态环约 0.76°/s。WP_NO_RING_ANIM 退回冻结。
             let introActive = scene3DIntroModels && Double(currentTime) <= scene3DIntroSettle + 0.5
-            if scene3DSolarOrbit || introActive || scene3DLiveModels {
+            if scene3DSolarOrbit || introActive || scene3DContinuousSpin || scene3DLiveModels {
                 rt.recompute()
                 for i in models3D.indices { if let wm = rt.worldsById[models3D[i].id] { models3D[i].world = wm } }
             }

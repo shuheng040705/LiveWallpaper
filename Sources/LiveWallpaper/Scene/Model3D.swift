@@ -455,6 +455,28 @@ final class Scene3DRuntime {
         }
         return maxT
     }
+    /// 任一**模型**的祖先链含「持续自转」angles 脚本(随时间累积无终点,settle 后仍转)。与有限入场关键帧
+    /// (modelAnimEndTime 后 hold)区分:持续自转脚本用 `engine.frametime` 逐帧累加角度。
+    /// 土星 3589454154「土星赤道中心」455/458/468:`accumulatedTime += engine.frametime;
+    ///   value.y = accumulatedTime/(baseRotationTime/(f·shared.kv))*360 % 360` → 行星/环/陨石绕 Y 轴持续旋转。
+    ///   kv 由对象 700 visible 脚本从 1 ramp 到 100(t=2..36s,绑用户属性 kv=100),稳态环约 0.76°/s(≈8 分钟/圈,
+    ///   清晰可见;这是用户所见 WE「环动态」的真实机制)。入场 459 origin/angles 用 `engine.runtime` 关键帧插值
+    ///   (到末关键帧 hold)不引用 frametime → 不命中。命中 → render3D 在 settle 后仍逐帧 recompute(相机静态,不漂)。
+    var hasContinuousModelRotation: Bool {
+        var seen = Set<Int>()
+        func isSpin(_ raw: Any?) -> Bool {
+            guard let d = raw as? [String: Any], let src = d["script"] as? String else { return false }
+            return src.contains("engine.frametime")
+        }
+        for m in models {
+            var cur: Int? = m.id, depth = 0
+            while let c = cur, let n = nodes[c], depth < 64 {
+                if !seen.contains(c) { seen.insert(c); if isSpin(n.anglesRaw) || isSpin(n.originRaw) { return true } }
+                cur = n.parent; depth += 1
+            }
+        }
+        return false
+    }
     var sharedDump: String { host?.sharedDump() ?? "no host" }
     func sharedJSON() -> String { host?.sharedJSON() ?? "{}" }
     func sharedHas(_ key: String) -> Bool { host?.sharedHas(key) ?? false }
