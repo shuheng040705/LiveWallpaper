@@ -14,7 +14,69 @@ final class Scene3DScriptHost {
     private var texts: [String: String] = [:]          // 文字脚本(text 属性)的字符串结果
     private(set) var registered = 0
 
-    init() { ctx.exceptionHandler = { _, _ in }; ctx.evaluateScript(WEScript.preludeSource) }
+    /// 太阳系 Main 模拟(VSOP87D 日心模拟)用 `Date.now()`(墙钟毫秒)算时间步进:
+    ///   `realDeltaMs = clamp(now - lastRealTime, 0, 100)`、`deltaSeconds = realDeltaMs/1000 * actualTimeMultiplier`、
+    ///   `actualTimeMultiplier = timenum(0-1) × TIME_UNITS[timedw]`(timedw=时间单位档:0=秒/s … 6=年/s)。
+    /// **不读 engine.runtime**。烘焙/逐帧若用真墙钟,相邻 tick 的 now 几乎不变 → realDeltaMs≈0 → 模拟不推进 →
+    /// 行星定格(就是 R4「行星静止」缺口的根因)。故把 `Date.now()` 改为**引擎 sim 时钟驱动**:首帧锚定真实当前时刻
+    /// (让模拟从真实天文日期起算,忠实 WE「实时太阳系」),其后按 `锚点 + engine.runtime*1000` 推进(逐帧 dt 真实) →
+    /// realDeltaMs = frametime*1000(被 clamp 到 ≤100ms,与 WE 一致)> 0 → 行星随时间公转(R4 修复)。
+    ///
+    /// **速度**:pkg 默认 timenum=1/timedw=0 = 实时(1 秒/秒,行星几乎不可见地慢——这是写实科普壁纸,用户拖速度滑块加速)。
+    ///   WP_SOLAR_SPEED 不直接乘 Date.now()(会被脚本 clamp(…,100) 吃掉,无效),而是**预置 storage 的 timedw 档位**
+    ///   (走 pkg 自己的速度脚本 id=859/860 路径,忠实)让模拟以该速度跑,供验证/演示。值=时间单位档 0-6(默认 nil=不预置=实时)。
+    static let solarSpeedUnit: Int? = ProcessInfo.processInfo.environment["WP_SOLAR_SPEED"].flatMap { Int($0) }.map { max(0, min(6, $0)) }
+    private var nowAnchorMs: Double = 0      // 首帧锚定的真实当前毫秒(模拟起算日期)
+    private var nowAnchored = false
+    /// sim 时钟开关:**仅日心太阳系模拟启用**(让 Date.now() 随 engine.runtime 推进 → 行星公转)。
+    /// 默认关闭 → Date.now() 恒返回 init 时的真实墙钟(与改前一致),故土星/其它 3D 场景的 Date.now() 行为零变化(零回归)。
+    /// 由 Scene3DRuntime 在检测到 shared.currentFocus(Main 模拟独有)后调 enableSimClock() 开启。
+    private var simClockEnabled = false
+    func enableSimClock() {
+        simClockEnabled = true
+        ctx.evaluateScript("globalThis.__simClockOn = true;")   // 开启 Date.now()/new Date() 的 sim 时钟覆盖(仅太阳系)
+        // WP_SOLAR_SPEED:预置 pkg 速度脚本(id=859/860)的 storage 档位 → 模拟以该速度档运行(忠实走 pkg 速度路径)。
+        // 默认 nil 时不预置 → 用 pkg 默认实时(timedw=0)。仅验证/演示用;正常运行不设此变量 → 行为=pkg 默认。
+        if let unit = Self.solarSpeedUnit {
+            ctx.evaluateScript("if(globalThis.storage){ globalThis.storage.set('timedw_storage', \(unit)); globalThis.storage.set('timenum_storage', 1); }")
+        }
+    }
+
+    init() {
+        ctx.exceptionHandler = { _, _ in }
+        ctx.evaluateScript(WEScript.preludeSource)
+        // storage 桩(时间倍率/单位脚本 id=859/860 用 storage.get/set 存档;prelude 只定义 localStorage)。
+        // 与 localStorage 同构,本地内存即可(单会话无需持久化);缺它会让倍率脚本走 catch 分支(默认值仍对)。
+        ctx.evaluateScript("""
+        globalThis.storage = globalThis.storage || {
+          __d: Object.create(null),
+          get(k){ k=String(k); return Object.prototype.hasOwnProperty.call(this.__d,k)?this.__d[k]:undefined; },
+          set(k,v){ this.__d[String(k)]=v; }, remove(k){ delete this.__d[String(k)]; }
+        };
+        """)
+        // Date.now()/new Date() 引擎 sim 时钟覆盖(见上注释)。**仅当 __simClockOn(=日心太阳系模拟,enableSimClock 置位)
+        // 时**返回 sim 毫秒 __nowSimMs;否则**完全透传真实墙钟**(土星等 HUD 时钟/Date 动画行为与改前一致,零回归)。
+        // __nowSimMs 由 tick 每帧写入;new Date()(无/单参)也读它(保持模拟日期一致)。
+        ctx.evaluateScript("""
+        globalThis.__simClockOn = false;
+        globalThis.__nowSimMs = Date.now();
+        (function(){
+          var RealDate = Date;
+          function D(a,b,c,d,e,f,g){
+            if (this instanceof D) {
+              if (arguments.length === 0) return globalThis.__simClockOn ? new RealDate(globalThis.__nowSimMs) : new RealDate();
+              if (arguments.length === 1) return new RealDate(a);
+              return new RealDate(a, b||0, (c===undefined?1:c), d||0, e||0, f||0, g||0);
+            }
+            return (globalThis.__simClockOn ? new RealDate(globalThis.__nowSimMs) : new RealDate()).toString();
+          }
+          D.now = function(){ return globalThis.__simClockOn ? globalThis.__nowSimMs : RealDate.now(); };
+          D.parse = RealDate.parse; D.UTC = RealDate.UTC;
+          D.prototype = RealDate.prototype;
+          globalThis.Date = D;
+        })();
+        """)
+    }
 
     static func key(_ id: Int, _ prop: String) -> String { "\(id):\(prop)" }
 
@@ -45,11 +107,20 @@ final class Scene3DScriptHost {
         }
     }
 
-    /// 跑一帧:更新 engine.runtime/frametime,对每个脚本调 update(current),把结果存回 currents(演进)。
+    /// 跑一帧:更新 engine.runtime/frametime + Date.now() sim 时钟,对每个脚本调 update(current),把结果存回 currents(演进)。
     func tick(runtime: Double, frametime: Double) {
         ctx.setObject(runtime, forKeyedSubscript: "__rt" as NSString)
         ctx.setObject(frametime, forKeyedSubscript: "__ft" as NSString)
         ctx.evaluateScript("engine.runtime=__rt; engine.frametime=__ft; engine.timeOfDay=(__rt/86400)%1;")
+        // Date.now() sim 时钟:**仅日心太阳系模拟**(simClockEnabled)启用——首帧锚定真实当前毫秒(模拟从真实天文日期
+        // 起算),其后按 锚点 + runtime*1000 推进(逐帧真实 dt),使 Main 模拟 realDeltaMs = now-lastRealTime = frametime*1000
+        // (被脚本 clamp 到 ≤100ms,与 WE 一致)> 0 → 行星随时间公转(R4 修复)。速度由 storage 预置的 timedw 档(WP_SOLAR_SPEED)决定。
+        // 未启用(土星等)则不动 __nowSimMs(恒 = init 时墙钟)→ Date.now() 行为与改前一致(零回归)。
+        if simClockEnabled {
+            if !nowAnchored { nowAnchored = true; nowAnchorMs = Date().timeIntervalSince1970 * 1000.0 }
+            let simNowMs = nowAnchorMs + runtime * 1000.0
+            ctx.setObject(simNowMs, forKeyedSubscript: "__nowSimMs" as NSString)
+        }
         for (key, h) in handles {
             guard let u = h.update else { continue }
             let c = currents[key] ?? .zero
@@ -350,6 +421,7 @@ final class Scene3DRuntime {
     var sharedDump: String { host?.sharedDump() ?? "no host" }
     func sharedJSON() -> String { host?.sharedJSON() ?? "{}" }
     func sharedHas(_ key: String) -> Bool { host?.sharedHas(key) ?? false }
+    func sharedNum(_ key: String) -> Double? { host?.sharedNum(key) }
     /// 评估所有节点 visible 脚本(读宿主 shared)→ 返回**自身 visible 脚本判定为 false 的节点 id 集**。
     /// 太阳系灵动岛/通知/媒体面板等靠 visible 脚本条件显隐;静态壁纸无交互→脚本判 false→该子树隐藏。
     func hiddenNodeIds() -> Set<Int> {
@@ -413,11 +485,14 @@ final class Scene3DRuntime {
 
         // 脚本宿主:注册全部对象全部 {script} 属性(共享单 context 的 globalThis.shared)。WP_NO_3D_SCRIPTS=1 关。
         let h: Scene3DScriptHost? = ProcessInfo.processInfo.environment["WP_NO_3D_SCRIPTS"] == nil ? Scene3DScriptHost() : nil
+        var hasHeliocentricSim = false   // 日心太阳系模拟(Main 写 shared.currentFocus)→ 启用 Date.now() sim 时钟,行星公转
         if let h = h {
             for o in objects {
                 guard let id = intOf(o["id"]) else { continue }
                 for (prop, v) in o {
                     guard let d = v as? [String: Any], let src = d["script"] as? String else { continue }
+                    // 静态识别日心模拟:仅 Main(VSOP87D)脚本写 `shared.currentFocus`。土星等无 → Date.now() 行为不变(零回归)。
+                    if src.contains("shared.currentFocus") { hasHeliocentricSim = true }
                     var sp = d["scriptproperties"] as? [String: Any] ?? [:]
                     // 调试覆盖(默认遵 pkg 值):mode(1中点log/2线性/3/4真比例)、initialFocus(0总览 1-13天体)。
                     if let m = ProcessInfo.processInfo.environment["WP_SOLAR_MODE"], let mv = Double(m), sp["mode"] != nil { sp["mode"] = mv }
@@ -426,6 +501,8 @@ final class Scene3DRuntime {
                     h.register(id: id, prop: prop, source: src, scriptProps: sp, staticValue: sv)
                 }
             }
+            // 仅日心太阳系启用 sim 时钟(Date.now() 随 engine.runtime 推进 → 行星公转);WP_NO_SOLAR_ORBIT=1 关。
+            if hasHeliocentricSim && ProcessInfo.processInfo.environment["WP_NO_SOLAR_ORBIT"] == nil { h.enableSimClock() }
             // 安装真实场景层(name/id→层对象),让 Main 模拟 thisScene.getLayer(name).origin=轨道位置 命中真层。
             var ldefs: [[String: Any]] = []
             for o in objects { if let id = intOf(o["id"]) { ldefs.append(["id": id, "name": (o["name"] as? String) ?? ""]) } }

@@ -355,6 +355,8 @@ final class SceneRenderEngine {
     private var scene3DLastTime: Double = 0
     private var scene3DBakeTime: Double = 20         // 模型烘焙时刻;逐帧 tick 从 bakeTime+elapsed 续(HUD 续跑,模型保持烘焙)
     private let scene3DLiveModels = ProcessInfo.processInfo.environment["WP_3D_LIVE_MODELS"] != nil  // 调试:让模型也逐帧(取景会漂)
+    private var scene3DSolarOrbit = false                                                            // 日心太阳系(currentFocus):逐帧公转(R4)
+    private let noSolarOrbit = ProcessInfo.processInfo.environment["WP_NO_SOLAR_ORBIT"] != nil       // 退回烘焙冻结
     private var logged3DHud = false   // WP_3D_HUD_LOG 诊断:只打一次 HUD 层位置
     private var viewProj3D = matrix_identity_float4x4
     private var light3D: Scene3DRuntime.ResolvedLight?   // 3D 场景方向光(N·L 漫反射昼夜终止线);nil/WP_NO_3D_LIGHTING=平涂
@@ -3098,6 +3100,15 @@ final class SceneRenderEngine {
         scene3DBakeTime = bakeT
         rt.bake(toTime: bakeT)
         rt.recompute()
+        // 日心太阳系模拟(VSOP87D Main 写 shared.currentFocus)→ 逐帧 tick+recompute+刷新模型世界矩阵 → 行星绕太阳公转
+        // (R4 缺口修复)。相机固定看原点、内容随时间公转故不漂(与土星不同)。⚠ 只认 currentFocus 精确区分:土星
+        // (3589454154)也有 getLayer 脚本但其相机授权漂移,必须排除。**bake/recompute 后判**(脚本已跑、shared 已写
+        // currentFocus;放 bake 前 shared 还空判不出)。WP_NO_SOLAR_ORBIT=1 退回烘焙冻结(零回归对照)。
+        scene3DSolarOrbit = !noSolarOrbit && rt.sharedHas("currentFocus")
+        if scene3DSolarOrbit {
+            scene3DPerFrame = ProcessInfo.processInfo.environment["WP_NO_3D_LIVE"] == nil   // 覆盖脚本>200 的冻结
+            Log.write("3D solar-orbit: 逐帧公转开启 (scripts=\(rt.scriptCount))")
+        }
         // 条件 UI(灵动岛/通知/媒体面板)靠 visible 脚本显隐;静态壁纸无交互→脚本判隐藏→其子层(边框等)随之隐。
         scene3DHidden = rt.hiddenNodeIds()
         if !scene3DHidden.isEmpty { Log.write("3D hidden nodes(visible脚本判false): \(scene3DHidden.count)个") }
@@ -3200,7 +3211,9 @@ final class SceneRenderEngine {
             let t = scene3DBakeTime + Double(currentTime)
             let dt = max(0.0, min(0.1, t - scene3DLastTime)); scene3DLastTime = t
             rt.tick(time: t, dt: dt)
-            if scene3DLiveModels {
+            // 日心太阳系(R4):逐帧 recompute + 刷新所有模型世界矩阵 → 行星按 Main 写回的 origin/scale 绕太阳公转。
+            // 相机固定看原点故无土星那种取景漂移。WP_3D_LIVE_MODELS 调试时对所有 3D 场景也开。
+            if scene3DSolarOrbit || scene3DLiveModels {
                 rt.recompute()
                 for i in models3D.indices { if let wm = rt.worldsById[models3D[i].id] { models3D[i].world = wm } }
             }
