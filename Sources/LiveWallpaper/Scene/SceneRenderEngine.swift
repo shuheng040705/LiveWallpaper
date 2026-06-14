@@ -4298,7 +4298,8 @@ final class SceneRenderEngine {
         for i in 0..<max(1, frames) {
             let m: SIMD2<Float>
             if orbit {
-                let a = Float(i) * 0.12
+                let spd = Float(ProcessInfo.processInfo.environment["WP_ORBIT_SPEED"] ?? "0.12") ?? 0.12
+                let a = Float(i) * spd
                 m = SIMD2(cos(a) * 0.5, sin(a) * 0.5)   // [-0.5,0.5] 归一化绕中心
             } else { m = SIMD2<Float>(0, 0) }
             update(time: Double(i) * dt, mouseNorm: m)   // 审计修复#2:update 已推进 frameIndex 轮换缓冲

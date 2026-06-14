@@ -1052,12 +1052,20 @@ final class ParticleSimulator {
         // alpha 只用 pkg 里的真实数据:alphafade operator(fadeintime/fadeouttime)+ instanceoverride.alpha。
         // 不自造任何凭感觉凑的全局系数。WE 不过曝靠真实 maxcount/size/alpha/贴图亮度(都已从 pkg 读入照用)。
         if desc.hasAlphaFade {
-            // WE alphafade:fadeintime/fadeouttime 是**归一化生命比** [0,1](默认 0.5/0.5)。
-            // [0,fadeIn] 线性淡入 0→1、(fadeIn,fadeOut] 满、(fadeOut,1] 线性淡出 1→0。CParticle.cpp:1134-1144。
+            // WE alphafade(归一化生命比 f∈[0,1],默认 0.5/0.5):fadeintime=淡入时长 [0,fadeIn] 0→1;
+            // **fadeouttime=淡出时长**(最后 fadeOut)→ 淡出区 [1-fadeOut,1] 1→0;中间 [fadeIn,1-fadeOut] 满=1。
+            // ⚠ lwe(CParticle.cpp:1120 `life>fadeOutTime`)把 fadeouttime 当「淡出**起点**」→ fadeouttime<0.5
+            //   时几乎整条命都在变暗;再叠 lifetimerandom(逐粒子寿命不同)→ 相邻粒子 lifetimePos 不同 → alpha
+            //   乱跳 → rope 鼠标拖尾(getsuga 0.1/0.1)忽明忽暗碎成「黑色色块」(实测 f=0.82 该满却=0.20)。
+            //   真 WE 是实心拖尾(用户证)→ 取淡出**时长**语义。默认 0.5/0.5 两解一致(三角、无满段)=零回归;
+            //   仅 fadeIn+fadeOut<1 的壁纸多出满段(粒子更实/更亮=真 WE)。WP_FADE_STARTPOINT 退回 lwe 起点语义。
+            let startPoint = Self.fadeStartPoint
+            let foStart = startPoint ? desc.fadeOutTime : (1 - desc.fadeOutTime)
+            let foSpan  = startPoint ? (1 - desc.fadeOutTime) : desc.fadeOutTime
             if desc.fadeInTime > 0, f <= desc.fadeInTime {
                 a *= f / desc.fadeInTime
-            } else if desc.fadeOutTime < 1, f > desc.fadeOutTime {
-                a *= max(0, 1 - (f - desc.fadeOutTime) / (1 - desc.fadeOutTime))
+            } else if desc.fadeOutTime > 0, f > foStart {
+                a *= max(0, 1 - (f - foStart) / max(1e-4, foSpan))
             }
         }
         if desc.hasAlphaChange {
@@ -1159,8 +1167,34 @@ final class ParticleSimulator {
         guard n >= 2 else { return }
         let numSegments = n - 1
         let subdivision = max(1, desc.ropeSubdivision)
+        // ⭐向心 Catmull-Rom(默认):鼠标拖尾这类 rope 的粒子间距稀疏且**悬殊**(实测 getsuga avg184px、
+        //   max790px),**均匀** Catmull-Rom(lwe CParticle.cpp:2127 用的)在间距不均时会**过冲打环**→样条甩出
+        //   大环、尖点处切向反向 → 35px 细带沿环自交+收窄断裂 → 拖尾碎成「一段一块」(用户报「黑色色块」,
+        //   实测纯白贴图也碎=纯几何问题,非贴图/UV)。向心参数化(knot 间距=|Δp|^0.5)数学上保证样条不越出
+        //   控制点凸包、无环、无尖点,过同样的点 → 平滑连续拖尾(= 真 WE 观感)。lwe 用均匀=lwe≠真 WE。
+        //   均匀间距(闪电/绳索类密集粒子)下向心≈均匀,零差异 → 不影响其它 rope。WP_UNIFORM_ROPE 退回均匀。
+        let useCentripetal = ProcessInfo.processInfo.environment["WP_UNIFORM_ROPE"] == nil
 
         func catmullRom(_ p0: SIMD2<Float>, _ p1: SIMD2<Float>, _ p2: SIMD2<Float>, _ p3: SIMD2<Float>, _ t: Float) -> SIMD2<Float> {
+            if useCentripetal {
+                // 向心(α=0.5)Barry-Goldman 金字塔求值;knot 间距用相邻点距离^α,退化(重合点)回退线性。
+                let alpha: Float = 0.5
+                let t0: Float = 0
+                let t1 = t0 + pow(max(simd_distance(p0, p1), 1e-4), alpha)
+                let t2 = t1 + pow(max(simd_distance(p1, p2), 1e-4), alpha)
+                let t3 = t2 + pow(max(simd_distance(p2, p3), 1e-4), alpha)
+                if t2 - t1 < 1e-5 || t1 - t0 < 1e-5 || t3 - t2 < 1e-5 {
+                    return p1 + (p2 - p1) * t                 // 退化:线性
+                }
+                let tt = t1 + t * (t2 - t1)
+                let A1 = p0 * ((t1 - tt) / (t1 - t0)) + p1 * ((tt - t0) / (t1 - t0))
+                let A2 = p1 * ((t2 - tt) / (t2 - t1)) + p2 * ((tt - t1) / (t2 - t1))
+                let A3 = p2 * ((t3 - tt) / (t3 - t2)) + p3 * ((tt - t2) / (t3 - t2))
+                let B1 = A1 * ((t2 - tt) / (t2 - t0)) + A2 * ((tt - t0) / (t2 - t0))
+                let B2 = A2 * ((t3 - tt) / (t3 - t1)) + A3 * ((tt - t1) / (t3 - t1))
+                return B1 * ((t2 - tt) / (t2 - t1)) + B2 * ((tt - t1) / (t2 - t1))
+            }
+            // 均匀 Catmull-Rom(lwe 原式,WP_UNIFORM_ROPE 退回)
             let t2 = t * t, t3 = t2 * t
             let a: SIMD2<Float> = p1 * 2
             let b: SIMD2<Float> = (p2 - p0) * t
@@ -1219,9 +1253,18 @@ final class ParticleSimulator {
         func rightAt(_ point: Int, _ size: Float) -> SIMD2<Float> {
             let prev = point > 0 ? sp[point - 1] : sp[point]
             let next = point + 1 < totalPoints ? sp[point + 1] : sp[point]
-            let tan = next - prev
-            let len = simd_length(tan)
-            if len < 1e-4 { return .zero }              // 退化(节点重合)→ 零宽,塌成零面积,无 NaN
+            var tan = next - prev
+            var len = simd_length(tan)
+            // 中心差分退化(尖点/重合)→ 回退前向再后向切向,避免 ribbon 在该点收窄成零宽 → 断裂成块。
+            if len < 1e-4 {
+                tan = (point + 1 < totalPoints ? sp[point + 1] : sp[point]) - sp[point]
+                len = simd_length(tan)
+            }
+            if len < 1e-4 {
+                tan = sp[point] - (point > 0 ? sp[point - 1] : sp[point])
+                len = simd_length(tan)
+            }
+            if len < 1e-4 { return .zero }              // 仍退化(全重合)→ 零宽,无 NaN
             let dir = tan / len
             return SIMD2(-dir.y, dir.x) * size
         }
@@ -1243,6 +1286,8 @@ final class ParticleSimulator {
     /// 输出当前所有粒子的渲染实例(世界像素坐标 + 当前 alpha/size/旋转/颜色)。
     // controlpointattract 力学剖面退路:WP_CPATTRACT_CONST=1 退回 lwe 半径内恒力(无衰减)。
     static let cpAttractConstForce = ProcessInfo.processInfo.environment["WP_CPATTRACT_CONST"] != nil
+    // alphafade 语义:默认按真 WE「fadeouttime=淡出时长(最后 fadeOut)」;WP_FADE_STARTPOINT 退回 lwe「淡出起点」。
+    static let fadeStartPoint = ProcessInfo.processInfo.environment["WP_FADE_STARTPOINT"] != nil
 
     // 精灵宽度语义【2026-06-11 WE 实机截图裁决】:全宽 = pkg/2(= p.size 半径值直接当 quad 宽)。
     // 曾推断「lwe /2 + shader ±0.5 两头减半=半大」并 ×2,但 Postscript 鸟 WE 实测(画布≈1:1 截图)
