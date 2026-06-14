@@ -381,6 +381,9 @@ final class SceneRenderEngine {
     private let scene3DLiveModels = ProcessInfo.processInfo.environment["WP_3D_LIVE_MODELS"] != nil  // 调试:让模型也逐帧(取景会漂)
     private var scene3DSolarOrbit = false                                                            // 日心太阳系(currentFocus):逐帧公转(R4)
     private let noSolarOrbit = ProcessInfo.processInfo.environment["WP_NO_SOLAR_ORBIT"] != nil       // 退回烘焙冻结
+    private var scene3DIntroModels = false   // 入场动画(土星):从 t0 逐帧驱动模型(从下升起+倾入,>settled 后脚本本就 hold)
+    private let noIntro = ProcessInfo.processInfo.environment["WP_NO_3D_INTRO"] != nil   // 退回烘焙冻结(土星卡半升起)
+    private var scene3DIntroSettle: Double = 0   // 入场结束时刻(脚本最末关键帧 t);此后停刷模型省 GPU
     private var logged3DHud = false   // WP_3D_HUD_LOG 诊断:只打一次 HUD 层位置
     private var viewProj3D = matrix_identity_float4x4
     private var light3D: Scene3DRuntime.ResolvedLight?   // 3D 场景方向光(N·L 漫反射昼夜终止线);nil/WP_NO_3D_LIGHTING=平涂
@@ -3178,8 +3181,17 @@ final class SceneRenderEngine {
         // 但**宿主逐帧 tick**(脚本≤200=土星)→ HUD 文字(时钟/距离/角度)live 更新;模型世界保持烘焙(render3D 不重算模型)。
         // WP_NO_3D_LIVE=1 退回全冻结。WP_3D_LIVE_MODELS=1 让模型也逐帧(取景会漂,调试用)。
         scene3DPerFrame = ProcessInfo.processInfo.environment["WP_NO_3D_LIVE"] == nil && rt.scriptCount <= 200
-        let bakeT = ProcessInfo.processInfo.environment["WP_3D_TIME"].flatMap { Double($0) } ?? 20.0
+        // 入场动画(土星):脚本数少(非日心太阳系公转)且模型祖先链含 origin/angles 关键帧脚本(从下升起+倾入再 hold)
+        //   → 从 t=0 起逐帧驱动模型(相机静态,动模型不漂);脚本在末关键帧后 hold=settled。WP_NO_3D_INTRO 退回烘焙冻结。
+        // 排除:日心太阳系(脚本>200=scene3DPerFrame 已 false,且其行星 origin 无脚本走 getLayer 公转)、纯静态 3D(无关键帧脚本)。
+        scene3DIntroModels = !noIntro && scene3DPerFrame && rt.hasModelKeyframeAnim
+        // 烘焙时刻:入场动画从 t=0 起算(模型逐帧从底部升起);否则旧路径烘焙到 settled(默认 20s,WP_3D_TIME 调)。
+        let bakeT: Double = scene3DIntroModels ? 0.0 : (ProcessInfo.processInfo.environment["WP_3D_TIME"].flatMap { Double($0) } ?? 20.0)
         scene3DBakeTime = bakeT
+        // settled 时刻(末关键帧 t,如土星=30);此后停刷模型省 CPU(脚本本就 hold)。算不出(0)→ 给个保险上限永不停。
+        let settle = rt.modelAnimEndTime
+        scene3DIntroSettle = settle > 0 ? settle : .greatestFiniteMagnitude
+        if scene3DIntroModels { Log.write("3D intro animation: 模型从 t=0 升起, settle=\(settle)s (scripts=\(rt.scriptCount))") }
         rt.bake(toTime: bakeT)
         rt.recompute()
         // 日心太阳系模拟(VSOP87D Main 写 shared.currentFocus)→ 逐帧 tick+recompute+刷新模型世界矩阵 → 行星绕太阳公转
@@ -3293,9 +3305,12 @@ final class SceneRenderEngine {
             let t = scene3DBakeTime + Double(currentTime)
             let dt = max(0.0, min(0.1, t - scene3DLastTime)); scene3DLastTime = t
             rt.tick(time: t, dt: dt)
-            // 日心太阳系(R4):逐帧 recompute + 刷新所有模型世界矩阵 → 行星按 Main 写回的 origin/scale 绕太阳公转。
-            // 相机固定看原点故无土星那种取景漂移。WP_3D_LIVE_MODELS 调试时对所有 3D 场景也开。
-            if scene3DSolarOrbit || scene3DLiveModels {
+            // 逐帧 recompute + 刷新模型世界矩阵的两类场景:
+            //   ①日心太阳系(R4,scene3DSolarOrbit):行星按 Main 写回的 origin/scale 绕太阳公转(相机固定看原点不漂)。
+            //   ②入场动画(土星,introActive):模型从底部升起+倾入到 settled(相机静态不漂);settled(currentTime>末
+            //     关键帧 t)后停刷省 CPU(脚本本就 hold)。WP_3D_LIVE_MODELS 调试时对任何 3D 场景逐帧刷新。
+            let introActive = scene3DIntroModels && Double(currentTime) <= scene3DIntroSettle + 0.5
+            if scene3DSolarOrbit || introActive || scene3DLiveModels {
                 rt.recompute()
                 for i in models3D.indices { if let wm = rt.worldsById[models3D[i].id] { models3D[i].world = wm } }
             }

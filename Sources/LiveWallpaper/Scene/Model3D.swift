@@ -418,6 +418,43 @@ final class Scene3DRuntime {
     private var nodeOrder: [Int] = []
     private let host: Scene3DScriptHost?
     var scriptCount: Int { host?.registered ?? 0 }
+    /// 任一**模型**的节点祖先链含脚本驱动的 origin/angles(=有限时长关键帧入场:从下升起+倾入再 hold)。
+    /// 土星(3589454154):全部件挂在根 459 下,459.origin/angles 是 Vec3 关键帧脚本(t0→t30 升起+倾入,t>30 hold
+    /// 末关键帧=settled)。判据用于「入场动画」逐帧驱动模型(相机静态→动模型不漂)。日心太阳系靠 getLayer/currentFocus
+    /// 公转(走 scene3DSolarOrbit 另一路),其行星节点本身 origin 不带脚本 → 此判据不会误命中(且 solarOrbit 优先级更高)。
+    var hasModelKeyframeAnim: Bool {
+        for m in models {
+            var cur: Int? = m.id, depth = 0
+            while let c = cur, let n = nodes[c], depth < 64 {
+                if n.originScripted || n.anglesScripted { return true }
+                cur = n.parent; depth += 1
+            }
+        }
+        return false
+    }
+    /// 入场动画 settled 时刻(秒)= 模型祖先链 origin/angles 脚本 scriptproperties 里所有关键帧时间(键以 't' 开头,
+    /// 如 t1..t4 / tt1 / t22)的最大值。脚本在末关键帧之后 hold,故此后停刷模型可省 CPU(土星=30)。算不出 → 0(=不停刷)。
+    var modelAnimEndTime: Double {
+        var maxT: Double = 0
+        var seen = Set<Int>()
+        func scanScript(_ raw: Any?) {
+            guard let d = raw as? [String: Any], d["script"] != nil,
+                  let sp = d["scriptproperties"] as? [String: Any] else { return }
+            for (k, v) in sp where k.hasPrefix("t") {
+                let num = (v as? NSNumber)?.doubleValue
+                    ?? ((v as? [String: Any])?["value"] as? NSNumber)?.doubleValue
+                if let t = num, t.isFinite, t > maxT { maxT = t }
+            }
+        }
+        for m in models {
+            var cur: Int? = m.id, depth = 0
+            while let c = cur, let n = nodes[c], depth < 64 {
+                if !seen.contains(c) { seen.insert(c); scanScript(n.originRaw); scanScript(n.anglesRaw) }
+                cur = n.parent; depth += 1
+            }
+        }
+        return maxT
+    }
     var sharedDump: String { host?.sharedDump() ?? "no host" }
     func sharedJSON() -> String { host?.sharedJSON() ?? "{}" }
     func sharedHas(_ key: String) -> Bool { host?.sharedHas(key) ?? false }

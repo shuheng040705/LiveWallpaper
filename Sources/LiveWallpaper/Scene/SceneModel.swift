@@ -2360,8 +2360,14 @@ struct SceneDocument {
             let lower = rawText.lowercased()
             let isPlaceholder = lower == "text layer" || lower == "day"
                 || (lower.hasPrefix("<") && lower.hasSuffix(">")) || lower.contains("12:34:56")
-            guard !rawText.isEmpty, rawText.count <= 40,
-                  !rawText.contains("export"), !rawText.contains("function"), !rawText.contains("{"),
+                || lower == "undefined" || lower == "null"
+            // 合法长字幕(如土星 707/720「November 1980 / Humanity's first visitor to saturn」99/147 字符)曾被
+            //   `count <= 40` 误丢。改**按内容判**占位/脚本垃圾(含 `{`/`undefined`/脚本源码/已知占位串)而非纯长度——
+            //   长度只是脚本占位的弱信号,真长文本(姊妹短字幕 VOYAGER 1/CASSINI 正常渲)同样合法。WP_NO_LONGTEXT 退回旧 <=40 守卫。
+            let lengthOK = ProcessInfo.processInfo.environment["WP_NO_LONGTEXT"] != nil ? (rawText.count <= 40) : true
+            guard !rawText.isEmpty, lengthOK,
+                  !rawText.contains("export"), !rawText.contains("function"),
+                  !rawText.contains("{"), !rawText.contains("undefined"),
                   !isPlaceholder else { return nil }
             kind = .staticText(rawText)
         }
