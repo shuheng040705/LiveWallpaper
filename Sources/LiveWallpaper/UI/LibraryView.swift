@@ -231,9 +231,9 @@ struct LibraryView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 26) {
                     if !featuredItems.isEmpty {
-                        // 16:9 大图 hero,高度上限 = 视口高 - 一行货架(~290),让「最近添加」一行卡片露出。
+                        // 16:9 大图 hero,高度上限 = 视口高 - 一整行货架(标题+卡片+留白),让「最近添加」完整露出。
                         HeroCarousel(items: featuredItems, index: $heroIndex, currentID: currentID,
-                                     maxHeight: max(300, geo.size.height - 290),
+                                     maxHeight: max(280, geo.size.height - 350),
                                      onSet: { selectAndConfigure($0) },
                                      onToggleFav: { PreferencesStore.shared.toggleFavorite($0.id); favVersion += 1 })
                             .padding(.horizontal, 26).padding(.top, 10)
@@ -495,6 +495,8 @@ struct HeroCarousel: View {
     var onToggleFav: (WallpaperItem) -> Void
 
     @State private var thumb: NSImage?
+    @State private var loadToken = 0        // 防止切换后旧异步图覆盖
+    @State private var hasRendered = false   // 已显示实际渲染图 → 不再被 gif 占位覆盖
 
     private var item: WallpaperItem { items[min(index, items.count - 1)] }
 
@@ -579,8 +581,21 @@ struct HeroCarousel: View {
     }
 
     private func loadThumb() {
-        guard items.indices.contains(index), let url = item.previewURL else { thumb = nil; return }
-        ThumbnailCache.shared.largeImage(for: url) { img in self.thumb = img }
+        guard items.indices.contains(index) else { thumb = nil; return }
+        loadToken += 1
+        let token = loadToken
+        let target = item
+        hasRendered = false
+        // ① preview.gif 大图快速占位(可能低清)
+        if let url = target.previewURL {
+            ThumbnailCache.shared.largeImage(for: url) { img in
+                if token == self.loadToken, !self.hasRendered, let img { self.thumb = img }
+            }
+        }
+        // ② 实际渲染图(场景引擎离屏渲染 / 视频抽帧)替换占位,更清晰真实
+        RenderedPreviewCache.shared.image(for: target) { img in
+            if token == self.loadToken, let img { self.thumb = img; self.hasRendered = true }
+        }
     }
 }
 
