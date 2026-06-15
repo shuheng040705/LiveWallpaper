@@ -105,6 +105,14 @@ enum VecParse {
         guard a.count >= 2 else { return d }
         return SIMD2(a[0], a[1])
     }
+    /// parallaxDepth 取值:WGPU/真 WE 约定 —— **字段缺省 = (1,1)**(没写 parallaxDepth 的层默认满视差),
+    /// 只有显式写了才用其值(显式 (0,0) = 不参与视差)。WP_PARALLAX_LWE 退回 lwe 默认 (0,0)(ObjectParser.cpp:159)。
+    static func parallaxDepth(_ obj: [String: Any]) -> SIMD2<Float> {
+        guard obj["parallaxDepth"] != nil else {
+            return ProcessInfo.processInfo.environment["WP_PARALLAX_LWE"] != nil ? .zero : SIMD2(1, 1)
+        }
+        return f2(obj["parallaxDepth"])
+    }
     static func f3(_ s: Any?, default d: SIMD3<Float> = .zero) -> SIMD3<Float> {
         let a = floats(s)
         // 标量滑块绑到 vec3 字段(WE 行为):单值广播(统一缩放)。chracter_size 滑块有效值化为单标量
@@ -1306,11 +1314,14 @@ struct SceneDocument {
                 sizePx: size.count >= 2 ? SIMD2(size[0], size[1]) : nil,
                 scale: absScale,
                 anglesDeg: absAngles,
-                parallax: VecParse.f2(obj["parallaxDepth"]),
+                parallax: VecParse.parallaxDepth(obj),
                 visible: visible,
                 texturePath: texPath,
                 color: color,
-                blend: (isSolidReal && !texOverridden) ? .translucent : blend,
+                // texOverridden 层也用 .translucent(alpha-over):texture_override(RETAIN_ORIG=0)输出恒为带 alpha
+                // 的轮廓内容(贴图 DXT5/RG88 直 alpha 已正确解码),WE 一律 alpha-over 贴回。此前误用 blend(=.normal=
+                // 关混合)→ 贴图整块不透明覆盖、透明区显残留 RGB = 硬边矩形块(且 95% 透明的「前装饰」整块挡住时钟牌)。
+                blend: (isSolidReal || texOverridden) ? .translucent : blend,
                 isSolid: isSolidReal && !texOverridden,
                 effects: effects
             )
@@ -2548,11 +2559,14 @@ struct SceneDocument {
         if upper.contains("GOOD") && (upper.contains("MORNING") || upper.contains("AFTERNOON")
             || upper.contains("EVENING") || upper.contains("NIGHT")) {
             return .greeting
-        } else if upper == "DAY" || (name.hasPrefix("day") && !name.hasPrefix("date")) {
+        } else if upper == "DAY" || (name.hasPrefix("day") && !name.hasPrefix("date"))
+                    || name.contains("星期") || name == "week" {
             return .dayOfWeek
-        } else if name.contains("clock") || name == "时钟" || name.contains("time") {
-            return .clock
-        } else if name.contains("date") || name == "日期" || name == "dy" {
+        } else if name.contains("秒") || name.contains("seconds") {   // 秒(SS)独立文本层(名常带后缀如「秒(正片叠底)」→ 用 contains)
+            return .seconds
+        } else if name.contains("clock") || name.contains("时钟") || name.contains("time") || name.contains("时分") {
+            return .clock          // 时分 = HH:mm(某些壁纸时/分独立于秒)
+        } else if name.contains("date") || name.contains("日期") || name == "dy" {
             return .date
         }
         return nil

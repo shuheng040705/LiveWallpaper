@@ -1883,7 +1883,10 @@ final class SceneRenderEngine {
     private var cameraParallaxAmount: Float = 1
     private var cameraParallaxMouseInfluence: Float = 1
     private var cameraParallaxDelay: Float = 0
-    /// lwe m_parallaxDisplacement:每帧朝目标 (mouseUV-0.5)×amount×influence 平滑逼近的位移状态(归一化空间)。
+    /// 视差模型:默认 WGPU(wallpaper-wgpu)—— off=amount×parallaxDepth×smoothed、depth 默认(1,1)、(0,0)退出、
+    /// amount 不进平滑状态。WP_PARALLAX_LWE=1 退回 lwe —— off=(depth+amount)×displacement、depth 默认(0,0)、amount 进状态。
+    private let parallaxWGPU = ProcessInfo.processInfo.environment["WP_PARALLAX_LWE"] == nil
+    /// 视差平滑状态(归一化空间)。WGPU:centered×influence;lwe:centered×amount×influence。
     private var parallaxDisplacement = SIMD2<Float>(0, 0)
     /// 上一帧时间(秒),算视差平滑的真实 dt。粒子用的 lastUpdateTime 只在有粒子时更新,故另开一个。
     private var lastFrameTime: Double = -1
@@ -2116,8 +2119,20 @@ final class SceneRenderEngine {
     private func parallaxOffset(depth: SIMD2<Float>) -> SIMD2<Float> {
         guard cameraParallax else { return .zero }
         let refW = canvas.x
-        let ax = (depth.x + cameraParallaxAmount) * parallaxDisplacement.x * refW
-        let ay = (depth.y + cameraParallaxAmount) * parallaxDisplacement.y * refW
+        let ax: Float, ay: Float
+        if parallaxWGPU {
+            // WGPU(wallpaper-wgpu)模型:off = amount × parallaxDepth × smoothed × sceneWidth。
+            // amount 只在此出现一次(不在平滑状态里);depth 默认 (1,1)、显式 (0,0) → off=0(不参与)。
+            // ⚠ 暂未含 reference 的 root_position 项(shift=amount×depth×(root−smoothed)):描述未定 root_position
+            //   坐标空间,任何字面解读都会在静止态产生位移、且 magnitude 对不上 → 待 renderer.rs:444 源码精确补。
+            //   现为「鼠标驱动分量」(root 略去),静止态归 0。
+            ax = cameraParallaxAmount * depth.x * parallaxDisplacement.x * refW
+            ay = cameraParallaxAmount * depth.y * parallaxDisplacement.y * refW
+        } else {
+            // lwe(WP_PARALLAX_LWE 退回):off = (depth + amount) × displacement × sceneWidth(CImage.cpp:1118)。
+            ax = (depth.x + cameraParallaxAmount) * parallaxDisplacement.x * refW
+            ay = (depth.y + cameraParallaxAmount) * parallaxDisplacement.y * refW
+        }
         return SIMD2(-ax, -ay)
     }
 
@@ -2210,10 +2225,14 @@ final class SceneRenderEngine {
         let dispBefore = parallaxDisplacement   // 按需渲染:记下视差更新前位移,末尾判定本帧是否变化
         if cameraParallax {
             let userStrength = Float(PreferencesStore.shared.parallaxStrength)
-            // centeredMouse = 画布 UV - 0.5(lwe CScene.cpp:313)。同 cursor:屏幕 NDC 要先 /ndcScale 扣 cover 裁切,
+            // centeredMouse = 画布 UV - 0.5。同 cursor:屏幕 NDC 要先 /ndcScale 扣 cover 裁切,
             // 否则非同比例屏上视差量也随距离偏。mouseUV = (mouseNorm/ndcScale + 1)/2 → centered = mouseUV - 0.5。
             let centered = SIMD2(mouseNorm.x / aspectMouse.x * 0.5, mouseNorm.y / aspectMouse.y * 0.5)
-            let target = centered * cameraParallaxAmount * cameraParallaxMouseInfluence * userStrength
+            // WGPU:amount **不进**平滑状态(amount 在 parallaxOffset 逐对象施加);平滑态只存 centered×influence。
+            // lwe(退回):amount 进平滑状态(CScene.cpp:315 mix 到 centeredMouse×amount×influence)。
+            let target = parallaxWGPU
+                ? centered * cameraParallaxMouseInfluence * userStrength
+                : centered * cameraParallaxAmount * cameraParallaxMouseInfluence * userStrength
             let k = max(0, min(1, cameraParallaxDelay * Float(dt)))
             parallaxDisplacement += (target - parallaxDisplacement) * k
         }
