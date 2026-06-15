@@ -20,14 +20,14 @@ final class ThumbnailCache {
         }
     }
 
-    /// 大图(首页 hero 用):下采样到 ~1800px,独立缓存,清晰不糊。
+    /// 大图(首页 hero 用):下采样到 ~2880px(覆盖大屏 Retina hero,尽量清晰;低清源仍受源分辨率限制),独立缓存。
     func largeImage(for url: URL, completion: @escaping (NSImage?) -> Void) {
         if let cached = largeCache.object(forKey: url as NSURL) {
             completion(cached)
             return
         }
         queue.async {
-            let image = Self.downsample(url: url, maxPixel: 1800)
+            let image = Self.downsample(url: url, maxPixel: 2880)
             if let image { self.largeCache.setObject(image, forKey: url as NSURL) }
             DispatchQueue.main.async { completion(image) }
         }

@@ -231,9 +231,9 @@ struct LibraryView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 26) {
                     if !featuredItems.isEmpty {
-                        // 大图 hero 占满视口高度(仿 WaifuX 沉浸式),只露出下方货架标题一角。
+                        // 16:9 大图 hero,高度上限 = 视口高 - 一行货架(~290),让「最近添加」一行卡片露出。
                         HeroCarousel(items: featuredItems, index: $heroIndex, currentID: currentID,
-                                     height: max(360, geo.size.height - 86),
+                                     maxHeight: max(300, geo.size.height - 290),
                                      onSet: { selectAndConfigure($0) },
                                      onToggleFav: { PreferencesStore.shared.toggleFavorite($0.id); favVersion += 1 })
                             .padding(.horizontal, 26).padding(.top, 10)
@@ -490,7 +490,7 @@ struct HeroCarousel: View {
     let items: [WallpaperItem]
     @Binding var index: Int
     var currentID: String?
-    var height: CGFloat = 320
+    var maxHeight: CGFloat = 360
     var onSet: (WallpaperItem) -> Void
     var onToggleFav: (WallpaperItem) -> Void
 
@@ -501,13 +501,17 @@ struct HeroCarousel: View {
     // 图片为基底 + 所有装饰用 .overlay 钉在基底 320 高的框上(避免 .aspectRatio(.fill) 把 ZStack 撑大
     // 导致底部信息被裁掉看不见 —— 这是之前标题不显示的根因)。
     var body: some View {
-        Group {
-            if let thumb { Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill) }
-            else { Rectangle().fill(.white.opacity(0.06)) }
-        }
-        .frame(maxWidth: .infinity)
-        .frame(height: height)
-        .clipped()
+        // 16:9 box(用户要求按 16:9,避免人物被裁;占满宽度,过高时按 maxHeight 收窄居中,留出下方货架一行)。
+        Color.clear
+            .aspectRatio(16.0 / 9.0, contentMode: .fit)
+            .frame(maxWidth: .infinity, maxHeight: maxHeight)
+            .background {
+                Group {
+                    if let thumb { Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill) }
+                    else { Rectangle().fill(.white.opacity(0.06)) }
+                }
+            }
+            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
         .overlay {   // 暗化渐变(左 + 下),保证标题可读
             ZStack {
                 LinearGradient(colors: [.black.opacity(0.72), .black.opacity(0.15), .clear],
