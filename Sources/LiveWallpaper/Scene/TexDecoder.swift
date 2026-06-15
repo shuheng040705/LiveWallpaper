@@ -417,18 +417,24 @@ enum TexDecoder {
                     }
                 }
                 return finish(out, w, h)
-            case 9:        // R8:单通道 → RGBA=(R,R,R,**R**)。R 既广播到 RGB、又作 alpha。
-                // ⚠ 旧实现 alpha 恒=255(不透明)→ 粒子辉光/烟雾(fog1 等 R8,R=密度)整张 quad 不透明 →
-                //   渲成硬边黑方块(实测 getsuga 的 red_fire 精灵 fog1:1024² R8 全不透明 × 暗红 = 黑色色块,
-                //   真 WE 是软红烟)。R8 的单通道对粒子=密度/alpha,故 alpha 必须=R 才有软衰减/透明背景。
-                //   遮罩类读 .r 不受影响(.r 仍=R);仅「用 alpha 的」(粒子)从恒不透明→按 R 透明=修复。
-                //   WP_R8_OPAQUE=1 退回旧的 alpha=255。
+            case 9:        // R8:按用途分流(同 RG88 的 dataTexture 机制)。
+                // ① albedo(精灵/图层 g_Texture0):WE ConvertTexture0Format(common_fragment.h:106)铁证 =
+                //    vec4(1,1,1,R) → **RGB 恒白、alpha=R**(R 是形状/密度蒙版,颜色全由 v_Color/图层 color 给)。
+                //    旧实现 (R,R,R,R) 把 R 也塞进 RGB → 火/烟/碎屑(fire1/fog1/debris1 R8 精灵)被 R 二次压暗、
+                //    丢饱和 → 用户报「火焰不像真 WE」。改回 WE 真义:白 RGB + alpha=R(颜色纯由 tint 给)。
+                // ② dataTexture=true(特效遮罩 godrays/foliagesway/waterripple_mask、碰撞遮罩):shader 直接采
+                //    .r 当遮罩值,不走 ConvertTexture0Format → 必须保留 R 在 R 通道 → (R,R,R,R)。
+                //    WP_R8_OPAQUE / WP_NO_R8_ALPHA=1 退回旧 (R,R,R,255)(诊断)。
                 guard raw.count >= w * h else { return nil }
-                let r8Opaque = ProcessInfo.processInfo.environment["WP_R8_OPAQUE"] != nil
+                let env9 = ProcessInfo.processInfo.environment
+                let r8legacy = env9["WP_R8_OPAQUE"] != nil || env9["WP_NO_R8_ALPHA"] != nil
                 var out = [UInt8](repeating: 255, count: w * h * 4)
-                for i in 0..<(w * h) {
-                    let v = raw[i]; out[i*4] = v; out[i*4+1] = v; out[i*4+2] = v
-                    if !r8Opaque { out[i*4+3] = v }
+                if dataTexture {
+                    for i in 0..<(w * h) { let v = raw[i]; out[i*4] = v; out[i*4+1] = v; out[i*4+2] = v; out[i*4+3] = v }
+                } else if r8legacy {
+                    for i in 0..<(w * h) { let v = raw[i]; out[i*4] = v; out[i*4+1] = v; out[i*4+2] = v }   // (R,R,R,255)
+                } else {
+                    for i in 0..<(w * h) { out[i*4 + 3] = raw[i] }   // (255,255,255,R) = WE ConvertTexture0Format
                 }
                 return finish(out, w, h)
             // --- HDR / 高位深(保守:线性截断到 [0,1] 的 RGBA8,见 HDRFormat 注释)---

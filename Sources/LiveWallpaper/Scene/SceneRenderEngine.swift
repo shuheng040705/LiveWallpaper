@@ -1008,7 +1008,9 @@ final class SceneRenderEngine {
             func maskTex(_ path: String?) -> MTLTexture? {
                 guard let p = path else { return nil }
                 if let t = maskCache[p] { return t }
-                guard let blob = source.data(for: p), let dec = TexDecoder.decodeFirstMipWithFlags(blob),
+                // dataTexture:遮罩是数据贴图(shader 采 .r/.rg 当遮罩值,不走 ConvertTexture0Format)。
+                // R8 遮罩(godrays/foliagesway/waterripple_mask)须保留 R 在 R 通道(否则 .r 恒 1 → 特效全屏)。
+                guard let blob = source.data(for: p), let dec = TexDecoder.decodeFirstMipWithFlags(blob, dataTexture: true),
                       let t = makeTexture(dec.tex, loader: loader) else { return nil }
                 maskCache[p] = t; maskFlagsCache[p] = dec.flags; return t
             }
@@ -1626,8 +1628,9 @@ final class SceneRenderEngine {
             rippleSim?.rippleSpeed = document.rippleParams.z
             rippleSim?.rippleDecay = document.rippleParams.w
             // 碰撞遮罩(限定力场在水面):从壁纸源解码绑到 sim。无则力场全屏 → 鼠标划过草地也起波。
+            // dataTexture:碰撞遮罩是数据贴图(sim 采 .r 当掩码),R8 须保留 R 在 R 通道(否则全屏起波)。
             if let mp = document.rippleMaskPath, let blob = source.data(for: mp),
-               let dec = TexDecoder.decodeFirstMip(blob) {
+               let dec = TexDecoder.decodeFirstMipWithFlags(blob, dataTexture: true)?.tex {
                 rippleSim?.collisionMask = makeTexture(dec, loader: loader)
                 Log.write("cursorripple: collision mask \(mp) loaded")
             } else {
