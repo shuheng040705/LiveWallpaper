@@ -42,8 +42,10 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
         // 透明标题栏 + 全尺寸内容:侧边栏毛玻璃延伸到顶部(原生 NavigationSplitView 统一工具栏外观)。
         // 标题/副标题由 SwiftUI navigationTitle 驱动,显示在详情区工具栏(Finder 式)。
         w.titlebarAppearsTransparent = true
-        w.titleVisibility = .visible
+        w.titleVisibility = .hidden          // 自定义顶部标签栏托管导航,系统标题隐藏
         w.isReleasedWhenClosed = false
+        w.isRestorable = false               // 不做窗口/状态恢复(避免重启残留旧 tab/面板状态)
+        w.appearance = NSAppearance(named: .darkAqua)   // 仿 WaifuX:整窗深色玻璃
         w.delegate = self
         // 首次打开用默认大小并居中;有保存值时由 frameAutosave 立即覆盖恢复。
         w.setContentSize(NSSize(width: 1000, height: 660))
@@ -53,6 +55,25 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
         w.setFrameAutosaveName("LibraryWindow")
         w.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
+        captureIfRequested()
+    }
+
+    /// 截图验证用:WP_UI_SHOT=<png路径> 时,延迟后把窗口内容渲染成 PNG 再退出。
+    /// 用 cacheDisplay 直接渲染视图层(不依赖窗口前台/窗口ID/录屏权限),彻底避开截图抓错窗口的问题。
+    /// WP_UI_SHOT_DELAY 调延迟(默认 4s,等缩略图加载)。生产不设这些 env 时无任何影响。
+    private func captureIfRequested() {
+        guard let path = ProcessInfo.processInfo.environment["WP_UI_SHOT"], let w = window else { return }
+        let delay = Double(ProcessInfo.processInfo.environment["WP_UI_SHOT_DELAY"] ?? "4") ?? 4
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+            if let cv = w.contentView,
+               let rep = cv.bitmapImageRepForCachingDisplay(in: cv.bounds) {
+                cv.cacheDisplay(in: cv.bounds, to: rep)
+                if let data = rep.representation(using: .png, properties: [:]) {
+                    try? data.write(to: URL(fileURLWithPath: path))
+                }
+            }
+            NSApp.terminate(nil)
+        }
     }
 
     /// 窗口关闭:降回菜单栏代理(不占 Dock、不在台前调度里逗留)。

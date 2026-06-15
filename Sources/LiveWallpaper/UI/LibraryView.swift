@@ -1,132 +1,89 @@
 import SwiftUI
 
-/// 主界面(原生 macOS 风格):NavigationSplitView 左侧原生侧边栏 + 右侧内容区,
-/// 选中壁纸时右侧再滑出壁纸设置检视面板。配色全部使用系统强调色(Color.accentColor),
-/// 不再硬编码品牌渐变,以贴合 macOS 原生审美(随用户系统强调色变化)。
+/// 主界面 —— 仿 WaifuX 设计语言:深色玻璃拟态 + 顶部居中标签栏(首页 / 壁纸库 / 创意工坊)+ 右上设置齿轮,
+/// 首页大图轮播 + 横向货架,壁纸库用问候语 + 大标题 + 胶囊筛选 chips + 卡片网格。强制深色外观。
 struct LibraryView: View {
     @ObservedObject var library: WallpaperLibrary
     var currentID: String?
     var actions: LibraryActions
 
-    @State private var section: Section =
-        ProcessInfo.processInfo.environment["WP_PREVIEW_SETTINGS"] != nil ? .settings : .all
-    @State private var search = ""
-    @State private var favVersion = 0   // 收藏变更后强制刷新
-    @State private var settingsItem: WallpaperItem?   // 正在设置的壁纸(右侧检视面板)
-
-    enum Section: Hashable {
-        case all, favorites
-        case type(WallpaperType)
-        case workshop
-        case settings
-
+    enum Tab: String, CaseIterable, Identifiable {
+        case home, library, workshop
+        var id: String { rawValue }
         var title: String {
             switch self {
-            case .all: return "全部"
-            case .favorites: return "收藏"
-            case .type(let t): return t.displayName
+            case .home: return "首页"
+            case .library: return "壁纸库"
             case .workshop: return "创意工坊"
-            case .settings: return "设置"
             }
         }
         var icon: String {
             switch self {
-            case .all: return "square.grid.2x2"
-            case .favorites: return "heart"
+            case .home: return "house"
+            case .library: return "square.grid.2x2"
             case .workshop: return "bag"
-            case .settings: return "gearshape"
-            case .type(let t):
-                switch t {
-                case .video: return "film"
-                case .scene: return "sparkles"
-                case .web: return "globe"
-                default: return "questionmark"
-                }
             }
         }
     }
 
-    /// 年龄段图标(筛选菜单用)。
-    private func ratingIcon(_ r: ContentRating) -> String {
-        switch r {
-        case .everyone: return "person"
-        case .questionable: return "exclamationmark.shield"
-        case .mature: return "18.circle"
-        case .unknown: return "questionmark"
-        }
-    }
+    @State private var tab: Tab = {
+        if let t = ProcessInfo.processInfo.environment["WP_PREVIEW_TAB"], let tab = Tab(rawValue: t) { return tab }
+        return .home
+    }()
+    @State private var search = ""
+    @State private var favVersion = 0
+    @State private var settingsItem: WallpaperItem?    // 选中壁纸的检视面板
+    @State private var showSettings =
+        ProcessInfo.processInfo.environment["WP_PREVIEW_SETTINGS"] != nil   // 设置 sheet
+    @State private var heroIndex = 0
 
-    /// 网格缩略图大小(小/中/大),改变 adaptive 列的最小宽度 → 每行卡片数与卡片尺寸。
+    // 壁纸库筛选:类型(nil=全部)、仅收藏、搜索、分级、排序、网格大小。
+    @State private var typeFilter: WallpaperType? = nil
+    @State private var favOnly = false
+
     enum GridSize: String, CaseIterable {
         case small, medium, large
         var title: String { switch self { case .small: return "小"; case .medium: return "中"; case .large: return "大" } }
         var icon: String { switch self { case .small: return "square.grid.3x3"; case .medium: return "square.grid.2x2"; case .large: return "square" } }
-        /// adaptive 列 (最小宽, 最大宽)。小→更密更小、大→更稀更大。
         var range: (min: CGFloat, max: CGFloat) { switch self { case .small: return (165, 220); case .medium: return (230, 320); case .large: return (320, 440) } }
     }
     @State private var gridSize = GridSize(rawValue: PreferencesStore.shared.gridSizeRaw) ?? .medium
     private var columns: [GridItem] {
         let r = gridSize.range
-        return [GridItem(.adaptive(minimum: r.min, maximum: r.max), spacing: 20)]
+        return [GridItem(.adaptive(minimum: r.min, maximum: r.max), spacing: 18)]
     }
 
-    /// 排序方式。
     enum SortKey: String, CaseIterable {
-        case type, name, date, size
+        case date, name, type, size
         var title: String {
             switch self {
-            case .type: return "类型"
+            case .date: return "最新"
             case .name: return "名称"
-            case .date: return "最近下载"
-            case .size: return "文件大小"
-            }
-        }
-        var icon: String {
-            switch self {
-            case .type: return "square.grid.2x2"
-            case .name: return "textformat"
-            case .date: return "clock"
-            case .size: return "externaldrive"
+            case .type: return "类型"
+            case .size: return "大小"
             }
         }
     }
-    @State private var sortKey = SortKey(rawValue: PreferencesStore.shared.sortKeyRaw) ?? .type
+    @State private var sortKey = SortKey(rawValue: PreferencesStore.shared.sortKeyRaw) ?? .date
     @State private var sortDesc = PreferencesStore.shared.sortDescending
 
-    /// 内容分级(年龄段)全局勾选集。改变后影响全部/收藏/各类型的数量与内容(与 WE 一致)。
     @State private var selectedRatings: Set<ContentRating> =
         Set(PreferencesStore.shared.selectedRatings.compactMap { ContentRating(rawValue: $0) })
 
-    /// 某壁纸是否通过年龄段筛选(未分级 unknown 视作 everyone,不丢失无标签壁纸)。
     private func ratingOK(_ item: WallpaperItem) -> Bool {
         let r: ContentRating = item.contentRating == .unknown ? .everyone : item.contentRating
         return selectedRatings.contains(r)
     }
-
-    /// 先经年龄段筛选的库(所有分区/类型的数量与内容都基于它)。
     private var ratingFilteredItems: [WallpaperItem] { library.items.filter(ratingOK) }
 
     private var filtered: [WallpaperItem] {
         let fav = PreferencesStore.shared.favorites
         let matched = ratingFilteredItems.filter { item in
-            let sectionOK: Bool
-            switch section {
-            case .all: sectionOK = true
-            case .favorites: sectionOK = fav.contains(item.id)
-            case .type(let t): sectionOK = item.type == t
-            case .settings, .workshop: sectionOK = false
-            }
-            return sectionOK && (search.isEmpty || item.title.localizedCaseInsensitiveContains(search))
+            (typeFilter == nil || item.type == typeFilter)
+            && (!favOnly || fav.contains(item.id))
+            && (search.isEmpty || item.title.localizedCaseInsensitiveContains(search))
         }
         return sorted(matched)
-    }
-
-    /// 切换某年龄段勾选(至少保留 1 个,避免全空看不到任何壁纸)+ 持久化。
-    private func toggleRating(_ r: ContentRating) {
-        var s = selectedRatings
-        if s.contains(r) { if s.count > 1 { s.remove(r) } } else { s.insert(r) }
-        selectedRatings = s
-        PreferencesStore.shared.selectedRatings = Set(s.map { $0.rawValue })
     }
 
     private func sorted(_ items: [WallpaperItem]) -> [WallpaperItem] {
@@ -137,352 +94,509 @@ struct LibraryView: View {
                 if a.type != b.type { return a.type.sortOrder < b.type.sortOrder }
                 return a.title.localizedStandardCompare(b.title) == .orderedAscending
             }
-        case .name:
-            asc = { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
-        case .date:
-            asc = { $0.modifiedDate < $1.modifiedDate }
-        case .size:
-            asc = { $0.fileSize < $1.fileSize }
+        case .name: asc = { $0.title.localizedStandardCompare($1.title) == .orderedAscending }
+        case .date: asc = { $0.modifiedDate < $1.modifiedDate }
+        case .size: asc = { $0.fileSize < $1.fileSize }
         }
         let s = items.sorted(by: asc)
         return sortDesc ? s.reversed() : s
     }
 
-    // MARK: - 布局
+    private func toggleRating(_ r: ContentRating) {
+        var s = selectedRatings
+        if s.contains(r) { if s.count > 1 { s.remove(r) } } else { s.insert(r) }
+        selectedRatings = s
+        PreferencesStore.shared.selectedRatings = Set(s.map { $0.rawValue })
+    }
+
+    // MARK: - 根布局
 
     var body: some View {
-        NavigationSplitView {
-            sidebar
-                .navigationSplitViewColumnWidth(min: 204, ideal: 220, max: 280)
-        } detail: {
-            detail
-                .navigationSplitViewColumnWidth(min: 560, ideal: 760)
-        }
-        .navigationSplitViewStyle(.balanced)
-        .frame(minWidth: 1000, minHeight: 640)
-        .onAppear {
-            // 截图验证用:WP_PREVIEW_PANEL=1 直接展开第一张壁纸的检视面板(不触发应用壁纸)。
-            if ProcessInfo.processInfo.environment["WP_PREVIEW_PANEL"] != nil, settingsItem == nil {
-                settingsItem = filtered.first
+        ZStack {
+            WaifuTheme.background.ignoresSafeArea()
+            VStack(spacing: 0) {
+                topBar
+                content
             }
-        }
-    }
-
-    /// 切换分区(切到工坊/设置时收起壁纸检视面板)。
-    private func select(_ s: Section) {
-        if s == .workshop || s == .settings {
-            withAnimation(.easeOut(duration: 0.2)) { settingsItem = nil }
-        }
-        section = s
-    }
-
-    // MARK: - 侧边栏(原生 List,放大字号 + 品牌头部,营造高级感)
-
-    /// 侧栏行:放大的图标 + 标题(15.5pt),比系统默认更醒目、更有质感。
-    private func sidebarLabel(_ title: String, _ icon: String, accent: Bool = false) -> some View {
-        Label {
-            Text(title).font(.system(size: 15.5, weight: .regular))
-        } icon: {
-            Image(systemName: icon)
-                .font(.system(size: 16, weight: .medium))
-                .foregroundStyle(accent ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
-        }
-    }
-
-    private var sidebar: some View {
-        List(selection: Binding<Section?>(get: { section }, set: { if let v = $0 { select(v) } })) {
-            sidebarLabel(Section.all.title, Section.all.icon, accent: true)
-                .badge(ratingFilteredItems.count)
-                .tag(Section.all)
-            sidebarLabel(Section.favorites.title, Section.favorites.icon)
-                .badge(filteredFavCount)
-                .tag(Section.favorites)
-            sidebarLabel(Section.workshop.title, Section.workshop.icon)
-                .tag(Section.workshop)
-
-            SwiftUI.Section {
-                ForEach([WallpaperType.video, .scene, .web], id: \.self) { t in
-                    sidebarLabel(t.displayName, Section.type(t).icon)
-                        .badge(filteredTypeCount(t))
-                        .tag(Section.type(t))
-                }
-            } header: {
-                Text("类型").font(.system(size: 12.5, weight: .semibold)).foregroundStyle(.secondary)
-            }
-        }
-        .listStyle(.sidebar)
-        .environment(\.defaultMinListRowHeight, 36)   // 更舒展的行高 = 高级感
-        .safeAreaInset(edge: .top) { brandHeader }
-        .safeAreaInset(edge: .bottom) { sidebarFooter }
-    }
-
-    /// 侧栏顶部品牌区:应用图标 + 名称(留出红绿灯空间)。
-    private var brandHeader: some View {
-        HStack(spacing: 10) {
-            Image(systemName: "photo.stack")
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundStyle(Color.accentColor)
-            Text("壁纸库").font(.system(size: 19, weight: .bold))
-            Spacer()
-        }
-        .padding(.horizontal, 18).padding(.top, 32).padding(.bottom, 12)
-    }
-
-    /// 侧栏底部:设置 + 重新扫描。
-    private var sidebarFooter: some View {
-        VStack(spacing: 1) {
-            Divider().padding(.bottom, 4)
-            Button { select(.settings) } label: {
-                Label {
-                    Text("设置").font(.system(size: 14.5))
-                } icon: {
-                    Image(systemName: "gearshape").font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(section == .settings ? Color.accentColor : .secondary)
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .foregroundStyle(section == .settings ? Color.accentColor : .primary)
-            .padding(.horizontal, 14).padding(.vertical, 7)
-
-            Button { library.scan() } label: {
-                HStack(spacing: 10) {
-                    if library.isScanning {
-                        ProgressView().controlSize(.small).scaleEffect(0.8).frame(width: 18)
-                    } else {
-                        Image(systemName: "arrow.clockwise").font(.system(size: 15, weight: .medium)).frame(width: 18)
-                    }
-                    Text(library.isScanning ? "扫描中…" : "重新扫描").font(.system(size: 14.5))
-                    Spacer()
-                }
-                .foregroundStyle(.secondary)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(library.isScanning)
-            .padding(.horizontal, 14).padding(.vertical, 7)
-        }
-        .padding(.bottom, 10)
-        .background(.ultraThinMaterial)
-    }
-
-    private var filteredFavCount: Int {
-        let fav = PreferencesStore.shared.favorites
-        return ratingFilteredItems.filter { fav.contains($0.id) }.count
-    }
-    private func filteredTypeCount(_ t: WallpaperType) -> Int {
-        ratingFilteredItems.filter { $0.type == t }.count
-    }
-
-    // MARK: - 详情区
-
-    @ViewBuilder
-    private var detail: some View {
-        HStack(spacing: 0) {
-            content
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .toolbar { toolbarContent }
-            // 选中壁纸时右侧滑出壁纸检视面板。
+            // 右侧壁纸检视面板(选中后滑出)。
             if let item = settingsItem {
-                Divider()
-                WallpaperSettingsPanel(
-                    item: item,
-                    onApply: { actions.onApplySettings(item) },
-                    onClose: { withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil } },
-                    onUnsubscribe: item.id.allSatisfy(\.isNumber) ? {
-                        actions.onUnsubscribe(item)
-                        favVersion += 1
-                        withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil }
-                    } : nil
-                )
-                .frame(width: 320)
-                .transition(.move(edge: .trailing).combined(with: .opacity))
+                HStack(spacing: 0) {
+                    Spacer()
+                    WallpaperSettingsPanel(
+                        item: item,
+                        onApply: { actions.onApplySettings(item) },
+                        onClose: { withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil } },
+                        onUnsubscribe: item.id.allSatisfy(\.isNumber) ? {
+                            actions.onUnsubscribe(item); favVersion += 1
+                            withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil }
+                        } : nil
+                    )
+                    .frame(width: 330)
+                    .transition(.move(edge: .trailing))
+                }
             }
         }
+        .frame(minWidth: 1000, minHeight: 660)
+        .preferredColorScheme(.dark)
+        .sheet(isPresented: $showSettings) {
+            SettingsSheet(actions: actions,
+                          currentItem: currentID.flatMap { id in library.items.first { $0.id == id } },
+                          onClose: { showSettings = false })
+        }
     }
+
+    // MARK: - 顶部标签栏
+
+    private var topBar: some View {
+        HStack(spacing: 0) {
+            Spacer().frame(width: 76)   // 留出红绿灯
+            Spacer()
+            HStack(spacing: 4) {
+                ForEach(Tab.allCases) { t in tabButton(t) }
+            }
+            .padding(4)
+            .background(Capsule().fill(.white.opacity(0.06)))
+            .overlay(Capsule().strokeBorder(.white.opacity(0.06)))
+            Spacer()
+            Button { showSettings = true } label: {
+                Image(systemName: "gearshape")
+                    .font(.system(size: 16, weight: .medium))
+                    .foregroundStyle(WaifuTheme.secondary)
+                    .frame(width: 36, height: 32)
+                    .background(Circle().fill(.white.opacity(0.06)))
+            }
+            .buttonStyle(.plain).help("设置")
+            .padding(.trailing, 16)
+        }
+        .frame(height: 50)
+        .padding(.top, 8)
+    }
+
+    private func tabButton(_ t: Tab) -> some View {
+        let on = tab == t
+        return Button {
+            withAnimation(.easeOut(duration: 0.18)) {
+                tab = t
+                if t != .library { settingsItem = nil }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: t.icon).font(.system(size: 12, weight: .semibold))
+                Text(t.title).font(.system(size: 13.5, weight: .semibold))
+            }
+            .foregroundStyle(on ? .white : WaifuTheme.secondary)
+            .padding(.horizontal, 16).padding(.vertical, 7)
+            .background(Capsule().fill(on ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.clear)))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    // MARK: - 内容
 
     @ViewBuilder
     private var content: some View {
-        switch section {
-        case .workshop:
-            WorkshopView()
-        case .settings:
-            SettingsForm(actions: actions,
-                         currentItem: currentID.flatMap { id in library.items.first { $0.id == id } })
-        default:
-            if library.items.isEmpty { emptyState }
-            else if filtered.isEmpty { noResultsState }
-            else { grid }
+        switch tab {
+        case .home: homeView
+        case .library: libraryBrowse
+        case .workshop: WorkshopView().background(WaifuTheme.background)
         }
     }
 
-    // MARK: - 工具栏
+    // MARK: - 首页(大图 hero + 横向货架)
 
-    @ToolbarContentBuilder
-    private var toolbarContent: some ToolbarContent {
-        if section != .workshop && section != .settings {
-            ToolbarItemGroup {
-                // 内容分级筛选菜单(原生 Mail 式筛选)。
-                Menu {
-                    ForEach([ContentRating.everyone, .questionable, .mature], id: \.self) { r in
-                        Toggle(isOn: Binding(get: { selectedRatings.contains(r) },
-                                             set: { _ in toggleRating(r) })) {
-                            Label("\(r.displayName) (\(library.ratingCounts[r] ?? 0))", systemImage: ratingIcon(r))
-                        }
-                    }
-                } label: {
-                    Label("筛选", systemImage: "line.3.horizontal.decrease.circle")
-                }
-                .help("内容分级筛选")
+    private var recentItems: [WallpaperItem] {
+        ratingFilteredItems.sorted { $0.modifiedDate > $1.modifiedDate }
+    }
+    private var favoriteItems: [WallpaperItem] {
+        let fav = PreferencesStore.shared.favorites
+        return ratingFilteredItems.filter { fav.contains($0.id) }
+    }
+    /// 精选(hero):当前壁纸优先,其后最近添加,去重取前 8。
+    private var featuredItems: [WallpaperItem] {
+        var seen = Set<String>(); var out: [WallpaperItem] = []
+        if let cur = currentID, let c = library.items.first(where: { $0.id == cur }) { out.append(c); seen.insert(c.id) }
+        for it in recentItems where !seen.contains(it.id) { out.append(it); seen.insert(it.id); if out.count >= 8 { break } }
+        return out
+    }
 
-                // 排序菜单。
-                Menu {
-                    Picker("排序方式", selection: Binding(get: { sortKey }, set: {
-                        sortKey = $0; PreferencesStore.shared.sortKeyRaw = $0.rawValue
-                    })) {
-                        ForEach(SortKey.allCases, id: \.self) { Label($0.title, systemImage: $0.icon).tag($0) }
-                    }
-                    Divider()
-                    Picker("顺序", selection: Binding(get: { sortDesc }, set: {
-                        sortDesc = $0; PreferencesStore.shared.sortDescending = $0
-                    })) {
-                        Label("升序", systemImage: "arrow.up").tag(false)
-                        Label("降序", systemImage: "arrow.down").tag(true)
-                    }
-                } label: {
-                    Label("排序", systemImage: "arrow.up.arrow.down")
+    private var homeView: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 26) {
+                if !featuredItems.isEmpty {
+                    HeroCarousel(items: featuredItems, index: $heroIndex, currentID: currentID,
+                                 onSet: { selectAndConfigure($0) },
+                                 onToggleFav: { PreferencesStore.shared.toggleFavorite($0.id); favVersion += 1 })
+                        .frame(height: 320)
+                        .padding(.horizontal, 26).padding(.top, 8)
                 }
-                .help("排序方式")
+                shelf("最近添加", Array(recentItems.prefix(14)))
+                if !favoriteItems.isEmpty { shelf("我的收藏", Array(favoriteItems.prefix(14))) }
+                ForEach([WallpaperType.scene, .video, .web], id: \.self) { t in
+                    let items = ratingFilteredItems.filter { $0.type == t }
+                    if !items.isEmpty { shelf(t.displayName, Array(items.prefix(14))) }
+                }
+            }
+            .padding(.bottom, 30)
+            .id(favVersion)
+        }
+        .scrollIndicators(.hidden)
+    }
 
-                // 网格大小切换。
-                Picker("图标大小", selection: Binding(get: { gridSize }, set: { newSize in
-                    withAnimation(.easeOut(duration: 0.18)) { gridSize = newSize }
-                    PreferencesStore.shared.gridSizeRaw = newSize.rawValue
-                })) {
-                    ForEach(GridSize.allCases, id: \.self) { Image(systemName: $0.icon).tag($0) }
+    /// 横向货架:标题 + 一行可横向滚动的卡片。
+    private func shelf(_ title: String, _ items: [WallpaperItem]) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 6) {
+                Text(title).font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
+                Text("\(items.count)").font(.system(size: 13, weight: .medium)).foregroundStyle(WaifuTheme.tertiary)
+                Spacer()
+            }
+            .padding(.horizontal, 26)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 16) {
+                    ForEach(items) { item in
+                        WallpaperCard(item: item, isCurrent: item.id == currentID,
+                                      isFavorite: PreferencesStore.shared.isFavorite(item.id),
+                                      onSelect: { selectAndConfigure(item) },
+                                      onToggleFavorite: { PreferencesStore.shared.toggleFavorite(item.id); favVersion += 1 })
+                            .frame(width: 248)
+                            .contextMenu { cardMenu(item) }
+                    }
                 }
-                .pickerStyle(.segmented)
-                .help("图标大小")
+                .padding(.horizontal, 26)
             }
         }
     }
 
-    /// 删除前弹确认(移到废纸篓,可恢复)。
-    private func confirmDelete(_ item: WallpaperItem) {
-        let alert = NSAlert()
-        alert.messageText = "删除壁纸「\(item.title)」?"
-        alert.informativeText = "壁纸文件夹会被移到废纸篓,可在废纸篓里恢复。"
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "删除")
-        alert.addButton(withTitle: "取消")
-        if alert.runModal() == .alertFirstButtonReturn {
-            actions.onDelete(item)
-            favVersion += 1
+    // MARK: - 壁纸库(问候语 + 大标题 + 胶囊筛选 + 网格)
+
+    private var greeting: String {
+        let h = Calendar.current.component(.hour, from: Date())
+        switch h {
+        case 5..<12: return "早上好"
+        case 12..<18: return "下午好"
+        case 18..<23: return "晚上好"
+        default: return "夜深了"
         }
     }
 
-    /// 选中壁纸:应用它 + 滑出右侧设置检视面板。
+    private var libraryBrowse: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 18) {
+                // 问候 + 大标题
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(greeting).font(.system(size: 13, weight: .medium)).foregroundStyle(WaifuTheme.tertiary)
+                    Text("探索壁纸库").font(.system(size: 28, weight: .bold)).foregroundStyle(.white)
+                }
+                searchBar
+                // 类型筛选 chips
+                filterGroup("类型") {
+                    chip("全部", icon: "square.grid.2x2", on: typeFilter == nil) { typeFilter = nil }
+                    ForEach([WallpaperType.scene, .video, .web], id: \.self) { t in
+                        chip(t.displayName, icon: typeIcon(t), on: typeFilter == t) { typeFilter = (typeFilter == t ? nil : t) }
+                    }
+                    chip("收藏", icon: "heart.fill", on: favOnly) { favOnly.toggle() }
+                }
+                // 分级 chips
+                filterGroup("内容分级") {
+                    ForEach([ContentRating.everyone, .questionable, .mature], id: \.self) { r in
+                        chip(r.displayName, icon: ratingIcon(r), on: selectedRatings.contains(r)) { toggleRating(r) }
+                    }
+                }
+                // 数量 + 排序
+                HStack {
+                    Text("\(filtered.count) 张壁纸").font(.system(size: 13, weight: .medium)).foregroundStyle(WaifuTheme.secondary)
+                    Spacer()
+                    gridSizeControl
+                    sortMenu
+                }
+                .padding(.top, 2)
+
+                if library.items.isEmpty { emptyState }
+                else if filtered.isEmpty { noResultsState }
+                else {
+                    LazyVGrid(columns: columns, spacing: 18) {
+                        ForEach(filtered) { item in
+                            WallpaperCard(item: item, isCurrent: item.id == currentID,
+                                          isFavorite: PreferencesStore.shared.isFavorite(item.id),
+                                          onSelect: { selectAndConfigure(item) },
+                                          onToggleFavorite: { PreferencesStore.shared.toggleFavorite(item.id); favVersion += 1 })
+                                .contextMenu { cardMenu(item) }
+                        }
+                    }
+                    .id(favVersion)
+                }
+            }
+            .padding(.horizontal, 26).padding(.top, 10).padding(.bottom, 30)
+        }
+        .scrollIndicators(.hidden)
+    }
+
+    private var searchBar: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass").font(.system(size: 13)).foregroundStyle(WaifuTheme.tertiary)
+            TextField("搜索壁纸…", text: $search)
+                .textFieldStyle(.plain).font(.system(size: 13.5)).foregroundStyle(.white)
+            if !search.isEmpty {
+                Button { search = "" } label: {
+                    Image(systemName: "xmark.circle.fill").font(.system(size: 13)).foregroundStyle(WaifuTheme.tertiary)
+                }.buttonStyle(.plain)
+            }
+        }
+        .padding(.horizontal, 14).padding(.vertical, 10)
+        .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(.white.opacity(0.06)))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(.white.opacity(0.07)))
+        .frame(maxWidth: 520)
+    }
+
+    /// 筛选分组:小标题 + 一行 chips。
+    @ViewBuilder
+    private func filterGroup<C: View>(_ title: String, @ViewBuilder _ chips: () -> C) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.system(size: 11.5, weight: .semibold)).foregroundStyle(WaifuTheme.tertiary)
+            HStack(spacing: 8) { chips() }
+        }
+    }
+
+    /// 胶囊筛选 chip(选中=强调色填充)。
+    private func chip(_ title: String, icon: String, on: Bool, _ act: @escaping () -> Void) -> some View {
+        Button { withAnimation(.easeOut(duration: 0.15)) { act() } } label: {
+            HStack(spacing: 5) {
+                Image(systemName: icon).font(.system(size: 11, weight: .semibold))
+                Text(title).font(.system(size: 12.5, weight: .medium))
+            }
+            .foregroundStyle(on ? .white : WaifuTheme.secondary)
+            .padding(.horizontal, 13).padding(.vertical, 7)
+            .background(Capsule().fill(on ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.white.opacity(0.06))))
+            .overlay(Capsule().strokeBorder(.white.opacity(on ? 0 : 0.07)))
+            .contentShape(Capsule())
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var gridSizeControl: some View {
+        HStack(spacing: 2) {
+            ForEach(GridSize.allCases, id: \.self) { sz in
+                let on = gridSize == sz
+                Button {
+                    withAnimation(.easeOut(duration: 0.18)) { gridSize = sz }
+                    PreferencesStore.shared.gridSizeRaw = sz.rawValue
+                } label: {
+                    Image(systemName: sz.icon).font(.system(size: 12, weight: on ? .semibold : .regular))
+                        .frame(width: 28, height: 24)
+                        .foregroundStyle(on ? .white : WaifuTheme.secondary)
+                        .background(RoundedRectangle(cornerRadius: 7).fill(on ? Color.accentColor.opacity(0.9) : .clear))
+                }
+                .buttonStyle(.plain).help("\(sz.title)图标")
+            }
+        }
+        .padding(2)
+        .background(RoundedRectangle(cornerRadius: 9).fill(.white.opacity(0.06)))
+    }
+
+    private var sortMenu: some View {
+        Menu {
+            Picker("排序", selection: Binding(get: { sortKey }, set: { sortKey = $0; PreferencesStore.shared.sortKeyRaw = $0.rawValue })) {
+                ForEach(SortKey.allCases, id: \.self) { Text($0.title).tag($0) }
+            }
+            Divider()
+            Picker("顺序", selection: Binding(get: { sortDesc }, set: { sortDesc = $0; PreferencesStore.shared.sortDescending = $0 })) {
+                Text("降序").tag(true); Text("升序").tag(false)
+            }
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.up.arrow.down").font(.system(size: 11))
+                Text(sortKey.title).font(.system(size: 12.5, weight: .medium))
+            }
+            .foregroundStyle(WaifuTheme.secondary)
+            .padding(.horizontal, 11).padding(.vertical, 7)
+            .background(Capsule().fill(.white.opacity(0.06)))
+        }
+        .menuStyle(.borderlessButton).fixedSize()
+    }
+
+    // MARK: - 辅助
+
+    private func typeIcon(_ t: WallpaperType) -> String {
+        switch t { case .video: return "film"; case .scene: return "sparkles"; case .web: return "globe"; default: return "questionmark" }
+    }
+    private func ratingIcon(_ r: ContentRating) -> String {
+        switch r { case .everyone: return "person"; case .questionable: return "exclamationmark.shield"; case .mature: return "18.circle"; case .unknown: return "questionmark" }
+    }
+
     private func selectAndConfigure(_ item: WallpaperItem) {
         actions.onSelect(item)
         withAnimation(.easeOut(duration: 0.22)) { settingsItem = item }
     }
 
-    /// 内容区大号分区标题(高级感:粗体大标题 + 数量)。
-    private var gridHeader: some View {
-        HStack(alignment: .firstTextBaseline, spacing: 10) {
-            Text(section.title).font(.system(size: 24, weight: .bold))
-            Text("\(filtered.count)").font(.system(size: 15, weight: .medium)).foregroundStyle(.tertiary)
-            Spacer()
+    @ViewBuilder
+    private func cardMenu(_ item: WallpaperItem) -> some View {
+        Button { selectAndConfigure(item) } label: { Label("设为壁纸", systemImage: "play.fill") }
+        Button { withAnimation(.easeOut(duration: 0.22)) { settingsItem = item } } label: { Label("壁纸设置…", systemImage: "slider.horizontal.3") }
+        Button {
+            PreferencesStore.shared.toggleFavorite(item.id); favVersion += 1
+        } label: {
+            Label(PreferencesStore.shared.isFavorite(item.id) ? "取消收藏" : "收藏",
+                  systemImage: PreferencesStore.shared.isFavorite(item.id) ? "heart.slash" : "heart")
         }
-        .padding(.horizontal, 24).padding(.top, 14).padding(.bottom, 2)
+        Button { NSWorkspace.shared.activateFileViewerSelecting([item.folderURL]) } label: { Label("在访达中显示", systemImage: "folder") }
+        Divider()
+        Button(role: .destructive) { confirmDelete(item) } label: { Label("删除壁纸", systemImage: "trash") }
     }
 
-    private var grid: some View {
-        ScrollView {
-            gridHeader
-            LazyVGrid(columns: columns, spacing: 20) {
-                ForEach(filtered) { item in
-                    WallpaperCard(
-                        item: item,
-                        isCurrent: item.id == currentID,
-                        isFavorite: PreferencesStore.shared.isFavorite(item.id),
-                        onSelect: { selectAndConfigure(item) },
-                        onToggleFavorite: {
-                            PreferencesStore.shared.toggleFavorite(item.id)
-                            favVersion += 1
-                        }
-                    )
-                    .contextMenu {
-                        Button { selectAndConfigure(item) } label: { Label("设为壁纸", systemImage: "play.fill") }
-                        Button { withAnimation(.easeOut(duration: 0.22)) { settingsItem = item } } label: { Label("壁纸设置…", systemImage: "slider.horizontal.3") }
-                        Button {
-                            PreferencesStore.shared.toggleFavorite(item.id); favVersion += 1
-                        } label: {
-                            Label(PreferencesStore.shared.isFavorite(item.id) ? "取消收藏" : "收藏",
-                                  systemImage: PreferencesStore.shared.isFavorite(item.id) ? "heart.slash" : "heart")
-                        }
-                        Button {
-                            NSWorkspace.shared.activateFileViewerSelecting([item.folderURL])
-                        } label: { Label("在访达中显示", systemImage: "folder") }
-                        Divider()
-                        Button(role: .destructive) { confirmDelete(item) } label: {
-                            Label("删除壁纸", systemImage: "trash")
-                        }
-                    }
-                }
-            }
-            .padding(24)
-            .id(favVersion)
-        }
-        .searchable(text: $search, placement: .toolbar, prompt: "搜索壁纸")
+    private func confirmDelete(_ item: WallpaperItem) {
+        let alert = NSAlert()
+        alert.messageText = "删除壁纸「\(item.title)」?"
+        alert.informativeText = "壁纸文件夹会被移到废纸篓,可在废纸篓里恢复。"
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "删除"); alert.addButton(withTitle: "取消")
+        if alert.runModal() == .alertFirstButtonReturn { actions.onDelete(item); favVersion += 1 }
     }
 
     private var emptyState: some View {
-        EmptyStateView(
-            label: library.isScanning ? "正在扫描壁纸…" : "没找到壁纸",
-            systemImage: library.isScanning ? "hourglass" : "tray",
-            description: library.rootURL.path
-        )
+        EmptyStateView(label: library.isScanning ? "正在扫描壁纸…" : "没找到壁纸",
+                       systemImage: library.isScanning ? "hourglass" : "tray",
+                       description: library.rootURL.path)
+            .frame(height: 320)
     }
-
     private var noResultsState: some View {
-        EmptyStateView(
-            label: section == .favorites ? "还没有收藏" : "没有匹配的壁纸",
-            systemImage: section == .favorites ? "heart.slash" : "magnifyingglass",
-            description: section == .favorites ? "把喜欢的壁纸点上 ♥,这里就会出现" : "试试别的搜索词"
-        )
+        EmptyStateView(label: favOnly ? "还没有收藏" : "没有匹配的壁纸",
+                       systemImage: favOnly ? "heart.slash" : "magnifyingglass",
+                       description: favOnly ? "把喜欢的壁纸点上 ♥,这里就会出现" : "试试别的筛选或搜索词")
+            .frame(height: 320)
     }
 }
 
-/// 占位空态(macOS 13 没有系统 ContentUnavailableView,这里自绘一个对齐风格的版本)。
+/// WaifuX 风深色玻璃配色 token。
+enum WaifuTheme {
+    static let background = LinearGradient(colors: [Color(white: 0.10), Color(white: 0.06)],
+                                           startPoint: .top, endPoint: .bottom)
+    static let secondary = Color.white.opacity(0.62)
+    static let tertiary = Color.white.opacity(0.40)
+    static let card = Color.white.opacity(0.06)
+}
+
+/// 首页大图 hero 轮播:大预览 + 标题/元信息 + 设为壁纸/收藏 + 左右切换 + 圆点。
+struct HeroCarousel: View {
+    let items: [WallpaperItem]
+    @Binding var index: Int
+    var currentID: String?
+    var onSet: (WallpaperItem) -> Void
+    var onToggleFav: (WallpaperItem) -> Void
+
+    @State private var thumb: NSImage?
+
+    private var item: WallpaperItem { items[min(index, items.count - 1)] }
+
+    // 图片为基底 + 所有装饰用 .overlay 钉在基底 320 高的框上(避免 .aspectRatio(.fill) 把 ZStack 撑大
+    // 导致底部信息被裁掉看不见 —— 这是之前标题不显示的根因)。
+    var body: some View {
+        Group {
+            if let thumb { Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill) }
+            else { Rectangle().fill(.white.opacity(0.06)) }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 320)
+        .clipped()
+        .overlay {   // 暗化渐变(左 + 下),保证标题可读
+            ZStack {
+                LinearGradient(colors: [.black.opacity(0.72), .black.opacity(0.15), .clear],
+                               startPoint: .leading, endPoint: .trailing)
+                LinearGradient(colors: [.clear, .black.opacity(0.2), .black.opacity(0.62)],
+                               startPoint: .center, endPoint: .bottom)
+            }
+            .allowsHitTesting(false)
+        }
+        .overlay(alignment: .bottomLeading) {
+            VStack(alignment: .leading, spacing: 10) {
+                TypeBadge(type: item.type)
+                Text(item.title).font(.system(size: 30, weight: .bold)).foregroundStyle(.white)
+                    .lineLimit(2).shadow(color: .black.opacity(0.6), radius: 6)
+                HStack(spacing: 8) {
+                    Text(item.type.displayName)
+                    Text("·"); Text(sizeText(item.fileSize))
+                }.font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.85))
+                HStack(spacing: 10) {
+                    Button { onSet(item) } label: {
+                        Label(item.id == currentID ? "正在播放" : "设为壁纸",
+                              systemImage: item.id == currentID ? "checkmark.circle.fill" : "play.fill")
+                            .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                            .padding(.horizontal, 18).padding(.vertical, 10)
+                            .background(Capsule().fill(item.id == currentID ? AnyShapeStyle(.white.opacity(0.22)) : AnyShapeStyle(Color.accentColor)))
+                    }.buttonStyle(.plain)
+                    Button { onToggleFav(item) } label: {
+                        Image(systemName: PreferencesStore.shared.isFavorite(item.id) ? "heart.fill" : "heart")
+                            .font(.system(size: 14, weight: .semibold))
+                            .foregroundStyle(PreferencesStore.shared.isFavorite(item.id) ? .pink : .white)
+                            .frame(width: 38, height: 38).background(Circle().fill(.white.opacity(0.18)))
+                    }.buttonStyle(.plain)
+                }
+                .padding(.top, 2)
+            }
+            .padding(28)
+        }
+        .overlay(alignment: .leading) {
+            heroArrow("chevron.left") { index = (index - 1 + items.count) % items.count }.padding(.leading, 12)
+        }
+        .overlay(alignment: .trailing) {
+            heroArrow("chevron.right") { index = (index + 1) % items.count }.padding(.trailing, 12)
+        }
+        .overlay(alignment: .bottom) {
+            HStack(spacing: 6) {
+                ForEach(items.indices, id: \.self) { i in
+                    Circle().fill(.white.opacity(i == index ? 0.95 : 0.35)).frame(width: 6, height: 6)
+                }
+            }
+            .padding(.bottom, 12)
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
+        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(.white.opacity(0.10)))
+        .shadow(color: .black.opacity(0.4), radius: 18, y: 8)
+        .onChange(of: index) { _ in loadThumb() }
+        .onChange(of: item.id) { _ in loadThumb() }
+        .onAppear { loadThumb() }
+    }
+
+    private func heroArrow(_ icon: String, _ act: @escaping () -> Void) -> some View {
+        Button(action: { withAnimation(.easeOut(duration: 0.2)) { act() } }) {
+            Image(systemName: icon).font(.system(size: 14, weight: .bold)).foregroundStyle(.white)
+                .frame(width: 36, height: 36).background(Circle().fill(.black.opacity(0.4)))
+        }.buttonStyle(.plain).opacity(items.count > 1 ? 1 : 0)
+    }
+
+    private func loadThumb() {
+        guard items.indices.contains(index), let url = item.previewURL else { thumb = nil; return }
+        ThumbnailCache.shared.largeImage(for: url) { img in self.thumb = img }
+    }
+}
+
+func sizeText(_ bytes: Int64) -> String {
+    if bytes <= 0 { return "—" }
+    let mb = Double(bytes) / 1_048_576
+    if mb >= 1024 { return String(format: "%.1f GB", mb / 1024) }
+    if mb >= 1 { return String(format: "%.0f MB", mb) }
+    return String(format: "%.0f KB", Double(bytes) / 1024)
+}
+
+/// 占位空态。
 struct EmptyStateView: View {
     let label: String
     let systemImage: String
     var description: String? = nil
     var body: some View {
         VStack(spacing: 8) {
-            Image(systemName: systemImage)
-                .font(.system(size: 38, weight: .regular))
-                .foregroundStyle(.tertiary)
-            Text(label)
-                .font(.title3.weight(.semibold))
-                .foregroundStyle(.secondary)
+            Image(systemName: systemImage).font(.system(size: 38)).foregroundStyle(WaifuTheme.tertiary)
+            Text(label).font(.title3.weight(.semibold)).foregroundStyle(WaifuTheme.secondary)
             if let description {
-                Text(description)
-                    .font(.callout)
-                    .foregroundStyle(.tertiary)
-                    .multilineTextAlignment(.center)
-                    .lineLimit(2)
-                    .padding(.horizontal, 40)
+                Text(description).font(.callout).foregroundStyle(WaifuTheme.tertiary)
+                    .multilineTextAlignment(.center).lineLimit(2).padding(.horizontal, 40)
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 }
 
-/// 单张壁纸卡片:16:9 预览 + 悬停放大/阴影 + 渐变标题 + 播放中角标 + 收藏心形。
-/// 选中描边使用系统强调色(Color.accentColor)。
+/// 壁纸卡片(WaifuX 风:连续圆角 + 类型/大小角标 + 悬停放大 + 渐变标题)。
 struct WallpaperCard: View {
     let item: WallpaperItem
     var isCurrent: Bool
@@ -496,11 +610,8 @@ struct WallpaperCard: View {
     var body: some View {
         ZStack {
             Group {
-                if let thumb {
-                    Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill)
-                } else {
-                    Rectangle().fill(.quaternary).overlay(ProgressView().controlSize(.small))
-                }
+                if let thumb { Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill) }
+                else { Rectangle().fill(.white.opacity(0.05)).overlay(ProgressView().controlSize(.small)) }
             }
             .frame(maxWidth: .infinity)
             .aspectRatio(16.0/9.0, contentMode: .fit)
@@ -509,19 +620,18 @@ struct WallpaperCard: View {
             VStack {
                 Spacer()
                 HStack {
-                    Text(item.title)
-                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
-                        .lineLimit(2).shadow(color: .black.opacity(0.5), radius: 3, y: 1)
+                    Text(item.title).font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                        .lineLimit(1).shadow(color: .black.opacity(0.5), radius: 3, y: 1)
                     Spacer()
                 }
-                .padding(.horizontal, 12).padding(.bottom, 10).padding(.top, 30)
-                .background(LinearGradient(colors: [.clear, .black.opacity(0.35), .black.opacity(0.8)],
+                .padding(.horizontal, 12).padding(.bottom, 9).padding(.top, 30)
+                .background(LinearGradient(colors: [.clear, .black.opacity(0.35), .black.opacity(0.82)],
                                            startPoint: .top, endPoint: .bottom))
             }
 
             if hovering {
-                Image(systemName: "play.circle.fill")
-                    .font(.system(size: 40)).foregroundStyle(.white.opacity(0.95)).shadow(radius: 6)
+                Image(systemName: "play.circle.fill").font(.system(size: 42))
+                    .foregroundStyle(.white.opacity(0.95)).shadow(radius: 6)
                     .transition(.scale.combined(with: .opacity))
             }
 
@@ -545,8 +655,7 @@ struct WallpaperCard: View {
                             Circle().fill(.green).frame(width: 6, height: 6)
                             Text("播放中").font(.system(size: 10, weight: .bold))
                         }
-                        .foregroundStyle(.white)
-                        .padding(.horizontal, 7).padding(.vertical, 3)
+                        .foregroundStyle(.white).padding(.horizontal, 7).padding(.vertical, 3)
                         .background(.black.opacity(0.5), in: Capsule())
                     }
                     Spacer()
@@ -559,12 +668,10 @@ struct WallpaperCard: View {
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(
-                isCurrent ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.white.opacity(0.10)),
+                isCurrent ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.white.opacity(0.08)),
                 lineWidth: isCurrent ? 3 : 1)
         )
-        // 双层柔和投影 = 高级层次感(环境大柔影 + 贴近的暗影);选中时叠一层强调色辉光。
-        .shadow(color: .black.opacity(hovering ? 0.32 : 0.16), radius: hovering ? 18 : 9, y: hovering ? 10 : 4)
-        .shadow(color: .black.opacity(hovering ? 0.18 : 0.10), radius: hovering ? 5 : 2, y: 1)
+        .shadow(color: .black.opacity(hovering ? 0.38 : 0.20), radius: hovering ? 18 : 9, y: hovering ? 10 : 4)
         .shadow(color: isCurrent ? Color.accentColor.opacity(0.45) : .clear, radius: 10)
         .scaleEffect(hovering ? 1.03 : 1.0)
         .animation(.spring(response: 0.32, dampingFraction: 0.72), value: hovering)
@@ -590,19 +697,34 @@ struct TypeBadge: View {
         .foregroundStyle(.white)
     }
     private var icon: String {
-        switch type {
-        case .video: return "film.fill"
-        case .scene: return "sparkles"
-        case .web: return "globe"
-        default: return "questionmark"
-        }
+        switch type { case .video: return "film.fill"; case .scene: return "sparkles"; case .web: return "globe"; default: return "questionmark" }
     }
     private var color: Color {
-        switch type {
-        case .video: return .blue
-        case .scene: return .purple
-        case .web: return .green
-        default: return .gray
+        switch type { case .video: return .blue; case .scene: return .purple; case .web: return .green; default: return .gray }
+    }
+}
+
+/// 设置 sheet(WaifuX 风:深色,复用分组设置表单 + 关闭按钮)。
+struct SettingsSheet: View {
+    let actions: LibraryActions
+    var currentItem: WallpaperItem?
+    var onClose: () -> Void
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack {
+                Text("设置").font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
+                Spacer()
+                Button(action: onClose) {
+                    Image(systemName: "xmark.circle.fill").font(.system(size: 18)).foregroundStyle(WaifuTheme.secondary)
+                }.buttonStyle(.plain).keyboardShortcut(.cancelAction)
+            }
+            .padding(.horizontal, 20).padding(.vertical, 14)
+            Divider().opacity(0.3)
+            SettingsForm(actions: actions, currentItem: currentItem)
         }
+        .frame(width: 720, height: 620)
+        .background(WaifuTheme.background.ignoresSafeArea())
+        .preferredColorScheme(.dark)
     }
 }

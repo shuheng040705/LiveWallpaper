@@ -5,6 +5,7 @@ import ImageIO
 final class ThumbnailCache {
     static let shared = ThumbnailCache()
     private let cache = NSCache<NSURL, NSImage>()
+    private let largeCache = NSCache<NSURL, NSImage>()   // 首页 hero 大图(独立缓存,避免与卡片 520px 版本撞键)
     private let queue = DispatchQueue(label: "thumbnail", qos: .utility, attributes: .concurrent)
 
     func thumbnail(for url: URL, maxPixel: CGFloat = 520, completion: @escaping (NSImage?) -> Void) {
@@ -15,6 +16,19 @@ final class ThumbnailCache {
         queue.async {
             let image = Self.downsample(url: url, maxPixel: maxPixel)
             if let image { self.cache.setObject(image, forKey: url as NSURL) }
+            DispatchQueue.main.async { completion(image) }
+        }
+    }
+
+    /// 大图(首页 hero 用):下采样到 ~1800px,独立缓存,清晰不糊。
+    func largeImage(for url: URL, completion: @escaping (NSImage?) -> Void) {
+        if let cached = largeCache.object(forKey: url as NSURL) {
+            completion(cached)
+            return
+        }
+        queue.async {
+            let image = Self.downsample(url: url, maxPixel: 1800)
+            if let image { self.largeCache.setObject(image, forKey: url as NSURL) }
             DispatchQueue.main.async { completion(image) }
         }
     }
