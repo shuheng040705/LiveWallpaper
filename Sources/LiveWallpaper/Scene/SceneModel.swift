@@ -904,6 +904,14 @@ struct SceneDocument {
             if obj["image"] == nil, obj["camera"] != nil,
                ProcessInfo.processInfo.environment["WP_NO_CAMERA_ANIM"] == nil,
                cameraAnim == nil {
+                // ⭐开场运镜可被用户属性关闭:camera 对象的 visible 常绑「开场动画/Opening animation」开关
+                //   (如 Lucy 3521337568:camera_paths_1640 visible={user:"newproperty"})。用户关掉该开关 →
+                //   parseVisible=false → 不建 cameraAnim → 不播放飞入运镜(相机停在静止取景,内容一开始就到位)。
+                //   修复用户报「关闭开场动画后仍会播放一次」:此前忽略 visible 恒建 cameraAnim,重载时又从 t=0 重播。
+                guard Self.parseVisible(obj["visible"]) else {
+                    Log.write("scene: camera-path 运镜被用户属性关闭(visible=false)→ 跳过开场飞入")
+                    continue
+                }
                 let originAnim = WEKeyframeAnimation.parse(obj["origin"])
                 let zoomAnim = WEKeyframeAnimation.parse(obj["zoom"])
                 if originAnim != nil || zoomAnim != nil {
@@ -1191,6 +1199,20 @@ struct SceneDocument {
             if let c = obj["color"] { color = VecParse.f4(c, default: color) }
             if let a = VecParse.unwrap(obj["alpha"]) as? NSNumber { color.w = a.floatValue }
 
+            // texture_override 特效(workshop 3224559305 "Texture Override"):纯色层靠它把**真实美术贴图**
+            //   塞进来(pass.textures[1]=贴图名,textures[0]=null 用层基底)。本壁纸「白影轻扬」3497488774 的 41 个
+            //   美术层(草地/身体/栅栏/杂草/云…)全这么做。引擎不处理 → 全退成纯色填充(color=None→白)→ 整屏泛白。
+            //   真义(texture_override.frag,RETAIN_ORIG=0 默认):用覆盖贴图 g_Texture1 替换层基底,**不乘 g_Color4**。
+            //   故:把覆盖贴图设为层基底纹理 + color 置白(不被填充色染),按普通图像层渲染;飘动等其余特效仍在链里跑。
+            //   (texture_override 自身不在 manifest → runLayerEffects 的 we.has 门控自动跳过,无害。)
+            var texOverridden = false
+            if texPath == nil, let ovBase = Self.textureOverrideBase(obj),
+               let ovPath = Self.resolveTexture(base: ovBase, source: source) {
+                texPath = ovPath
+                texOverridden = true
+                color = SIMD4(1, 1, 1, color.w)
+            }
+
             // solidlayer 没有纹理但要画;有纹理但解析不到、又不是 solid 的,跳过。
             // frameBufferInput(composelayer/_rt_FullFrameBuffer)无自有贴图但要渲(输入=下方场景),不丢。
             if texPath == nil && !isSolidReal && !isFrameBufferInput { continue }
@@ -1288,8 +1310,8 @@ struct SceneDocument {
                 visible: visible,
                 texturePath: texPath,
                 color: color,
-                blend: isSolidReal ? .translucent : blend,
-                isSolid: isSolidReal,
+                blend: (isSolidReal && !texOverridden) ? .translucent : blend,
+                isSolid: isSolidReal && !texOverridden,
                 effects: effects
             )
             layer.scaleScript = scaleScript
@@ -2673,6 +2695,23 @@ struct SceneDocument {
     }
 
     /// 把 material textures[0] 的 base 名解析为 pkg 内实际 .tex 路径。
+    /// texture_override 特效(workshop 3224559305)的覆盖贴图名:pass.textures 里第一个非空字符串
+    /// (textures[0]=null 表示用层基底,textures[1]=真实美术贴图名,如 "身体"/"草地")。
+    /// 特效隐藏(visible 关 / 引用未定义属性)则不覆盖。无 texture_override 返回 nil。
+    private static func textureOverrideBase(_ obj: [String: Any]) -> String? {
+        guard let effects = obj["effects"] as? [[String: Any]] else { return nil }
+        for e in effects {
+            guard let file = e["file"] as? String, file.contains("texture_override") else { continue }
+            guard Self.effectVisible(e["visible"]) else { continue }
+            guard let passes = e["passes"] as? [[String: Any]], let p0 = passes.first,
+                  let texs = p0["textures"] as? [Any] else { continue }
+            for t in texs {
+                if let s = VecParse.unwrap(t) as? String, !s.isEmpty { return s }
+            }
+        }
+        return nil
+    }
+
     private static func resolveTexture(base: String, source: SceneSource) -> String? {
         let candidates = [
             "materials/\(base).tex",
