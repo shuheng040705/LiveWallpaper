@@ -116,23 +116,24 @@ struct LibraryView: View {
             WaifuTheme.background.ignoresSafeArea()
             VStack(spacing: 0) {
                 topBar
-                content
-            }
-            // 右侧壁纸检视面板(选中后滑出)。
-            if let item = settingsItem {
+                // 内容 + 右侧壁纸检视面板**并排**(面板不覆盖内容;选中壁纸时内容区自动变窄、网格重排)。
                 HStack(spacing: 0) {
-                    Spacer()
-                    WallpaperSettingsPanel(
-                        item: item,
-                        onApply: { actions.onApplySettings(item) },
-                        onClose: { withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil } },
-                        onUnsubscribe: item.id.allSatisfy(\.isNumber) ? {
-                            actions.onUnsubscribe(item); favVersion += 1
-                            withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil }
-                        } : nil
-                    )
-                    .frame(width: 330)
-                    .transition(.move(edge: .trailing))
+                    content
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    if let item = settingsItem {
+                        Divider().overlay(Color.white.opacity(0.06))
+                        WallpaperSettingsPanel(
+                            item: item,
+                            onApply: { actions.onApplySettings(item) },
+                            onClose: { withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil } },
+                            onUnsubscribe: item.id.allSatisfy(\.isNumber) ? {
+                                actions.onUnsubscribe(item); favVersion += 1
+                                withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil }
+                            } : nil
+                        )
+                        .frame(width: 340)
+                        .transition(.move(edge: .trailing))
+                    }
                 }
             }
         }
@@ -142,6 +143,11 @@ struct LibraryView: View {
             SettingsSheet(actions: actions,
                           currentItem: currentID.flatMap { id in library.items.first { $0.id == id } },
                           onClose: { showSettings = false })
+        }
+        .onAppear {
+            if ProcessInfo.processInfo.environment["WP_PREVIEW_PANEL"] != nil, settingsItem == nil {
+                settingsItem = filtered.first
+            }
         }
     }
 
@@ -221,26 +227,29 @@ struct LibraryView: View {
     }
 
     private var homeView: some View {
-        ScrollView {
-            VStack(alignment: .leading, spacing: 26) {
-                if !featuredItems.isEmpty {
-                    HeroCarousel(items: featuredItems, index: $heroIndex, currentID: currentID,
-                                 onSet: { selectAndConfigure($0) },
-                                 onToggleFav: { PreferencesStore.shared.toggleFavorite($0.id); favVersion += 1 })
-                        .frame(height: 320)
-                        .padding(.horizontal, 26).padding(.top, 8)
+        GeometryReader { geo in
+            ScrollView {
+                VStack(alignment: .leading, spacing: 26) {
+                    if !featuredItems.isEmpty {
+                        // 大图 hero 占满视口高度(仿 WaifuX 沉浸式),只露出下方货架标题一角。
+                        HeroCarousel(items: featuredItems, index: $heroIndex, currentID: currentID,
+                                     height: max(360, geo.size.height - 86),
+                                     onSet: { selectAndConfigure($0) },
+                                     onToggleFav: { PreferencesStore.shared.toggleFavorite($0.id); favVersion += 1 })
+                            .padding(.horizontal, 26).padding(.top, 10)
+                    }
+                    shelf("最近添加", Array(recentItems.prefix(14)))
+                    if !favoriteItems.isEmpty { shelf("我的收藏", Array(favoriteItems.prefix(14))) }
+                    ForEach([WallpaperType.scene, .video, .web], id: \.self) { t in
+                        let items = ratingFilteredItems.filter { $0.type == t }
+                        if !items.isEmpty { shelf(t.displayName, Array(items.prefix(14))) }
+                    }
                 }
-                shelf("最近添加", Array(recentItems.prefix(14)))
-                if !favoriteItems.isEmpty { shelf("我的收藏", Array(favoriteItems.prefix(14))) }
-                ForEach([WallpaperType.scene, .video, .web], id: \.self) { t in
-                    let items = ratingFilteredItems.filter { $0.type == t }
-                    if !items.isEmpty { shelf(t.displayName, Array(items.prefix(14))) }
-                }
+                .padding(.bottom, 30)
+                .id(favVersion)
             }
-            .padding(.bottom, 30)
-            .id(favVersion)
+            .scrollIndicators(.hidden)
         }
-        .scrollIndicators(.hidden)
     }
 
     /// 横向货架:标题 + 一行可横向滚动的卡片。
@@ -481,6 +490,7 @@ struct HeroCarousel: View {
     let items: [WallpaperItem]
     @Binding var index: Int
     var currentID: String?
+    var height: CGFloat = 320
     var onSet: (WallpaperItem) -> Void
     var onToggleFav: (WallpaperItem) -> Void
 
@@ -496,7 +506,7 @@ struct HeroCarousel: View {
             else { Rectangle().fill(.white.opacity(0.06)) }
         }
         .frame(maxWidth: .infinity)
-        .frame(height: 320)
+        .frame(height: height)
         .clipped()
         .overlay {   // 暗化渐变(左 + 下),保证标题可读
             ZStack {
@@ -508,14 +518,14 @@ struct HeroCarousel: View {
             .allowsHitTesting(false)
         }
         .overlay(alignment: .bottomLeading) {
-            VStack(alignment: .leading, spacing: 10) {
+            VStack(alignment: .leading, spacing: 12) {
                 TypeBadge(type: item.type)
-                Text(item.title).font(.system(size: 30, weight: .bold)).foregroundStyle(.white)
-                    .lineLimit(2).shadow(color: .black.opacity(0.6), radius: 6)
+                Text(item.title).font(.system(size: 42, weight: .bold)).foregroundStyle(.white)
+                    .lineLimit(2).shadow(color: .black.opacity(0.65), radius: 8)
                 HStack(spacing: 8) {
                     Text(item.type.displayName)
                     Text("·"); Text(sizeText(item.fileSize))
-                }.font(.system(size: 12, weight: .medium)).foregroundStyle(.white.opacity(0.85))
+                }.font(.system(size: 13, weight: .medium)).foregroundStyle(.white.opacity(0.88))
                 HStack(spacing: 10) {
                     Button { onSet(item) } label: {
                         Label(item.id == currentID ? "正在播放" : "设为壁纸",
@@ -531,9 +541,9 @@ struct HeroCarousel: View {
                             .frame(width: 38, height: 38).background(Circle().fill(.white.opacity(0.18)))
                     }.buttonStyle(.plain)
                 }
-                .padding(.top, 2)
+                .padding(.top, 4)
             }
-            .padding(28)
+            .padding(36)
         }
         .overlay(alignment: .leading) {
             heroArrow("chevron.left") { index = (index - 1 + items.count) % items.count }.padding(.leading, 12)
