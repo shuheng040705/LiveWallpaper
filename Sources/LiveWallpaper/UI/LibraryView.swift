@@ -67,7 +67,7 @@ struct LibraryView: View {
     @State private var gridSize = GridSize(rawValue: PreferencesStore.shared.gridSizeRaw) ?? .medium
     private var columns: [GridItem] {
         let r = gridSize.range
-        return [GridItem(.adaptive(minimum: r.min, maximum: r.max), spacing: 18)]
+        return [GridItem(.adaptive(minimum: r.min, maximum: r.max), spacing: 20)]
     }
 
     /// 排序方式。
@@ -176,61 +176,95 @@ struct LibraryView: View {
         section = s
     }
 
-    // MARK: - 侧边栏(原生 List)
+    // MARK: - 侧边栏(原生 List,放大字号 + 品牌头部,营造高级感)
+
+    /// 侧栏行:放大的图标 + 标题(15.5pt),比系统默认更醒目、更有质感。
+    private func sidebarLabel(_ title: String, _ icon: String, accent: Bool = false) -> some View {
+        Label {
+            Text(title).font(.system(size: 15.5, weight: .regular))
+        } icon: {
+            Image(systemName: icon)
+                .font(.system(size: 16, weight: .medium))
+                .foregroundStyle(accent ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.secondary))
+        }
+    }
 
     private var sidebar: some View {
         List(selection: Binding<Section?>(get: { section }, set: { if let v = $0 { select(v) } })) {
-            Label(Section.all.title, systemImage: Section.all.icon)
+            sidebarLabel(Section.all.title, Section.all.icon, accent: true)
                 .badge(ratingFilteredItems.count)
                 .tag(Section.all)
-            Label(Section.favorites.title, systemImage: Section.favorites.icon)
+            sidebarLabel(Section.favorites.title, Section.favorites.icon)
                 .badge(filteredFavCount)
                 .tag(Section.favorites)
-            Label(Section.workshop.title, systemImage: Section.workshop.icon)
+            sidebarLabel(Section.workshop.title, Section.workshop.icon)
                 .tag(Section.workshop)
 
-            SwiftUI.Section("类型") {
+            SwiftUI.Section {
                 ForEach([WallpaperType.video, .scene, .web], id: \.self) { t in
-                    Label(t.displayName, systemImage: Section.type(t).icon)
+                    sidebarLabel(t.displayName, Section.type(t).icon)
                         .badge(filteredTypeCount(t))
                         .tag(Section.type(t))
                 }
+            } header: {
+                Text("类型").font(.system(size: 12.5, weight: .semibold)).foregroundStyle(.secondary)
             }
         }
         .listStyle(.sidebar)
-        .safeAreaInset(edge: .bottom) {
-            // 底部固定:设置 + 重新扫描(原生小工具条)。
-            VStack(spacing: 2) {
-                Divider()
-                Button { select(.settings) } label: {
-                    Label("设置", systemImage: "gearshape")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(section == .settings ? Color.accentColor : .primary)
-                .padding(.horizontal, 10).padding(.vertical, 5)
+        .environment(\.defaultMinListRowHeight, 36)   // 更舒展的行高 = 高级感
+        .safeAreaInset(edge: .top) { brandHeader }
+        .safeAreaInset(edge: .bottom) { sidebarFooter }
+    }
 
-                Button { library.scan() } label: {
-                    HStack(spacing: 8) {
-                        if library.isScanning {
-                            ProgressView().controlSize(.small).scaleEffect(0.75).frame(width: 16)
-                        } else {
-                            Image(systemName: "arrow.clockwise").frame(width: 16)
-                        }
-                        Text(library.isScanning ? "扫描中…" : "重新扫描")
-                        Spacer()
-                    }
-                    .foregroundStyle(.secondary)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .disabled(library.isScanning)
-                .padding(.horizontal, 10).padding(.vertical, 5)
-            }
-            .padding(.bottom, 8)
-            .background(.ultraThinMaterial)
+    /// 侧栏顶部品牌区:应用图标 + 名称(留出红绿灯空间)。
+    private var brandHeader: some View {
+        HStack(spacing: 10) {
+            Image(systemName: "photo.stack")
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundStyle(Color.accentColor)
+            Text("壁纸库").font(.system(size: 19, weight: .bold))
+            Spacer()
         }
+        .padding(.horizontal, 18).padding(.top, 32).padding(.bottom, 12)
+    }
+
+    /// 侧栏底部:设置 + 重新扫描。
+    private var sidebarFooter: some View {
+        VStack(spacing: 1) {
+            Divider().padding(.bottom, 4)
+            Button { select(.settings) } label: {
+                Label {
+                    Text("设置").font(.system(size: 14.5))
+                } icon: {
+                    Image(systemName: "gearshape").font(.system(size: 15, weight: .medium))
+                        .foregroundStyle(section == .settings ? Color.accentColor : .secondary)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(section == .settings ? Color.accentColor : .primary)
+            .padding(.horizontal, 14).padding(.vertical, 7)
+
+            Button { library.scan() } label: {
+                HStack(spacing: 10) {
+                    if library.isScanning {
+                        ProgressView().controlSize(.small).scaleEffect(0.8).frame(width: 18)
+                    } else {
+                        Image(systemName: "arrow.clockwise").font(.system(size: 15, weight: .medium)).frame(width: 18)
+                    }
+                    Text(library.isScanning ? "扫描中…" : "重新扫描").font(.system(size: 14.5))
+                    Spacer()
+                }
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .disabled(library.isScanning)
+            .padding(.horizontal, 14).padding(.vertical, 7)
+        }
+        .padding(.bottom, 10)
+        .background(.ultraThinMaterial)
     }
 
     private var filteredFavCount: Int {
@@ -249,8 +283,6 @@ struct LibraryView: View {
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .toolbar { toolbarContent }
-                .navigationTitle(section.title)
-                .navigationSubtitle(section == .settings || section == .workshop ? "" : "\(filtered.count) 张壁纸")
             // 选中壁纸时右侧滑出壁纸检视面板。
             if let item = settingsItem {
                 Divider()
@@ -356,9 +388,20 @@ struct LibraryView: View {
         withAnimation(.easeOut(duration: 0.22)) { settingsItem = item }
     }
 
+    /// 内容区大号分区标题(高级感:粗体大标题 + 数量)。
+    private var gridHeader: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(section.title).font(.system(size: 24, weight: .bold))
+            Text("\(filtered.count)").font(.system(size: 15, weight: .medium)).foregroundStyle(.tertiary)
+            Spacer()
+        }
+        .padding(.horizontal, 24).padding(.top, 14).padding(.bottom, 2)
+    }
+
     private var grid: some View {
         ScrollView {
-            LazyVGrid(columns: columns, spacing: 18) {
+            gridHeader
+            LazyVGrid(columns: columns, spacing: 20) {
                 ForEach(filtered) { item in
                     WallpaperCard(
                         item: item,
@@ -389,7 +432,7 @@ struct LibraryView: View {
                     }
                 }
             }
-            .padding(20)
+            .padding(24)
             .id(favVersion)
         }
         .searchable(text: $search, placement: .toolbar, prompt: "搜索壁纸")
@@ -467,12 +510,13 @@ struct WallpaperCard: View {
                 Spacer()
                 HStack {
                     Text(item.title)
-                        .font(.system(size: 12, weight: .medium)).foregroundStyle(.white)
-                        .lineLimit(2).shadow(radius: 2)
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                        .lineLimit(2).shadow(color: .black.opacity(0.5), radius: 3, y: 1)
                     Spacer()
                 }
-                .padding(.horizontal, 10).padding(.bottom, 8).padding(.top, 24)
-                .background(LinearGradient(colors: [.clear, .black.opacity(0.72)], startPoint: .top, endPoint: .bottom))
+                .padding(.horizontal, 12).padding(.bottom, 10).padding(.top, 30)
+                .background(LinearGradient(colors: [.clear, .black.opacity(0.35), .black.opacity(0.8)],
+                                           startPoint: .top, endPoint: .bottom))
             }
 
             if hovering {
@@ -512,15 +556,18 @@ struct WallpaperCard: View {
         }
         .frame(maxWidth: .infinity)
         .background(Color.black.opacity(0.001))
-        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
         .overlay(
-            RoundedRectangle(cornerRadius: 10).strokeBorder(
-                isCurrent ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.primary.opacity(0.08)),
+            RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(
+                isCurrent ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.white.opacity(0.10)),
                 lineWidth: isCurrent ? 3 : 1)
         )
-        .shadow(color: .black.opacity(hovering ? 0.28 : 0.12), radius: hovering ? 12 : 5, y: hovering ? 6 : 2)
-        .scaleEffect(hovering ? 1.02 : 1.0)
-        .animation(.easeOut(duration: 0.18), value: hovering)
+        // 双层柔和投影 = 高级层次感(环境大柔影 + 贴近的暗影);选中时叠一层强调色辉光。
+        .shadow(color: .black.opacity(hovering ? 0.32 : 0.16), radius: hovering ? 18 : 9, y: hovering ? 10 : 4)
+        .shadow(color: .black.opacity(hovering ? 0.18 : 0.10), radius: hovering ? 5 : 2, y: 1)
+        .shadow(color: isCurrent ? Color.accentColor.opacity(0.45) : .clear, radius: 10)
+        .scaleEffect(hovering ? 1.03 : 1.0)
+        .animation(.spring(response: 0.32, dampingFraction: 0.72), value: hovering)
         .contentShape(Rectangle())
         .onTapGesture(perform: onSelect)
         .onHover { hovering = $0 }

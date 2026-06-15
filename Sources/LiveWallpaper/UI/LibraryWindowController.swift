@@ -36,7 +36,8 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
 
         let hosting = NSHostingController(rootView: makeRoot())
         let w = NSWindow(contentViewController: hosting)
-        w.title = "壁纸库"
+        // 不设静态标题:让 SwiftUI navigationTitle(当前分区名)驱动工具栏标题(静态 title 会压过它)。
+        w.title = ""
         w.styleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         // 透明标题栏 + 全尺寸内容:侧边栏毛玻璃延伸到顶部(原生 NavigationSplitView 统一工具栏外观)。
         // 标题/副标题由 SwiftUI navigationTitle 驱动,显示在详情区工具栏(Finder 式)。
