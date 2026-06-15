@@ -2422,21 +2422,48 @@ struct SceneDocument {
             kind = .staticText(rawText)
         }
 
-        // WE 用大字号渲染纹理、再靠 layer.size×scale 的盒子定屏上大小;字号太小会糊。
-        // 故纹理总以大字号渲染求清晰(纹理像素只用来定字形纵横比 + 抗锯齿质量),
-        // 真正的屏上尺寸由引擎据 boxSizePx×scale 适配(见 SceneRenderEngine.textQuad)。
-        // 有盒子时把渲染字号再抬高(让纹理高分辨率,缩到盒子也锐利);无盒子时保留旧 ≥64 行为。
-        let renderPt: CGFloat = boxSize != nil ? max(128, pt * 2) : max(64, pt * 2)
+        // 锚点 size 文本(歌名 size="2 2" + 大 scale)与 media 文本(歌名/艺术家):WE 忽略 size 框,按
+        // pointsize×scale 渲染。把 boxSizePx 设 nil → 不当尺寸盒子、不按 size.x 折行(否则 2px 折行宽度
+        // 把"NIGHT DANCER"挤成竖排碎块);useScreenPointSize 让渲染端用 pt×scale 定屏上字高。
+        // (先算 isAnchor,renderPt 才能按各路径的「屏上字高」定纹理分辨率。)
+        let isMediaText: Bool = { if case .script(let s) = kind { return s.isMediaDriven }; return false }()
+        let isAnchor = isMediaText || (boxSize.map { $0.y < Float(pt) } ?? false)
+
+        // ── 文字纹理分辨率(清晰度修复)────────────────────────────────────────────────
+        // 真因:旧码把 renderPt 钉死在 128/64,与文字**屏上像素高**脱钩。时钟盒子(如黑猫 Clock 12:
+        //   size.y=161×scale.y≈1.05 ≈ 169 画布 px;Retina backing 2× → 屏上 ~340 物理 px)被渲成 128px
+        //   纹理再双线性**放大**贴上去 → 发虚/模糊(用户报「字体异常模糊」)。
+        // 正解:按文字的**屏上画布字高**定 renderPt,再乘 supersample(覆盖 Retina 2×+留余量),纹理 1:1
+        //   或超采样贴屏 → 锐利。各路径的屏上画布字高:
+        //     · 锚点/media:srcPointSize × |scale.y|(WE 真义=pointsize×scale)
+        //     · 盒子文本:box.y × |scale.y|(盒子定屏上高,见 textQuad)
+        //     · autosize:无盒子,屏上高 = 纹理像素×scale(纹理像素由 renderPt 决定)→ 保留 pt×2 旧义,
+        //       但乘进 |scale.y| 余量,scale>1 时也不被放糊。
+        // renderPt 改变**不影响屏上尺寸**(仅盒子/锚点路径):
+        //   · 盒子文本屏上高由 box×scale 决定(SceneRenderEngine.textQuad/L987),纹理只定字形纵横比+AA。
+        //   · 锚点/media 屏上比例 = srcPt/renderPt(L981),renderPt 与 texHeight 同比 → 比例抵消、屏上字号不变。
+        //   · autosize 路径屏上高 = 纹理像素×scale,纹理像素∝renderPt → 改 renderPt 会**放大**字。故 autosize
+        //     **保持旧公式不动**(纯静态标签/问候,无盒子无锚点;改了会动到表观字号 = 回归风险),只提盒子/锚点。
+        // WP_NO_TEXT_HIDPI=1 退回旧的固定 128/64(A/B 诊断本修复)。
+        let scaleY = max(0.0001, CGFloat(abs(scale.y)))
+        let renderPt: CGFloat
+        if ProcessInfo.processInfo.environment["WP_NO_TEXT_HIDPI"] != nil {
+            renderPt = boxSize != nil ? max(128, pt * 2) : max(64, pt * 2)   // 旧行为(退路)
+        } else if isAnchor {
+            // 锚点/media:屏上字高 = srcPt×scale.y。supersample 2.5× 覆盖 Retina 2×+余量。
+            renderPt = min(512, max(64, pt * scaleY * 2.5))
+        } else if let bs = boxSize {
+            // 盒子文本(时钟/日期):屏上字高 = box.y×scale.y。supersample 2.5×。floor 128 保底。
+            // 上限 512pt(=旧 128 的 4×,任意现实显示都锐利)防极大盒子(整屏标题)的纹理爆显存/超 8192 宽限。
+            renderPt = min(512, max(128, CGFloat(bs.y) * scaleY * 2.5))
+        } else {
+            renderPt = max(64, pt * 2)        // autosize:屏上字号 ∝ renderPt,保持旧义不动(零回归)
+        }
         var text = TextLayerDesc(kind: kind, color: color, pointSize: renderPt)
         text.srcPointSize = pt        // pkg 原始 pointsize:屏上字高 = pt×scale(WE 真义,size 盒子太小=锚点时用)
         text.align = align
         text.verticalAlign = vAlign
         text.fontName = fontName
-        // 锚点 size 文本(歌名 size="2 2" + 大 scale)与 media 文本(歌名/艺术家):WE 忽略 size 框,按
-        // pointsize×scale 渲染。把 boxSizePx 设 nil → 不当尺寸盒子、不按 size.x 折行(否则 2px 折行宽度
-        // 把"NIGHT DANCER"挤成竖排碎块);useScreenPointSize 让渲染端用 pt×scale 定屏上字高。
-        let isMediaText: Bool = { if case .script(let s) = kind { return s.isMediaDriven }; return false }()
-        let isAnchor = isMediaText || (boxSize.map { $0.y < Float(pt) } ?? false)
         text.boxSizePx = isAnchor ? nil : boxSize
         text.useScreenPointSize = isAnchor
 

@@ -2746,10 +2746,26 @@ final class SceneRenderEngine {
     }
 
     /// 文本图层 → 纹理。返回 (纹理, 像素宽, 像素高)。
+    /// ⚠ 文字纹理**不走** makeTexture 的 textureMaxDimension 质量下采样:那个上限是给大资源图省显存的,
+    ///   文字纹理小且程序化生成,按屏上字高精确建分辨率(见 parseTextLayer renderPt);若被下采样到
+    ///   512/1024(中/低画质)会把刚做清晰的字又压糊(=用户报的模糊在非默认画质下复现)。故文字直接上传原分辨率。
+    ///   WP_TEXT_QUALITY_CAP=1 退回旧的「文字也吃画质下采样」(A/B 诊断)。
     private func makeTextTexture(_ desc: TextLayerDesc, loader: MTKTextureLoader, simTime: Double? = nil) -> (MTLTexture, Int, Int)? {
-        guard let r = TextLayerRenderer.render(desc, simTime: simTime),
-              let tex = makeTexture(.rgba8(pixels: r.pixels, width: r.width, height: r.height), loader: loader)
-        else { return nil }
+        guard let r = TextLayerRenderer.render(desc, simTime: simTime) else { return nil }
+        if ProcessInfo.processInfo.environment["WP_TEXT_QUALITY_CAP"] != nil {
+            guard let tex = makeTexture(.rgba8(pixels: r.pixels, width: r.width, height: r.height), loader: loader)
+            else { return nil }
+            return (tex, r.width, r.height)
+        }
+        // 直接按文字真实分辨率建纹理(绕过质量下采样),保住清晰度。
+        let td = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm,
+                                                          width: r.width, height: r.height, mipmapped: false)
+        td.usage = .shaderRead
+        guard let tex = device.makeTexture(descriptor: td) else { return nil }
+        r.pixels.withUnsafeBytes { raw in
+            tex.replace(region: MTLRegionMake2D(0, 0, r.width, r.height), mipmapLevel: 0,
+                        withBytes: raw.baseAddress!, bytesPerRow: r.width * 4)
+        }
         return (tex, r.width, r.height)
     }
 
