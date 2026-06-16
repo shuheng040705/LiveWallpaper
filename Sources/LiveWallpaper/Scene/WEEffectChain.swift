@@ -723,7 +723,11 @@ final class WEEffectChain {
         d.vertexDescriptor = vd
         let ps: MTLRenderPipelineState
         do {
+            let _t0 = CFAbsoluteTimeGetCurrent()
             ps = try device.makeRenderPipelineState(descriptor: d)
+            if ProcessInfo.processInfo.environment["WP_PIPE_TIME"] != nil {
+                FileHandle.standardError.write("PIPE \(key) \(String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - _t0) * 1000))ms\n".data(using: .utf8)!)
+            }
         } catch {
             pipeFailed.insert(key)   // 负缓存:只记一次,不再每帧重试/刷日志
             Log.write("WEEffectChain: pipeline fail \(key) ERROR: \(error)"); return nil
@@ -950,6 +954,22 @@ final class WEEffectChain {
                 } else if u.name == "g_Screen" {
                     // 屏幕尺寸 vec3(w,h,aspect);depthparallax vert 声明但未用,给真实值无害。
                     vals = [Float(texW), Float(texH), Float(texW) / Float(max(1, texH))]
+                } else if u.name == "g_Offset",
+                          let mk = meta[u.name]?.material,
+                          let pv = pkgParams[mk] ?? (caseInsensitiveParams ? pkgParams.first(where: { $0.key.lowercased() == mk.lowercased() })?.value : nil) {
+                    // transform 特效的 g_Offset:WE 对 effect pass 在**场景像素空间**渲(首=末 pass,lwe CImage.cpp:805),
+                    // offset 单位是像素;我方 effect quad 恒 NDC[-1,1]+identity MVP → 像素 offset 直接喂会把几何推出屏幕
+                    // (雾 offset "0 -50" → NDC y≈-51 飞出)。故把**像素量级**的 offset 归一化到 NDC:x=px/(sceneW/2)、
+                    // y=-px/(sceneH/2)(Y 翻转:WE 场景 Y 向上 vs NDC)。启发:|分量|>2 视为像素(归一);≤2 视为已归一/UV
+                    // (如 mirror 的 offset "1 0" 直接用)。WP_NO_OFFSET_NORM 退回原始像素值。
+                    let raw = Self.parseFloats(pv)
+                    if ProcessInfo.processInfo.environment["WP_NO_OFFSET_NORM"] != nil {
+                        vals = raw
+                    } else {
+                        let ox = raw.count > 0 ? raw[0] : 0, oy = raw.count > 1 ? raw[1] : 0
+                        vals = [abs(ox) > 2 ? ox / (Float(max(1, sceneW)) * 0.5) : ox,
+                                abs(oy) > 2 ? -oy / (Float(max(1, sceneH)) * 0.5) : oy]
+                    }
                 } else if let mk = meta[u.name]?.material,
                           let pv = pkgParams[mk] ?? (caseInsensitiveParams ? pkgParams.first(where: { $0.key.lowercased() == mk.lowercased() })?.value : nil) {
                     vals = Self.parseFloats(pv)                       // pkg 用户设的真实值(大小写不敏感兜底)

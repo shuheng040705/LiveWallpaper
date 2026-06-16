@@ -224,13 +224,24 @@ final class SceneRenderer: WallpaperRenderer {
 
         // 审计修复 #1:整段 update+render 持锁,防止主线程在此期间重建/释放 engine 状态(数据竞争)。
         // 锁内只做 GPU 命令编码(nextDrawable 可能阻塞但不回主线程同步等待),不会与主线程死锁。
+        let _flog = ProcessInfo.processInfo.environment["WP_FRAME_LOG"] != nil
+        let _t0 = _flog ? CACurrentMediaTime() : 0
         renderLock.lock()
         engine.update(time: t, mouseNorm: mn)
+        let _tU = _flog ? CACurrentMediaTime() : 0
         // 按需渲染:无连续动画内容、视差已收敛且鼠标未动 → 画面与上帧一致,跳过渲染(空闲 CPU/GPU 趋近 0)。
         guard engine.frameDidChange else { renderLock.unlock(); return }
         guard let drawable = layer.nextDrawable() else { renderLock.unlock(); return }
+        let _tD = _flog ? CACurrentMediaTime() : 0
         engine.render(to: drawable, viewportSize: layer.drawableSize)
         renderLock.unlock()
+        if _flog {
+            let total = (CACurrentMediaTime() - _t0) * 1000
+            if total > 20 {   // 只报慢帧(>20ms=掉帧)
+                let upd = (_tU - _t0) * 1000, drw = (_tD - _tU) * 1000, rnd = (CACurrentMediaTime() - _tD) * 1000
+                FileHandle.standardError.write("WPF f\(frameCount) t=\(String(format:"%.1f",t))s total=\(String(format:"%.0f",total))ms [upd=\(String(format:"%.0f",upd)) drawable=\(String(format:"%.0f",drw)) render=\(String(format:"%.0f",rnd))]\n".data(using:.utf8)!)
+            }
+        }
 
         frameCount += 1
         if frameCount % 180 == 1 {

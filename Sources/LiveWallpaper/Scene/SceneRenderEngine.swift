@@ -4320,7 +4320,12 @@ final class SceneRenderEngine {
     private static let kInflightFrames = 3
     private let inflightSemaphore = DispatchSemaphore(value: SceneRenderEngine.kInflightFrames)
     private var frameIndex: Int = 0
-    private lazy var captureEnabled: Bool = FileManager.default.fileExists(atPath: "/tmp/wp_capture")
+    // 诊断抓帧:**必须显式 env WP_CAPTURE=1 开启**(直接跑包内二进制时传)。
+    // ⚠ 原来用「/tmp/wp_capture 文件存在」触发——一个遗留的该文件会让桌面 app 每 captureStep 帧同步写 PNG
+    //   (getBytes+编码+写盘 ~600ms 阻塞渲染线程)= 每~2秒卡一下、写满 captureMax 帧才停(用户实测大坑)。
+    //   改 env 门控:文件再也无法静默触发;不抓帧时纹理用 .private 更高效。
+    private lazy var captureEnabled: Bool = ProcessInfo.processInfo.environment["WP_CAPTURE"] != nil
+        || FileManager.default.fileExists(atPath: "/tmp/wp_capture_force")   // 兜底:显式 _force 文件(不会误留)
     // 诊断抓帧步进/上限(默认 120/720;WP_CAP_STEP/WP_CAP_MAX 可改,用于密集采样动画相位峰值)。
     private lazy var captureStep: Int = Int(ProcessInfo.processInfo.environment["WP_CAP_STEP"] ?? "") ?? 120
     private lazy var captureMax: Int = Int(ProcessInfo.processInfo.environment["WP_CAP_MAX"] ?? "") ?? 720
@@ -4780,7 +4785,11 @@ final class SceneRenderEngine {
                 let a = Float(i) * spd
                 m = SIMD2(cos(a) * 0.5, sin(a) * 0.5)   // [-0.5,0.5] 归一化绕中心
             } else { m = SIMD2<Float>(0, 0) }
+            let _ft = ProcessInfo.processInfo.environment["WP_FRAME_TIME"] != nil
+            let _tU = _ft ? CFAbsoluteTimeGetCurrent() : 0
             update(time: Double(i) * dt, mouseNorm: m)   // 审计修复#2:update 已推进 frameIndex 轮换缓冲
+            let _uMs = _ft ? (CFAbsoluteTimeGetCurrent() - _tU) * 1000 : 0
+            let _tE = _ft ? CFAbsoluteTimeGetCurrent() : 0
             guard let cmd = queue.makeCommandBuffer() else { return false }
             encodeFrame(commandBuffer: cmd, finalTarget: inter)
             let bp = MTLRenderPassDescriptor()
@@ -4799,6 +4808,12 @@ final class SceneRenderEngine {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); enc.endEncoding()
             }
             cmd.commit(); cmd.waitUntilCompleted()
+            if _ft {
+                let _gMs = (CFAbsoluteTimeGetCurrent() - _tE) * 1000
+                if _uMs + _gMs > 8 {  // 只报慢帧(>8ms=可能丢帧)
+                    FileHandle.standardError.write("FRAME \(i) update=\(String(format:"%.1f",_uMs))ms gpu=\(String(format:"%.1f",_gMs))ms\n".data(using:.utf8)!)
+                }
+            }
             if orbit {
                 for (gi, g) in particleGroups.enumerated() where g.isRope {
                     let n = g.sim.liveCount, v = g.ropeVertexCount
