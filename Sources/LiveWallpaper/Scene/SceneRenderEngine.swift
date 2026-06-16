@@ -772,6 +772,7 @@ final class SceneRenderEngine {
 
     func load(document: SceneDocument, source: SceneSource) {
         auditLines.removeAll()   // 渲染审计:新场景重新收集加载期事件/警告
+        sceneHasTimeFilter = document.hasTimeFilter   // 含时间滤镜脚本 → 施加时段昼夜色彩分级
         // 释放上一个场景占用的音频捕获(若有),再按新场景重新 acquire。
         if usesAudio { AudioCapture.shared.release(); usesAudio = false }
         // 壁纸自带音频(sound 对象,BGM/雨声):停旧的、按新场景加载。默认随全局 isMuted(默认静音)不出声。
@@ -1321,8 +1322,14 @@ final class SceneRenderEngine {
                 //   不会把眼睛拉散/脱位。旧关闭原因(attachedUnitVerts 按父 size 归一)随①统一锚点废弃已不存在。
                 //   WP_NO_ATTACH_BLINK=1 可临时退回静态 bind(A/B 对比眨眼)。
                 let blinkOn = ProcessInfo.processInfo.environment["WP_NO_ATTACH_BLINK"] == nil
+                // 严格 pkg:animationlayer 默认 visible=false(lwe ObjectParser.cpp:305);WE 里 visible:false 的
+                //   animationlayer 不独立播放(由 strand sway 脚本/眨眼调度脚本驱动)。我方"全不可见时回退播第一个"
+                //   是偏离。WP_STRICT_ANIMLAYERS=1 → 只播 visible:true(白影头发刘海全 false → bind 静止;眼/眉
+                //   visible:true 照播;御剑龙/刀全 true 照播零回归)。A/B 验证 bind 静止态是否自然(若炸开说明
+                //   bind 是 rest 散布、需动画/脚本姿态,则该实现脚本而非简单 strict)。
+                let strictAnim = ProcessInfo.processInfo.environment["WP_STRICT_ANIMLAYERS"] != nil
                 if mesh.hasSkin,
-                   let al = layer.animationLayers.first(where: { $0.visible }) ?? layer.animationLayers.first {
+                   let al = layer.animationLayers.first(where: { $0.visible }) ?? (strictAnim ? nil : layer.animationLayers.first) {
                     // ⭐**眼睛眨眼/眼球转动 = 完整 3D 蒙皮**(2026-06-14c,替代旧「眼睛一律静态 bind」绕过):
                     //   眼睛是「离体 UV 岛」(眼白顶点在 mesh box 外、拉到脸上)。蒙皮数学本身正确(invBind/权重/
                     //   归一已验证 frame0 偏差=0)。旧「眼睛一律静态 bind」绕过让眼睛恒睁(不眨)。
@@ -1378,7 +1385,7 @@ final class SceneRenderEngine {
                 // 单层对象走 skinLayers 与旧 skin() 数学完全一致(合成=纯 base),零回归。
                 if puppetMesh != nil {
                     var ls = layer.animationLayers.filter { $0.visible }
-                    if ls.isEmpty, let al = layer.animationLayers.first { ls = [al] }
+                    if ls.isEmpty, !strictAnim, let al = layer.animationLayers.first { ls = [al] }
                     puppetAnimLayers = ls.map { (animId: $0.animation, rate: $0.rate, additive: $0.additive) }
                 }
                 Log.write("puppet: \(layer.name) mesh \(bind.count/4) verts, \(puppetCount) idx, skin=\(puppetMesh != nil ? "anim\(puppetAnimId)+\(puppetAnimLayers.count)layers" : "static")")
@@ -2059,6 +2066,7 @@ final class SceneRenderEngine {
     private var generalFlip = false
     /// 图片筛选器:0=无、1=灰度、2=棕褐、3=反相、4=暖、5=冷。最终画面过一个轻量后处理滤镜。默认 0=无。
     private var generalFilter = 0
+    private var sceneHasTimeFilter = false   // 当前场景含时间滤镜脚本(昼夜主题)→ 启用时段色彩分级
     /// SceneRenderer 据 loadedItem 推入这 4 项(load/reloadInPlace 时调一次)。播放速度/音量在外层(时钟累积/audioPlayback)处理。
     /// WP_NO_GENERAL_PROPS 总退路:置 1 时引擎忽略这些通用项,完全走旧行为。
     func setGeneralProps(audioListen: Bool, flip: Bool, filter: Int) {
@@ -2540,7 +2548,13 @@ final class SceneRenderEngine {
                 }
                 // 审计修复(#1):透传引擎 sim time 给脚本驱动的文本(engine.runtime 同步;时钟/日期仍走 JSC 原生 Date())。
                 let now = TextLayerRenderer.currentString(ts.desc, simTime: time)
-                if now != ts.lastString || lastTextRefresh == time {
+                // 仅当显示字符串**真的变了**才重渲纹理(时钟分钟变/秒变/歌名变)。
+                // ⚠ 旧代码的 `|| lastTextRefresh == time` 让每秒那拍**无条件重渲所有文字**——与本意矛盾;
+                //   文字 HiDPI 后纹理大(时钟可达 1500×750),每秒重建大纹理+GPU 上传 = 周期性卡顿(用户报「过几秒卡一下」)。
+                //   字符串变化检测已足够驱动时钟跳动(now 每秒用当前时间重算);静态文本/HH:MM 时钟分钟内不再重渲。
+                //   WP_TEXT_REFRESH_ALWAYS=1 退回旧的每秒强制重渲(诊断)。
+                let forceRefresh = ProcessInfo.processInfo.environment["WP_TEXT_REFRESH_ALWAYS"] != nil
+                if now != ts.lastString || forceRefresh {
                     ts.lastString = now
                     if let t = makeTextTexture(ts.desc, loader: loader, simTime: time) {
                         layers[i].texture = t.0
@@ -4052,7 +4066,9 @@ final class SceneRenderEngine {
         let env = ProcessInfo.processInfo.environment
         if env["WP_FORCE_FLIP"] == "1" { flip = true }
         if let f = env["WP_FORCE_FILTER"], let v = Int(f) { filter = v }
-        guard flip || filter > 0, let pf = pipelineBlitPresent else { return }
+        let grade = timeStageGrade()
+        let gradeActive = grade != SIMD4<Float>(1, 1, 1, 1)
+        guard flip || filter > 0 || gradeActive, let pf = pipelineBlitPresent else { return }
         let savedFlip = generalFlip, savedFilter = generalFilter
         generalFlip = flip; generalFilter = filter
         defer { generalFlip = savedFlip; generalFilter = savedFilter }
@@ -4079,7 +4095,35 @@ final class SceneRenderEngine {
             pe.setFragmentTexture(tmp, index: 0)
             var gp = SIMD2<Float>(generalFlip ? 1 : 0, Float(generalFilter))
             pe.setFragmentBytes(&gp, length: MemoryLayout<SIMD2<Float>>.stride, index: 0)
+            var g = grade
+            pe.setFragmentBytes(&g, length: MemoryLayout<SIMD4<Float>>.stride, index: 1)
             pe.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3); pe.endEncoding()
+        }
+    }
+
+    /// 时段昼夜色彩分级(白影轻扬 3497488774 等带「时间滤镜」脚本的壁纸):按系统小时定档,
+    /// 返回 (gainR,gainG,gainB,gamma) → present shader 施加 c=pow(c,gamma)*gain。(1,1,1,1)=恒等。
+    /// WE 的时间滤镜是分布式脚本(各层按 getHours 改色),完整复刻巨大;此为务实近似——按 WE 4 档实渲
+    /// (we_ref/ 夜/黄昏/白天/清晨)反推的全局色彩分级,we_ab.py 迭代调。WP_TIME_FILTER=1 启用(暂门控,
+    /// 待加「场景含 getHours 时间滤镜脚本」自动检测);WP_FORCE_HOUR=<0-23> 测各档;WP_NO_TIME_FILTER=1 关。
+    private func timeStageGrade() -> SIMD4<Float> {
+        let env = ProcessInfo.processInfo.environment
+        if env["WP_NO_TIME_FILTER"] != nil { return SIMD4(1, 1, 1, 1) }
+        // 自动启用:场景含时间滤镜脚本(getHours+timeStage);WP_TIME_FILTER=1 也可强制(测无脚本壁纸)。
+        guard sceneHasTimeFilter || env["WP_TIME_FILTER"] != nil else { return SIMD4(1, 1, 1, 1) }
+        var hour = Calendar.current.component(.hour, from: Date())
+        if let h = env["WP_FORCE_HOUR"], let hv = Int(h) { hour = hv }
+        // 调参用:WP_GRADE="r,g,b,gamma" 直接覆盖(免重 build 迭代)。
+        if let g = env["WP_GRADE"] {
+            let p = g.split(separator: ",").compactMap { Float($0) }
+            if p.count == 4 { return SIMD4(p[0], p[1], p[2], p[3]) }
+        }
+        // 参数从 WE 4 档实渲(we_ref/)反推、we_ab.py 验证贴合(天空区匹配 WE 目标 ±3):
+        switch hour {
+        case 20...23, 0...4: return SIMD4(0.24, 0.38, 0.70, 1.35)  // 夜:深蓝重压暗 → (41,69,123) vs WE(39,64,120)
+        case 5...8:          return SIMD4(0.86, 0.91, 1.00, 1.02)  // 清晨:冷调微压 → (168,171,176) vs WE(170,172,177)
+        case 9...15:         return SIMD4(0.99, 1.02, 1.05, 1.02)  // 白天:近恒等 → (193,191,182) vs WE(198,199,191)
+        default:             return SIMD4(1.08, 1.00, 0.84, 0.98)  // 黄昏 16-19:暖橙 → (210,190,150) vs WE(209,188,151)
         }
     }
 
@@ -5161,7 +5205,8 @@ final class SceneRenderEngine {
     // WE「属性」通用区:翻转(uv.x 镜像)+ 图片筛选器(0=无/1=灰度/2=棕褐/3=反相/4=暖/5=冷)。
     // gp.x=flip(0/1),gp.y=filter 索引。仅在 flip 或 filter 启用时走本 pipeline,默认走 fullscreen_copy 不变。
     fragment float4 fullscreen_present(VOut in [[stage_in]], texture2d<float> t [[texture(0)]],
-                                       sampler s [[sampler(0)]], constant float2& gp [[buffer(0)]]) {
+                                       sampler s [[sampler(0)]], constant float2& gp [[buffer(0)]],
+                                       constant float4& grade [[buffer(1)]]) {
         float2 uv = in.uv;
         if (gp.x > 0.5) uv.x = 1.0 - uv.x;   // 水平翻转整个壁纸
         float4 c = t.sample(s, uv);
@@ -5182,6 +5227,8 @@ final class SceneRenderEngine {
         } else if (f == 5) {                  // 冷色(降红/抬蓝)
             c.rgb = clamp(c.rgb * float3(0.88, 1.00, 1.12), 0.0, 1.0);
         }
+        // 时段色彩分级(昼夜):c = pow(c, gamma) * gain。grade=(gainR,gainG,gainB,gamma);(1,1,1,1)=恒等。
+        c.rgb = clamp(pow(max(c.rgb, 0.0), grade.w) * grade.rgb, 0.0, 1.0);
         return c;
     }
     // FXAA(快速近似抗锯齿,FXAA3 简化版)。rcp = 1/源纹理尺寸。呈现时按 luma 边缘做一次平滑。
