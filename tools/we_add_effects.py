@@ -25,6 +25,10 @@ def main():
     print(f"当前 manifest: {before} keys")
 
     scan = B.scan_post_workshop_effects()          # 全库 effects/workshop/ 引用 → (pkg, combo_sets)
+    # pkg-local 内置特效(effect.json 在 pkg 内、非 workshop 前缀、非 WE assets 内置;如「白影轻扬」3497488774
+    # 的 fog)被 workshop scanner 漏掉 → 并入(setdefault:workshop 同名优先不覆盖)。同走 build_workshop_effect。
+    for k, v in B.scan_pkg_local_effects().items():
+        scan.setdefault(k, v)
     targets = sys.argv[1:]
     if not targets:
         missing = sorted(k for k in scan if k not in manifest)
@@ -41,6 +45,9 @@ def main():
             print(f"✗ {eff_key}: 全库 scene 未引用(scan 未命中),跳过")
             continue
         pkg_path, combo_sets = scan[eff_key]
+        # scene 绑的覆盖贴图槽(effect.json 不声明、由 scene 绑)→ 供 sampler combo(texture_override 的
+        # g_Texture1 ENABLE)在转译期派生,否则变体无 g_Texture1、覆盖贴图永远采不到。
+        force_slots = B.scene_bound_slots_for(eff_key, pkg_path)
         # base({}) + scene 实际用到的 combo 组合,逐变体建(与 we_build_effects.main 同口径)
         variants_in = [{}]
         for cs in sorted(combo_sets):
@@ -51,7 +58,7 @@ def main():
         for combos in variants_in:
             ck = B.combo_key(combos)
             try:
-                rec, err, misses = B.build_workshop_effect(eff_key, pkg_path, combos, ck)
+                rec, err, misses = B.build_workshop_effect(eff_key, pkg_path, combos, ck, force_slots=force_slots)
                 if rec and rec["passes"] and any(pp.get("frag") for pp in rec["passes"]):
                     built.append({"combos": combos, "passes": rec["passes"]})
                     print(f"  ✓ {eff_key}  combos={combos or '(base)'}")

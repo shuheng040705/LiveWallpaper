@@ -9,6 +9,7 @@ import AppKit
 enum TextLayerKind {
     case script(WEScript)   // 真 WE JS 脚本驱动(时钟/日期/…),每秒跑一次拿字符串
     case clock      // HH:MM(近似回退)
+    case seconds    // 秒(SS,近似回退;某些壁纸把时/分/秒拆成独立文本层,如「白影轻扬」时分+秒+星期)
     case date       // 日期(近似回退)
     case dayOfWeek  // 星期(SAT)
     case greeting   // 按时段问候(GOOD MORNING/AFTERNOON/EVENING)
@@ -175,6 +176,9 @@ enum TextLayerRenderer {
             }
         case .staticText(let s): return s
         case .clock: return fallbackClock(desc)
+        case .seconds:
+            let f = DateFormatter(); f.dateFormat = "ss"
+            return f.string(from: Date())
         case .date:
             let f = DateFormatter()
             f.dateFormat = "MM / dd"

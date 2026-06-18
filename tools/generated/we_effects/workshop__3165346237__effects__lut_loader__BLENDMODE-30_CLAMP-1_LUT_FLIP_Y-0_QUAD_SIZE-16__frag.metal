@@ -1,0 +1,58 @@
+#pragma clang diagnostic ignored "-Wmissing-prototypes"
+
+#include <metal_stdlib>
+#include <simd/simd.h>
+
+using namespace metal;
+
+struct _Globals
+{
+    float g_Multiply;
+    float g_TranslucentCompensation;
+};
+
+struct main0_out
+{
+    float4 _fragColor [[color(0)]];
+};
+
+struct main0_in
+{
+    float2 v_TexCoord [[user(locn0)]];
+};
+
+static inline __attribute__((always_inline))
+float blendAmount(thread const float& multiply, thread const float& alpha, constant _Globals& _53)
+{
+    return multiply + (_53.g_TranslucentCompensation * (1.0 - alpha));
+}
+
+static inline __attribute__((always_inline))
+float3 ApplyBlending(int blendMode, thread const float3& A, thread const float3& B, thread const float& opacity)
+{
+    return mix(A, float3(fast::max(A.x, fast::max(A.y, A.z))) * B, float3(opacity));
+}
+
+fragment main0_out main0(main0_in in [[stage_in]], constant _Globals& _53 [[buffer(0)]], texture2d<float> g_Texture0 [[texture(0)]], texture2d<float> g_Texture1 [[texture(1)]], sampler g_Texture0Smplr [[sampler(0)]], sampler g_Texture1Smplr [[sampler(1)]])
+{
+    main0_out out = {};
+    float4 textureColor = g_Texture0.sample(g_Texture0Smplr, in.v_TexCoord);
+    textureColor = fast::clamp(textureColor, float4(0.0), float4(1.0));
+    float blueColor = textureColor.z * 15.0;
+    float quad1y = floor(floor(blueColor) * 0.25);
+    float quad2y = floor(ceil(blueColor) * 0.25);
+    float2 texPos1;
+    texPos1.x = (((floor(blueColor) - (quad1y * 4.0)) * 0.25) + 0.0078125) + (0.234375 * textureColor.x);
+    texPos1.y = ((quad1y * 0.25) + 0.0078125) + (0.234375 * textureColor.y);
+    float2 texPos2;
+    texPos2.x = (((ceil(blueColor) - (quad2y * 4.0)) * 0.25) + 0.0078125) + (0.234375 * textureColor.x);
+    texPos2.y = ((quad2y * 0.25) + 0.0078125) + (0.234375 * textureColor.y);
+    float param = _53.g_Multiply;
+    float param_1 = textureColor.w;
+    float3 param_2 = textureColor.xyz;
+    float3 param_3 = mix(g_Texture1.sample(g_Texture1Smplr, texPos1, level(0.0)).xyz, g_Texture1.sample(g_Texture1Smplr, texPos2, level(0.0)).xyz, float3(fract(blueColor)));
+    float param_4 = blendAmount(param, param_1, _53);
+    out._fragColor = float4(ApplyBlending(30, param_2, param_3, param_4), textureColor.w);
+    return out;
+}
+

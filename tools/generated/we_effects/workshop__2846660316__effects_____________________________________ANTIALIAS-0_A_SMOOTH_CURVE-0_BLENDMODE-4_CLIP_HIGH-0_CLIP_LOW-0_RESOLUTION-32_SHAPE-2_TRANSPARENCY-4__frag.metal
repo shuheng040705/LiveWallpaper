@@ -47,8 +47,8 @@ fragment main0_out main0(main0_in in [[stage_in]], constant _Globals& _76 [[buff
     float2 shapeCoord = in.v_TexCoord.yx;
     shapeCoord.y = 1.0 - shapeCoord.y;
     float barDist = abs((fract(shapeCoord.x * _76.u_BarCount) * 2.0) - 1.0);
-    int frequency = int((floor(shapeCoord.x * _76.u_BarCount) / _76.u_BarCount) * 32.0);
-    float param = float(frequency);
+    float frequency = (floor(shapeCoord.x * _76.u_BarCount) / _76.u_BarCount) * 32.0;
+    float param = frequency;
     float param_1 = 32.0;
     float barFreq1 = mod2(param, param_1);
     float param_2 = barFreq1 + 1.0;
@@ -56,7 +56,7 @@ fragment main0_out main0(main0_in in [[stage_in]], constant _Globals& _76 [[buff
     float barFreq2 = mod2(param_2, param_3);
     float barVolume1 = (_76.g_AudioSpectrum32Left[int(barFreq1)].x + _76.g_AudioSpectrum32Right[int(barFreq1)].x) * 0.5;
     float barVolume2 = (_76.g_AudioSpectrum32Left[int(barFreq2)].x + _76.g_AudioSpectrum32Right[int(barFreq2)].x) * 0.5;
-    float barVolume = mix(barVolume1, barVolume2, smoothstep(0.0, 1.0, fract(float(frequency))));
+    float barVolume = mix(barVolume1, barVolume2, smoothstep(0.0, 1.0, fract(frequency)));
     float barHeight = mix(_76.u_BarBounds.x, _76.u_BarBounds.y, barVolume);
     float bar = step(1.0 - shapeCoord.y, barHeight);
     bar *= step(barDist, 1.0 - _76.u_BarSpacing);

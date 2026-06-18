@@ -224,6 +224,10 @@ struct LayerDesc {
     // 主纹理槽是 `_rt_FullFrameBuffer`(场景主 FBO 名):本层无自有贴图,输入=渲染序中其下方已合成的整帧场景。
     // 渲染时 SceneRenderEngine 用 compositeSceneBelow(upTo: 本层) 当 g_Texture0,跑特效链(pulse/调色)再写回场景。
     var frameBufferInput: Bool = false
+    // 渲进哪个 composelayer 的 child FBO(2026-06-19 阴影软化):本 image 层若是某带特效 composelayer(如「星_阴影」
+    //   opacity 0.6)的后代,应渲进该 composelayer 的 FBO 走它的特效链软化(opacity/blendgradient)+ 在该 composelayer
+    //   的 z 位合成(身后),而非展平后与真实部件交错硬渲(盖脸=阴影块)。nil=正常主场景渲染。
+    var renderIntoComposeId: Int? = nil
     // 排在最后一个 postChain fullscreenlayer **之上**(渲染序在后)→ 不被该后处理染色/模糊(WE 语义)。
     //   引擎把这些层留到 postChain 跑完后再叠到已后处理画面上(时钟/日期文本保持亮白,不被 darkambient tint 压暗)。
     var abovePost: Bool = false
@@ -260,6 +264,10 @@ struct LayerDesc {
     // 通用 quad attach 公式:quadCenterWorld = parentOrigin + R(parentAngle)·((attachPos + attachLocalOrigin)·parentScale)
     // (attachPos = 父 puppet 该挂点的 mesh-local 平移)。有自身 puppet 的部件走蒙皮路径,不用此字段。
     var attachLocalOrigin: SIMD2<Float> = .zero
+    // 挂点骨所属的父 puppet 对象 id(嵌套挂点每帧位移传播用):本层挂到此对象的具名骨。若该对象**自身**也挂着上层骨
+    //   (如知更鸟头挂身体锁骨、五官又挂头),其每帧动画位移要传给本层,否则人物晃动时本层(五官)不跟随=分离。
+    //   = attach 公式里的 cpid(嵌套)/pid(直挂)。非嵌套时该父不挂骨 → 每帧位移为 0 → 零回归。
+    var attachParentObjId: Int = -1
     // 基础材质(genericimage2/3/4)的 shader + combos + 常量。供 SceneRenderEngine 对带特性的图层
     // (NORMALMAP/REFLECTION/LIGHTING/EMISSIVE/PBR 等)用转译的 material/<shader> 变体渲染;plain 层不用。
     var materialShader: String? = nil          // "genericimage2"/"genericimage3"/"genericimage4"
@@ -341,6 +349,7 @@ struct AnimationLayerDesc {
     var blend: Float = 1         // 混合权重
     var animation: Int = 0       // 动画索引
     var additive: Bool = false   // additive 叠加层(御剑龙「动画 2」=true:在 base 姿势上叠加位移)
+    var name: String = ""        // 动画层名(待机动画/互动/特殊cg…):供 init 脚本 .stop("名") 默认停掉事件动画
 }
 
 /// effect pass override 的单个常量绑定(ObjectParser.cpp:381-394 / ImageEffectPassOverride)。
@@ -527,6 +536,8 @@ struct SceneDocument {
     var postBloomThreshold: Float = 0   // lwe WallpaperParser.cpp:52 缺省 0
     var postBloomStrength: Float = 0    // lwe WallpaperParser.cpp:51 缺省 0
     var postBloomTint: SIMD3<Float> = SIMD3(1, 1, 1)
+    // 含「时间滤镜」脚本(按 getHours 切昼夜主题,如白影轻扬 3497488774)→ 引擎施加时段色彩分级。
+    var hasTimeFilter = false
     var postLocalContrast = false
     var postLocalContrastStrength: Float = 0.2
 
@@ -691,6 +702,21 @@ struct SceneDocument {
                               pt.origin.z + origin.z * pt.scale.z)
             return (world, scale * pt.scale, angle + pt.angle)
         }
+        // 子 id 在祖先 stopAt 的**局部坐标系**(stopAt 自身贡献=0/单位)里的相对偏移,中间链每级 scale/angle 都复合
+        //   (与 resolveTransform 同构,只是把 stopAt 当根)。挂点用:attachLocalOrigin 必须是子相对挂点骨所在父
+        //   (cpid)的 mesh-local 偏移,**要含中间容器的 scale**——麻匪 xraypad-眠 的头发/头容器 scale=2.02249(故意
+        //   反消身体 0.49444 让子按原图分辨率渲),旧分支裸加 origin 漏乘 → 五官被拉散 ~176px=「两组脸」。
+        func relOriginUnder(_ id: Int, _ stopAt: Int, _ depth: Int) -> (origin: SIMD3<Float>, scale: SIMD3<Float>, angle: Float) {
+            if id == stopAt { return (.zero, SIMD3(1, 1, 1), 0) }
+            let origin = localOrigin[id] ?? .zero
+            let scale = localScale[id] ?? SIMD3(1, 1, 1)
+            let angle = localAngleZ[id] ?? 0
+            guard depth < 32, let pid = parentOf[id] else { return (origin, scale, angle) }
+            let pt = relOriginUnder(pid, stopAt, depth + 1)
+            let local = rotateVec2(SIMD2(origin.x * pt.scale.x, origin.y * pt.scale.y), pt.angle)
+            let world = SIMD3(pt.origin.x + local.x, pt.origin.y + local.y, pt.origin.z + origin.z * pt.scale.z)
+            return (world, scale * pt.scale, angle + pt.angle)
+        }
         // 子图层 origin 在父的局部空间:换算到世界要逐级「乘父缩放、绕累计父角旋转、再加父原点」(WE 层级变换)。
         func absoluteOrigin(_ id: Int) -> SIMD3<Float> { resolveTransform(id, 0).origin }
         // 子图层有效缩放 = 自身 × 所有祖先缩放(决定渲染大小)。
@@ -722,6 +748,24 @@ struct SceneDocument {
         let forceShow: Set<Int> = Set((ProcessInfo.processInfo.environment["WP_SHOW_IDS"] ?? "")
             .split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
         var selfVisible: [Int: Bool] = [:]
+        // ⭐默认停掉的动画层(2026-06-19,从 pkg init 脚本提取):很多角色的 init 控制脚本调
+        //   getLayer("层名").getAnimationLayer("动画名").stop() 把 `互动`/`特殊cg` 这类**事件/交互触发**动画默认停掉
+        //   (只在鼠标互动/特殊事件时才 play)。我方没实现 .stop() → 把这些 additive 事件层当常驻一直叠 → `特殊cg`
+        //   把眼睛压成闭着(知更鸟该睁眼却闭)。此处正则扫所有 visible 脚本的 .stop() 调用,建 [层名→停掉的动画名集],
+        //   建图层时排除被停的动画层 = 忠实 WE 默认 idle 状态。WP_NO_ANIM_STOP=1 退回(全播)。
+        var stoppedAnims: [String: Set<String>] = [:]
+        if ProcessInfo.processInfo.environment["WP_NO_ANIM_STOP"] == nil,
+           let re = try? NSRegularExpression(pattern: #"getLayer\(\s*["']([^"']+)["']\s*\)\s*\.getAnimationLayer\(\s*["']([^"']+)["']\s*\)\s*\.stop\(\)"#) {
+            for ob in objects {
+                guard let vis = ob["visible"] as? [String: Any], let s = vis["script"] as? String,
+                      s.contains("getAnimationLayer") else { continue }
+                let ns = s as NSString
+                for m in re.matches(in: s, range: NSRange(location: 0, length: ns.length)) {
+                    let ln = ns.substring(with: m.range(at: 1)), an = ns.substring(with: m.range(at: 2))
+                    stoppedAnims[ln, default: []].insert(an)
+                }
+            }
+        }
         for obj in objects {
             guard let id = (obj["id"] as? NSNumber)?.intValue else { continue }
             selfVisible[id] = forceShow.contains(id) ? true : Self.parseVisible(obj["visible"])
@@ -741,6 +785,20 @@ struct SceneDocument {
         // 部件间 attachment 解析支持:id→对象,供查父对象的 puppet/size。
         var objById: [Int: [String: Any]] = [:]
         for obj in objects { if let id = (obj["id"] as? NSNumber)?.intValue { objById[id] = obj } }
+        // ⭐视差深度沿父链继承(绑定关系):子层没写 parallaxDepth → 用最近祖先设了的值(真 WE:时钟/日期
+        //   文字 parent=木板组、自身 parallaxDepth=None → 继承「视差定位点」根的深度 → 整组木板+文字一起晃、
+        //   文字始终在木板上)。旧逻辑对 None 一律默认 (1,1) 满视差 → 子文字与父木板视差幅度不同 → 鼠标视差时
+        //   文字飘离木板(用户实测)。都没设才退 (1,1)(独立层零变化)。WP_NO_PARALLAX_INHERIT=1 退回旧。
+        func effectiveParallaxDepth(_ id: Int) -> SIMD2<Float> {
+            if ProcessInfo.processInfo.environment["WP_NO_PARALLAX_INHERIT"] != nil,
+               let o = objById[id] { return VecParse.parallaxDepth(o) }
+            var cur: Int? = id, depth = 0
+            while let c = cur, depth < 32 {
+                if let o = objById[c], o["parallaxDepth"] != nil { return VecParse.f2(o["parallaxDepth"]) }
+                cur = parentOf[c]; depth += 1
+            }
+            return ProcessInfo.processInfo.environment["WP_PARALLAX_LWE"] != nil ? .zero : SIMD2(1, 1)
+        }
         // 给定父 id,返回 (父 puppet 路径, 父 scene size, 父骨骼动画 id?, rate)。父对象须有 image→model.json→puppet。
         // animId/rate 来自父对象 animationlayers 首个 visible(否则首个)条目(对应 MDLA 动画 id):
         //   凯尔希主体 = anim206「呼吸」,让头骨 bone5 逐帧移动 → 供子部件动态跟随挂点。无动画时 animId=nil。
@@ -754,6 +812,35 @@ struct SceneDocument {
             let pAnims = Self.parseAnimationLayers(pobj["animationlayers"])
             let chosen = pAnims.first(where: { $0.visible }) ?? pAnims.first
             return (pup, SIMD2(ps[0], ps[1]), chosen.map { $0.animation }, chosen?.rate ?? 1)
+        }
+        // ⭐嵌套挂点位移传播(2026-06-18,知更鸟「白蛋脸」根因修复)。
+        //   pkg 语义(由**已知正确**的凯尔希思衡托反推证实):挂点子对象的 origin 是**相对挂点骨**的——
+        //   子渲染中心 = 父origin + R(父角)·((attachPos骨位 + 子origin)·父scale)。当**父 puppet 对象自身也挂在
+        //   更上层的骨上**(知更鸟:头`头+脖子`挂身体「锁骨」→ 头渲染在挂点位移后的高位;五官又挂这个头的「头」骨),
+        //   子用的 parentRenderOrigin 必须含父的挂点位移,否则子拿父的**静态**origin 定位 → 头移子不移 = 头脸分离
+        //   (头基底裸皮肤=白蛋)。本函数累积 id **自身+祖先链**上每一层 attachment 的挂点位移(= R(祖父角)·(骨位·祖父scale))。
+        //   非嵌套(凯尔希思衡托:父=主体不挂任何骨)→ 返回 0,零回归。WP_NO_ATTACH_PROPAGATE=1 退回旧行为(A/B)。
+        var _attachMeshCache: [String: PuppetMesh?] = [:]
+        func attachShiftOf(_ id: Int) -> SIMD2<Float> {
+            if ProcessInfo.processInfo.environment["WP_NO_ATTACH_PROPAGATE"] != nil { return .zero }
+            var shift = SIMD2<Float>.zero
+            var cur: Int? = id; var hops = 0
+            while let c = cur, hops < 32 {
+                hops += 1
+                if let cobj = objById[c], let att = cobj["attachment"] as? String, !att.isEmpty,
+                   let gp = parentOf[c], let pinfo = parentPuppetInfo(gp) {
+                    let mesh: PuppetMesh?
+                    if let cached = _attachMeshCache[pinfo.puppet] { mesh = cached }
+                    else { mesh = source.data(for: pinfo.puppet).flatMap { PuppetMesh.parse($0, size: pinfo.size) }; _attachMeshCache[pinfo.puppet] = mesh }
+                    if let m = mesh, let aw = m.attachmentWorld(att) {
+                        let attachPos = SIMD2(aw.columns.3.x, aw.columns.3.y)
+                        let pT = resolveTransform(gp, 0)
+                        shift += rotateVec2(SIMD2(attachPos.x * pT.scale.x, attachPos.y * pT.scale.y), pT.angle)
+                    }
+                }
+                cur = parentOf[c]
+            }
+            return shift
         }
 
         var layers: [LayerDesc] = []
@@ -1213,8 +1300,19 @@ struct SceneDocument {
             //   真义(texture_override.frag,RETAIN_ORIG=0 默认):用覆盖贴图 g_Texture1 替换层基底,**不乘 g_Color4**。
             //   故:把覆盖贴图设为层基底纹理 + color 置白(不被填充色染),按普通图像层渲染;飘动等其余特效仍在链里跑。
             //   (texture_override 自身不在 manifest → runLayerEffects 的 we.has 门控自动跳过,无害。)
+            // 多层 texture_override(耳朵 758/732、大地、花1/2/3:多个 texture_override 各带 uvOffset/scale/angle
+            //   变换 + RETAIN_ORIG 前后合成,中间可夹 auto_sway 扭曲)。单层 hack(只取第一张贴图、无定位、丢后续
+            //   合成层)对它们远不够 → 只渲一层 wispy 外毛、丢实心基底 → 耳朵 splay 散开(用户实测"骨骼问题很大")。
+            //   这类层**保持纯 solidlayer 不套 hack** → texture_override 进 manifest 后由特效链逐 pass 真合成
+            //   (solidEffectCanvasSize 给层尺寸画布当 g_Texture0;每 pass g_Texture1=覆盖贴图按 uvOffset 定位;
+            //   RETAIN_ORIG=0 替换 / =1 用 blendFg(POS0)/blendBg(POS1) 前后合成)。WP_NO_TEXOVERRIDE_FX 退旧单层 hack。
+            let texOvCount = (obj["effects"] as? [Any])?.reduce(0) { acc, e in
+                acc + ((((e as? [String: Any])?["file"] as? String)?.contains("texture_override") ?? false) ? 1 : 0)
+            } ?? 0
+            let multiTexOvChain = texOvCount > 1
+                && ProcessInfo.processInfo.environment["WP_NO_TEXOVERRIDE_FX"] == nil
             var texOverridden = false
-            if texPath == nil, let ovBase = Self.textureOverrideBase(obj),
+            if texPath == nil, !multiTexOvChain, let ovBase = Self.textureOverrideBase(obj),
                let ovPath = Self.resolveTexture(base: ovBase, source: source) {
                 texPath = ovPath
                 texOverridden = true
@@ -1231,7 +1329,12 @@ struct SceneDocument {
             // effect pass override(ObjectParser.cpp:381-394):与 effects 一一对应(保序、含被滤掉的位置→空)。
             let passOverrides = Self.parseEffectPassOverridesPerEffect(obj["effects"])
             // animationlayers(puppet warp,ObjectParser.cpp:439-463):rate/visible/blend/animation,解析存下。
-            let animLayers = Self.parseAnimationLayers(obj["animationlayers"])
+            var animLayers = Self.parseAnimationLayers(obj["animationlayers"])
+            // 排除被 init 脚本 .stop() 的事件动画层(互动/特殊cg 等):它们默认不播,只在交互/事件触发时 play。
+            //   (本对象名在 stoppedAnims 里 → 去掉对应名的动画层。)修知更鸟眼睛因常驻叠 `特殊cg` 而恒闭。
+            if let objNm = obj["name"] as? String, let stopped = stoppedAnims[objNm], !stopped.isEmpty {
+                animLayers.removeAll { stopped.contains($0.name) }
+            }
             let size = VecParse.floats(obj["size"])
             // 用累积绝对 origin(含父层偏移),否则带 parent 的图层(如企鹅部件)会跑到角落。
             let objId = (obj["id"] as? NSNumber)?.intValue ?? -1
@@ -1314,7 +1417,7 @@ struct SceneDocument {
                 sizePx: size.count >= 2 ? SIMD2(size[0], size[1]) : nil,
                 scale: absScale,
                 anglesDeg: absAngles,
-                parallax: VecParse.parallaxDepth(obj),
+                parallax: objId >= 0 ? effectiveParallaxDepth(objId) : VecParse.parallaxDepth(obj),
                 visible: visible,
                 texturePath: texPath,
                 color: color,
@@ -1426,9 +1529,13 @@ struct SceneDocument {
                 layer.parentAnimId = pinfo.animId
                 layer.parentAnimRate = pinfo.animRate
                 let pT = resolveTransform(pid, 0)
-                layer.parentRenderOrigin = SIMD2(pT.origin.x, pT.origin.y)
+                // + attachShiftOf(pid):父 puppet 自身若也挂在更上层骨上,其渲染中心 = 静态 + 挂点位移;
+                //   子必须用含位移的父中心定位(嵌套挂点),否则父移子不移=分离。非嵌套时 =0 零回归。
+                let pShift = attachShiftOf(pid)
+                layer.parentRenderOrigin = SIMD2(pT.origin.x + pShift.x, pT.origin.y + pShift.y)
                 layer.parentRenderScale = SIMD2(pT.scale.x, pT.scale.y)
                 layer.parentRenderAngle = pT.angle
+                layer.attachParentObjId = pid   // 挂点骨所属对象(每帧位移传播)
                 // 纯 quad 部件(无自身 puppet)用:裸局部 origin(相对父挂点的偏移,父 mesh-local 像素)。
                 // 注:不能用 absOrigin(那是经父链解析的世界 origin,attach 公式要的是局部偏移)。
                 let localOrg = VecParse.f3(obj["origin"])
@@ -1455,12 +1562,24 @@ struct SceneDocument {
                         layer.parentAnimId = pinfo.animId
                         layer.parentAnimRate = pinfo.animRate
                         let pT = resolveTransform(cpid, 0)
-                        layer.parentRenderOrigin = SIMD2(pT.origin.x, pT.origin.y)
+                        // + attachShiftOf(cpid):挂点容器的父(如知更鸟头)自身也挂着上层骨时,把其挂点位移并入,
+                        //   五官/头发才跟着头一起到位(白蛋脸根因)。非嵌套 =0 零回归。
+                        let cShift = attachShiftOf(cpid)
+                        layer.parentRenderOrigin = SIMD2(pT.origin.x + cShift.x, pT.origin.y + cShift.y)
                         layer.parentRenderScale = SIMD2(pT.scale.x, pT.scale.y)
                         layer.parentRenderAngle = pT.angle
+                        layer.attachParentObjId = cpid   // 挂点骨所属对象=容器的父(如头);其每帧位移要传给本层(五官)
                         let cOrg = VecParse.f3(cobj?["origin"])
-                        accum += cOrg   // 折叠挂点容器自身的局部 origin
-                        layer.attachLocalOrigin = SIMD2(accum.x, accum.y)
+                        accum += cOrg   // (旧)裸加挂点容器局部 origin —— 漏中间容器 scale,WP_NO_ATTACH_CONTAINER_SCALE 时退回
+                        // ⭐2026-06-18 修「两组脸」:子相对挂点骨父(cpid)的偏移要含中间容器 scale/angle 复合,
+                        //   不能裸加(麻匪头发容器 scale=2.02 反消身体 0.49,漏乘→五官拉散 176px)。relOriginUnder 等价
+                        //   resolveTransform 把 cpid 当根。凯尔希/知更鸟容器 scale=1 时与裸加逐位相同→零回归。
+                        if ProcessInfo.processInfo.environment["WP_NO_ATTACH_CONTAINER_SCALE"] != nil {
+                            layer.attachLocalOrigin = SIMD2(accum.x, accum.y)
+                        } else {
+                            let rel = relOriginUnder(objId, cpid, 0).origin
+                            layer.attachLocalOrigin = SIMD2(rel.x, rel.y)
+                        }
                         break
                     }
                     accum += VecParse.f3(cobj?["origin"])   // 折叠中间容器局部 origin
@@ -1574,7 +1693,45 @@ struct SceneDocument {
         doc.camera = camera
         doc.cameraAnim = cameraAnim
         doc.projectLayers = projectLayers
+        // 时间滤镜检测:任一对象的 visible 脚本含 getHours + timeStage(昼夜主题主控脚本签名)
+        //   → 标记 hasTimeFilter,引擎据此施加时段色彩分级(白影轻扬 3497488774 等)。
+        for obj in objects {
+            guard let v = obj["visible"] as? [String: Any], let s = v["script"] as? String else { continue }
+            if s.contains("getHours") && (s.contains("timeStage") || s.contains("customTimeStage")) {
+                doc.hasTimeFilter = true
+                break
+            }
+        }
 
+        // ⭐composelayer 软化阴影(2026-06-19,从 pkg + 真 WE 逆向):带特效 composelayer(如「星_阴影」opacity 0.6)
+        //   且**有 image 后代**时,其后代应渲进该 composelayer 的 FBO(走 opacity 软化 + 在它 z 位身后合成),
+        //   而非展平交错硬渲盖脸。判据=该 composelayer frameBufferInput **且**有 image 后代(=它处理子内容,非处理场景;
+        //   音频条/打雷/blur 这类 frameBufferInput 但无 image 后代 → 不命中 → 处理场景,零回归)。
+        //   WP_NO_COMPOSE_IMAGE_FBO=1 退回(后代回主场景硬渲)。
+        if ProcessInfo.processInfo.environment["WP_NO_COMPOSE_IMAGE_FBO"] == nil {
+            // frameBufferInput composelayer 的 obj-id 集
+            let fbCompose = Set(layers.filter { $0.frameBufferInput }.map { $0.id })
+            if !fbCompose.isEmpty {
+                let layerIds = Set(layers.map { $0.id })
+                for i in layers.indices {
+                    // 沿父链(从本层的直接父起)找最近的 frameBufferInput composelayer 祖先
+                    var cur = parentOf[layers[i].id], hops = 0
+                    while let c = cur, hops < 32 {
+                        hops += 1
+                        if fbCompose.contains(c) { layers[i].renderIntoComposeId = c; break }
+                        cur = parentOf[c]
+                    }
+                }
+                // 仅当某 composelayer 确有 image 后代命中时才算「有 image 后代」(否则它仍处理场景)
+                let adopted = Set(layers.compactMap { $0.renderIntoComposeId })
+                // 标记:本身被采纳为「子内容容器」的 composelayer(供引擎判定用其 child FBO 当输入)
+                for i in layers.indices where adopted.contains(layers[i].id) {
+                    // 该 composelayer 用 child-image FBO 当特效输入(而非场景)。复用 frameBufferInput 流程,引擎据
+                    //   childImageLayerIndices 非空切换输入源。此处无需额外标记(引擎按 childImageLayerIndices 判)。
+                    _ = layerIds
+                }
+            }
+        }
         // 渲染覆盖清单:逐 scene 对象列出【已渲染/未渲染 + 原因】,写日志(/tmp/coverage_<id>.log)。
         // 目的:系统性发现被「跳过」的渲染项(如曾漏的打雷 composelayer),不再靠用户逐个指出。
         Self.writeCoverageReport(objects: objects, layers: layers, emitters: emitters, sounds: sounds,
@@ -1717,6 +1874,7 @@ struct SceneDocument {
             if let n = VecParse.unwrap(cur["blend"]) as? NSNumber { d.blend = n.floatValue }
             if let n = VecParse.unwrap(cur["animation"]) as? NSNumber { d.animation = n.intValue }
             d.additive = (VecParse.unwrap(cur["additive"]) as? Bool) ?? false
+            d.name = (cur["name"] as? String) ?? ""
             out.append(d)
         }
         return out

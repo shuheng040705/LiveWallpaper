@@ -223,6 +223,18 @@ def scene_combos():
 def combo_key(combos):
     return "base" if not combos else "_".join(f"{k}-{v}" for k,v in sorted(combos.items()))
 
+def safe_mfile(name):
+    """.metal 磁盘文件名:combo 极多的 effect(如 auto_sway,默认值并入 pck 后超 255 字节
+    → macOS Errno 63 File name too long)时,把超长 combo 段哈希缩短。文件名仅作唯一标识,
+    manifest 存这个名字、引擎据此定位文件 → 只要确定性一致即可,不影响渲染语义。"""
+    if len(name.encode("utf-8")) <= 200:
+        return name
+    import hashlib
+    stem, _, ext = name.rpartition(".")
+    h = hashlib.sha1(stem.encode("utf-8")).hexdigest()[:16]
+    # 保留前缀(entry/stage 可读)+ 哈希,确保 < 255
+    return f"{stem[:120]}__h{h}.{ext}"
+
 # ---- 基础材质 shader(genericimage2/3/4)的转译(供基础图层渲染路径,非 effect 后处理)----
 # 图层材质 pass 直接引用共享 shader 目录的 genericimage2/3/4(带 NORMALMAP/REFLECTION/LIGHTING/
 # EMISSIVE_MAP/PBRMASKS/FOG 等 combo)。转译器实测能处理(含 common_pbr*.h/common_fog.h)。
@@ -269,7 +281,7 @@ def build_material(shader_base, combos):
         if res is None:
             return None
         msl, uniforms, samplers, ubuf = res
-        mfile = f"material__{shader_base}__{ck}__{stage}.metal"
+        mfile = safe_mfile(f"material__{shader_base}__{ck}__{stage}.metal")
         with open(os.path.join(MSL_DIR, mfile), "w") as f:
             f.write(msl)
         rec[stage] = {"metal": mfile, "entry": "main0", "uniforms": uniforms,
@@ -362,8 +374,11 @@ def resolve_pass_shader(p, shaders_dir, file_reader):
                 shader_dir = SHARED_SHADERS
     return shader, mat_combos, mat_textures, shader_dir
 
-def build_effect_passes(edef, combos, ckey, shaders_dir, file_reader, tex_reader=None):
+def build_effect_passes(edef, combos, ckey, shaders_dir, file_reader, tex_reader=None, force_slots=None):
     """通用 pass 构建:builtin 与 workshop 共用。shaders_dir = .vert/.frag 所在目录;
+    force_slots:额外视为「已绑贴图」的槽索引集合——effect.json/material 常不声明覆盖贴图槽(由 scene 绑,
+    转译时不可见),但 sampler combo(如 texture_override 的 g_Texture1 ENABLE,绑了才采样)需据此派生,
+    否则该 sampler 被 `#if ENABLE` gate 掉、变体无 g_Texture1 → 运行期覆盖贴图永远采不到(耳朵只渲一层)。
     file_reader 读 material(builtin=磁盘相对 effect 目录,workshop=pkg map)。
     tex_reader(rel)→bytes|None 读 .tex 二进制(供 item 3 TEX0FORMAT 注入)。
     fbos 的 scale 写进每个 pass 的 targetScale(目标降采样分母,默认 1);
@@ -394,7 +409,7 @@ def build_effect_passes(edef, combos, ckey, shaders_dir, file_reader, tex_reader
         base, mat_combos, mat_textures, stage_dir = resolve_pass_shader(p, shaders_dir, file_reader)
         if not base:
             return None, f"pass {i} no shader", stage_misses
-        bound_slots = pass_bound_slots(p, mat_textures)   # item 5:本 pass 占用的贴图槽
+        bound_slots = pass_bound_slots(p, mat_textures) | (force_slots or set())   # item 5:本 pass 占用的贴图槽(+ scene 绑的覆盖槽)
         # item 3:texture0(slot 0)若绑定单通道 .tex(RG88/R8)→ 注入 TEX0FORMAT。texture0 名取
         # pass.textures[0] 或 material.textures[0](非空)。后处理 effect 的 slot0 多是离屏帧缓冲(无 .tex)→ 不注入。
         t0_name = None
@@ -453,7 +468,7 @@ def build_effect_passes(edef, combos, ckey, shaders_dir, file_reader, tex_reader
                 stage_misses.append((i, base, stage))
                 continue
             msl, uniforms, samplers, ubuf = res
-            mfile = f"{entry}__{pck}__{stage}.metal"
+            mfile = safe_mfile(f"{entry}__{pck}__{stage}.metal")
             with open(os.path.join(MSL_DIR, mfile), "w") as f:
                 f.write(msl)
             pass_rec[stage] = {"metal": mfile, "entry": "main0", "uniforms": uniforms,
@@ -508,9 +523,41 @@ def pkg_files(pkg_path):
         _pkg_cache[pkg_path] = unpack_pkg(pkg_path)
     return _pkg_cache[pkg_path]
 
-def build_workshop_effect(eff_key, pkg_path, combos, ckey):
+def scene_bound_slots_for(eff_key, pkg_path):
+    """该 effect 在 pkg 的 scene 里被绑的贴图槽(任意 object effects[].passes[].textures 非空项下标)并集。
+    effect.json/material 常不声明覆盖贴图槽(由 scene 绑),sampler combo(如 texture_override g_Texture1 的
+    ENABLE)需据此在转译期派生 → 传给 build_workshop_effect 的 force_slots。"""
+    files = pkg_files(pkg_path)
+    scene = next((_parse_json_lenient(v.decode("utf-8", "ignore"))
+                  for k, v in files.items() if k.endswith("scene.json")), None)
+    slots = set()
+    if not scene:
+        return slots
+    def visit(o):
+        if isinstance(o, dict):
+            for e in (o.get("effects") or []):
+                if not isinstance(e, dict):
+                    continue
+                f = (e.get("file") or "").replace("\\", "/")
+                if not f.endswith(eff_key + "/effect.json"):
+                    continue
+                for ps in (e.get("passes") or []):
+                    if isinstance(ps, dict):
+                        for idx, t in enumerate(ps.get("textures") or []):
+                            if t:
+                                slots.add(idx)
+            for v in o.values():
+                visit(v)
+        elif isinstance(o, list):
+            for v in o:
+                visit(v)
+    visit(scene)
+    return slots
+
+def build_workshop_effect(eff_key, pkg_path, combos, ckey, force_slots=None):
     """workshop effect(shaders/材质/effect.json 在 pkg 内)。eff_key 如 'workshop/2822917890/bloom'。
-    把 pkg 内 shaders/* 写到临时目录(保留 shaders/ 下的相对路径,供 #include 互引),按算法转译。"""
+    把 pkg 内 shaders/* 写到临时目录(保留 shaders/ 下的相对路径,供 #include 互引),按算法转译。
+    force_slots:scene 绑的覆盖贴图槽(见 build_effect_passes),供 sampler combo 派生。"""
     files = pkg_files(pkg_path)
     if not files:
         return None, "pkg unpack fail", []
@@ -526,7 +573,7 @@ def build_workshop_effect(eff_key, pkg_path, combos, ckey):
         return v.decode("utf-8", "ignore") if v is not None else None
     def tex_reader(rel):  # .tex 二进制(item 3 TEX0FORMAT),相对 pkg 根
         return files.get(rel.replace("\\", "/"))
-    return build_effect_passes(edef, combos, ckey, shdir, reader, tex_reader)
+    return build_effect_passes(edef, combos, ckey, shdir, reader, tex_reader, force_slots=force_slots)
 
 _shader_dir_cache = {}
 def _pkg_shader_dir(pkg_path, files):

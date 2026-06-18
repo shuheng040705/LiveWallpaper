@@ -236,6 +236,12 @@ def rename_reserved(src):
         return f"{m.group(1)}{m.group(2)} {m.group(3)} = {m.group(4)}{swz[m.group(2)]};"
     src = re.sub(r'(\s*)(vec3|vec2|float)\s+(\w+)\s*=\s*(texSample2D\w*\(.*\))\s*;\s*$',
                  _trunc, src, flags=re.MULTILINE)
+    # HLSL 赋值截断:`vec2 scale = g_Texture0Resolution / g_Texture1Resolution;`(两个 vec4 分辨率相除 → vec4,
+    # HLSL 隐式截断到 vec2,GLSL 严格报错)。texture_override.vert 用它把覆盖贴图按两图尺寸比缩放(耳朵 3 层合成)。
+    # 仅命中「分辨率 uniform 相除」这一确切构造,补 .xy/.xyz swizzle(vec4 截断,忠实 HLSL)。
+    swz2 = {"vec3": ".xyz", "vec2": ".xy"}
+    src = re.sub(r'(\s*)(vec3|vec2)\s+(\w+)\s*=\s*(g_Texture\d+Resolution\s*/\s*g_Texture\d+Resolution)\s*;',
+                 lambda m: f"{m.group(1)}{m.group(2)} {m.group(3)} = ({m.group(4)}){swz2[m.group(2)]};", src)
 
     # HLSL 允许**全局** `const` 用 uniform 表达式初始化(编译期按调用折叠);GLSL/Vulkan 禁止——全局 const
     # 初始化必须是编译期常量,否则 glslang「global const initializers must be constant」(phantomtransitionfx
@@ -304,12 +310,75 @@ def rename_reserved(src):
     # 首项补 .xy/.xyz(类型感知:仅当首项确为本文件声明的 vec4 标识符才补,全库仅此一处命中,非盲改)。
     v4names = set(re.findall(r'\bvec4\s+(\w+)', src))
     v4names |= set(re.findall(r'(?:uniform|varying|attribute|in|out)\s+vec4\s+(\w+)', src))
+    f1names = set(re.findall(r'(?:uniform|varying|attribute|in|out)?\s*\bfloat\s+(\w+)', src))
+    v2names = set(re.findall(r'(?:uniform|varying|attribute|in|out)?\s*\bvec2\s+(\w+)', src))
+    # 新增的向量尺寸截断修法(形态 A/B/C + float↔vec2)的总开关,WP_NO_VEC_TRUNC_FIX=1 退回原行为(诊断/回滚)。
+    _VTRUNC = not os.environ.get("WP_NO_VEC_TRUNC_FIX")
     if v4names:
         swz2 = {"vec2": ".xy", "vec3": ".xyz"}
         def _vmul(m):
             return (f"{m.group(1)} {m.group(2)} = {m.group(3)}{swz2[m.group(1)]} *"
                     if m.group(3) in v4names else m.group(0))
         src = re.sub(r'\b(vec2|vec3)\s+(\w+)\s*=\s*([A-Za-z_]\w*)\s*\*', _vmul, src)
+
+    if _VTRUNC and v4names:
+        # 形态 C:vec2 目标 [op]= …裸 vec4uniform…(range_scroll.vert 的 `v_TexCoord.xy *= g_Texture0Resolution;`
+        # 与 `reciprocalResolution = 1 / g_Texture0Resolution;`,reciprocalResolution 是 vec2 varying)。
+        # LHS 是 vec2(双分量 swizzle,或本文件声明的 vec2 标识符),RHS 整体赋值/复合赋值里裸用某 vec4 uniform
+        # → 该 vec4 截到 .xy(忠实 HLSL:vec2 ← vec4 取前两维)。逐行处理避免跨行误伤。先于形态 A/B 跑,使
+        # `reciprocalResolution = 1 / g_Texture0Resolution;` 直接被整体赋值规则截断(不靠 CAST2/vec2 相邻)。
+        def _v4_to_vec2_lhs(line):
+            mm = re.match(r'\s*([A-Za-z_]\w*)(\.[xyzwrgba]{2})?\s*([*/+\-]?=)(?!=)\s*(.*)$', line)
+            if not mm:
+                return line
+            base, swz, assign, rhs = mm.group(1), mm.group(2), mm.group(3), mm.group(4)
+            is_vec2_lhs = (swz is not None and len(swz) == 3) or (swz is None and base in v2names)
+            if not is_vec2_lhs:
+                return line
+            new_rhs = re.sub(r'\b([A-Za-z_]\w*)\b(?!\s*[.([])',
+                             lambda g: (g.group(1) + ".xy") if g.group(1) in v4names else g.group(0),
+                             rhs)
+            if new_rhs == rhs:
+                return line
+            head = base + (swz or "")
+            return f"{line[:mm.start(1)]}{head} {assign} {new_rhs}"
+        src = "\n".join(_v4_to_vec2_lhs(l) for l in src.split("\n"))
+
+        # HLSL 向量算术尺寸截断之二:`CAST2(...) <op> <vec4uniform>`(全局水波特效 ____________________
+        # 的 `vec2 strength = (CAST2(500) / g_Texture0Resolution) * ...`,resolution 是 vec4 但 WE/HLSL
+        # 把它截到 vec2 与 CAST2 逐分量除)。GLSL 的 vec2 / vec4 类型错。修法:CAST2(…)/vec2(…) 直接与某
+        # vec4 标识符做 `/ * + -` 时,把该 vec4 截到 .xy(忠实 HLSL 截断;resolution 的 .zw 是 1/宽高 倒数
+        # 之外的冗余分量,对 2D 偏移无意义)。窄规则:须 CAST2(…) 或 vec2(…) 与 vec4 标识符直接相邻、且
+        # 该标识符确为本文件声明的 vec4 → 全库仅此特效命中,正常 vec4 算术(vec4*vec4 等)不触发。
+        def _v4adj(m):
+            v4 = m.group('v4')
+            return m.group(0).replace(v4, v4 + ".xy", 1) if v4 in v4names else m.group(0)
+        # 形态 A:CAST2(...)/vec2(...) <op> vec4name  (vec4 在右)
+        src = re.sub(r'(?:CAST2|vec2)\s*\([^()]*\)\s*[*/+\-]\s*(?P<v4>[A-Za-z_]\w*)\b(?!\s*[.([])',
+                     _v4adj, src)
+        # 形态 B:vec4name <op> CAST2(...)/vec2(...)  (vec4 在左)
+        src = re.sub(r'\b(?P<v4>[A-Za-z_]\w*)\b(?!\s*[.([])\s*[*/+\-]\s*(?:CAST2|vec2)\s*\(',
+                     _v4adj, src)
+
+    # HLSL float-LHS 收窄 vec2 表达式:对「确为 float 的 LHS」整段赋值 `LHS = <含 vec2 标识符的表达式>;`,
+    # 当 RHS 算出来是 vec2(含某 vec2 标识符)时,把整段 RHS 包 `(...).x`(range_scroll.vert 的
+    # `varying float totalMargin; ... totalMargin = u_Margin + u_FadeWidth;` 与
+    # `minAlpha = step(..., u_Width - u_Margin - u_FadeWidth)`,u_FadeWidth 是 vec2 → RHS=vec2 赋给 float 类型错)。
+    # GLSL 的 `vec2 ± float`/`float ± vec2` 算术本身合法(标量广播),错只在「vec2 结果赋给 float」——故只截结果、
+    # 不动操作数(早先误截操作数把合法的 vec2 表达式拆坏,回归 waterripple/scroll)。HLSL 把 vec2 截到 .x 再存。
+    # 窄规则:① LHS 是裸标识符(无 swizzle)且确为本文件声明的 float;② LHS 不在 v2/v4names(避免 vec2/vec4 LHS);
+    # ③ RHS 出现某裸 vec2 标识符(其后非 .([)。全库仅 range_scroll 命中;float×float、vec2 LHS 等均不触发。
+    float_lhs = (f1names - v2names) - v4names
+    if _VTRUNC and v2names and float_lhs:
+        def _floatlhs_trunc(m):
+            lhs, sp, rhs = m.group(1), m.group(2), m.group(3)
+            if lhs in float_lhs and any(
+                    re.search(r'\b' + re.escape(vn) + r'\b(?!\s*[.([])', rhs) for vn in v2names):
+                return f"{lhs}{sp}= ({rhs}).x"
+            return m.group(0)
+        # 整段赋值:`LHS = <rhs до ;>`;LHS 须裸标识符(其后非 . 排除 X.xy=)、= 是真赋值(前后非 =!<>)。
+        src = re.sub(r'(?<![=!<>])\b([A-Za-z_]\w*)\b(?!\s*\.)(\s*)=(?!=)\s*([^;]*?)\s*(?=;)',
+                     _floatlhs_trunc, src)
 
     # HLSL 标量字面量广播进 min/max 的向量参数:`max(0, albedo.rgb)`(nitro frag) —— 首参是裸数字字面量
     # `0`、次参是向量(`.rgb` swizzle)。HLSL 把标量 0 广播成 vec3(0,0,0) 与 albedo.rgb 同型逐分量取 max。
@@ -651,7 +720,11 @@ def shadow_written_inputs(body):
     frag 直接写 v_TexCoord.y/.x 做几何变形)。修法:把被写的 in 声明改名为 _we_ro_<name>,并在 main()
     开头插入 `<type> <name> = _we_ro_<name>;` 的可写拷贝 —— 后续对 <name> 的读写都落在该局部上,语义
     与 HLSL 一致。vert↔frag 接口按 layout(location) 数字匹配,改名不影响。只读的 in(常态)不动,故
-    现有通过的着色器零影响。"""
+    现有通过的着色器零影响。
+
+    ⚠ varying 声明常被 #if COMBO 包裹(auto_sway 的 v_QuadMaskCoord 在 #if QUAD_MASK 内):该 combo
+    关闭时 `in` 声明消失,但无条件插入的可写拷贝仍引用 _we_ro_<name> → undeclared identifier。故插拷贝时
+    必须用声明处相同的 #if 守卫包裹。无守卫的 varying(常态)guards=[] → 输出与旧逻辑逐字一致,零影响。"""
     decls = {m.group(3): m.group(2) for m in _IN_DECL_RE.finditer(body)}
     if not decls:
         return body
@@ -659,12 +732,37 @@ def shadow_written_inputs(body):
                if re.search(r'\b' + re.escape(n) + r'\b(?:\.[xyzwrgba]+)?\s*[-+*/]?=(?!=)', body)]
     if not written:
         return body
+    # 收集每个被写 varying **每处声明**的预处理守卫栈(开启指令原文 #if/#ifdef/#ifndef)。
+    # auto_sway 这类 shader 把整套(varying 声明 + main)按 #if AA_VERSION==N 复制多份 → 同名 varying
+    # 多处声明、多个 main。每处声明各生成一份按其守卫包裹的拷贝;守卫互斥(==2/==3)同 combo 下 ≤1 生效。
+    _pp_open = re.compile(r'^\s*#\s*(?:if|ifdef|ifndef)\b')
+    _pp_close = re.compile(r'^\s*#\s*endif\b')
+    decl_sites = []   # [(name, guard_stack_tuple)]
+    stack = []
+    for ln in body.split("\n"):
+        if _pp_open.match(ln):
+            stack.append(ln.strip())
+        elif _pp_close.match(ln):
+            if stack: stack.pop()
+        m = _IN_DECL_RE.match(ln)
+        if m and m.group(3) in written:
+            decl_sites.append((m.group(3), tuple(stack)))
     def _ren(m):
         return (f"{m.group(1)}{m.group(2)} _we_ro_{m.group(3)}{m.group(4)}"
                 if m.group(3) in written else m.group(0))
     body = _IN_DECL_RE.sub(_ren, body)
-    copies = "".join(f"\n    {decls[n]} {n} = _we_ro_{n};" for n in written)
-    body = re.sub(r'(\bvoid\s+main\s*\(\s*\)\s*\{)', r'\1' + copies, body, count=1)
+    # 去重 (name, guards):同名同守卫只插一份,避免重复声明。
+    seen, parts = set(), []
+    for n, g in decl_sites:
+        if (n, g) in seen:
+            continue
+        seen.add((n, g))
+        opener = "".join(f"\n    {d}" for d in g)
+        closer = "\n    #endif" * len(g)
+        parts.append(f"{opener}\n    {decls[n]} {n} = _we_ro_{n};{closer}")
+    copies = "".join(parts)
+    # 在**每个** main 后插(多版本 shader 各 main 独立);单 main 单声明无守卫时与旧逻辑逐字一致。
+    body = re.sub(r'(\bvoid\s+main\s*\(\s*\)\s*\{)', lambda mm: mm.group(1) + copies, body)
     return body
 
 def preprocess(path, stage, combos, vary_locs, search_dirs=None, link_src=None, bound_slots=None):

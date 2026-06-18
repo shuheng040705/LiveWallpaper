@@ -241,6 +241,11 @@ private struct GPULayer {
     // 旧式只平移枢轴位移 → 偏离 24px。update 用该骨蒙皮矩阵变换**此点**(而非枢轴),捕获旋转放大的真实下沉。
     var attachAnchorLocal: SIMD2<Float> = .zero  // 子锚点(父 mesh-local;t=0)
     var attachAnchorBind: SIMD2<Float> = .zero   // 该锚点经骨蒙皮(t=0)后的位置(增量基准,通常≈anchorLocal)
+    // 嵌套挂点每帧位移传播(2026-06-18,晃动五官分离修复):
+    var attachParentObjId: Int = -1              // 挂点骨所属父对象 id(其每帧位移要传给本层;见 SceneModel 同名字段)
+    var attachAnimDelta: SIMD2<Float> = .zero    // 本层本帧自身挂点世界位移(center − attachStaticCenter),供子层累加
+    var attachAnimAngle: Float = 0               // 本层本帧自身挂点角增量(供 pass2 重建)
+    var isAttachFollow = false                   // 本帧走了动态挂点跟随(pass2 据此重建 baseModel)
     // scale 字段挂的 WE JS 脚本(如 "Second" 秒进度条):每帧跑脚本得新 scale → 重建 baseModel。
     var scaleScript: WEScript? = nil
     var baseSize: SIMD2<Float> = .zero       // 未乘 scale 的尺寸(autosize 后的纹理像素尺寸 / 显式 size)
@@ -604,7 +609,17 @@ final class SceneRenderEngine {
             att.destinationAlphaBlendFactor = .one
         }
 
-        pipelineNormal = try make(vertex: vfn) { $0.isBlendingEnabled = false }
+        // ⭐2026-06-18 黑块修复:`blending:"normal"` 的图层(默认值)应做 **alpha-over**,不是覆写。
+        //   WE/lwe 真义:每个 Image 先渲进自有透明 FBO(内部 Normal=GL_ONE,GL_ZERO 覆写),末 pass 再按对象 blend
+        //   (无 effect 时=Translucent)alpha-over 合进场景 → 净效果=alpha-over。我方对无 effect 的 image 层没有
+        //   per-Image FBO,若直接覆写主场景,透明纹素(alpha=0)会**抠掉下方已合成场景=透明黑洞**(星_后头发4/4附
+        //   是全场景仅有的 normal+无effect 透明发丝层 → 渲成黑方块)。改 alpha-over:不透明层 alpha=1 时 alpha-over
+        //   ==覆写(背景等零回归),透明层正确合成。WP_NORMAL_OVERWRITE=1 退回旧覆写(A/B)。
+        if ProcessInfo.processInfo.environment["WP_NORMAL_OVERWRITE"] != nil {
+            pipelineNormal = try make(vertex: vfn) { $0.isBlendingEnabled = false }
+        } else {
+            pipelineNormal = try make(vertex: vfn, alphaBlend)
+        }
         pipelineTranslucent = try make(vertex: vfn, alphaBlend)
         pipelineAdditive = try make(vertex: vfn, addBlend)
         // colorBlendMode 层:scene_fragment_blend 用 framebuffer fetch 读背景、着色器内按方程混合,
@@ -1238,7 +1253,7 @@ final class SceneRenderEngine {
                 //   位置(box 中心)由此挂点公式定。**旧 puppet 路径**用 parentRenderOrigin + 父 size + 根骨对齐挂点
                 //   (attachedUnitVerts),与 quad 路径锚点不一致 → 眼睛/眼睑偏出脸(离线落点偏差 ~0.15 画布宽);
                 //   头发/衣服(quad)用挂点公式本就对,故统一到挂点公式后两者都对、头发不动。
-                let attachPos = SIMD2(aw.columns.3.x, aw.columns.3.y)        // 挂点 mesh-local 平移
+                let attachPos = SIMD2(aw.columns.3.x, aw.columns.3.y)        // 挂点 mesh-local 平移(骨骼 bind 绝对位置)
                 let ploc = SIMD2(attachPos.x + layer.attachLocalOrigin.x,
                                  attachPos.y + layer.attachLocalOrigin.y)    // 父 mesh-local 像素
                 let ps = layer.parentRenderScale
@@ -1248,6 +1263,10 @@ final class SceneRenderEngine {
                                     layer.parentRenderOrigin.y + rotated.y)
                 attachEffSize = effSize                                       // 子自身 size×scale(quad 与 puppet 同)
                 attachAngle = layer.parentRenderAngle + layer.anglesDeg.z     // 随父转 + 自身角
+                if ProcessInfo.processInfo.environment["WP_ATTACH_LOG"] != nil {
+                    let ap = SIMD2(aw.columns.3.x, aw.columns.3.y)
+                    FileHandle.standardError.write("WP_ATTACH \(layer.name)(\(layer.id)) @\(layer.attachment ?? "?") attachPos=(\(Int(ap.x)),\(Int(ap.y))) childOrig=(\(Int(layer.attachLocalOrigin.x)),\(Int(layer.attachLocalOrigin.y))) parentRendOrig=(\(Int(layer.parentRenderOrigin.x)),\(Int(layer.parentRenderOrigin.y))) staticCenter=(\(Int(layerCenter.x)),\(Int(layerCenter.y))) modelCenter=(\(Int(modelCenter.x)),\(Int(modelCenter.y))) delta=(\(Int(modelCenter.x-layerCenter.x)),\(Int(modelCenter.y-layerCenter.y)))\n".data(using: .utf8)!)
+                }
             }
             let model = matModel(centerPx: modelCenter,
                                  sizePx: attachEffSize, angleDegZ: attachAngle)
@@ -1279,6 +1298,9 @@ final class SceneRenderEngine {
                 ? SIMD4(br, br, br, layer.color.w)
                 : (br == 1 ? layer.color
                    : SIMD4(layer.color.x * br, layer.color.y * br, layer.color.z * br, layer.color.w))
+            if ProcessInfo.processInfo.environment["WP_COLOR_LOG"] != nil {
+                FileHandle.standardError.write("WP_COLOR id=\(layer.id)(\(layer.name)) blend=\(layer.blend) color=(\(String(format:"%.2f",layer.color.x)),\(String(format:"%.2f",layer.color.y)),\(String(format:"%.2f",layer.color.z)),\(String(format:"%.2f",layer.color.w))) br=\(String(format:"%.2f",br)) solidBaked=\(solidColorBaked) litW=\(String(format:"%.2f",litColor.w))\n".data(using: .utf8)!)
+            }
             // 缺口E(已撤销,2026-06):曾试「音频可视化 solidlayer 贴回 alpha 强制 1」(让 alpha=0 的 audioline
             // 频谱可见)。**实测把凯尔希 Esperanta(id391)整屏糊成噪点**(meanDiff 106 vs 基线)——该 audioline 的
             // effectedTexture 强制不透明后覆盖/污染场景,说明其 alpha=0 是有意隐藏/该层不干净渲染,审计前提不成立。
@@ -1443,6 +1465,7 @@ final class SceneRenderEngine {
             result[result.count - 1].puppetUse3D = eyeUse3D  // 眼睛层完整 3D 蒙皮;主 puppet 平面(零回归)
             result[result.count - 1].audioVizSelfAlpha = audioVizSelfAlpha   // 音频可视化层:合成保留 effectedTexture 逐像素 alpha
             result[result.count - 1].isAttached = (attachWorld != nil)   // attach 成功(蒙皮或刚性 quad 均含):baseModel 已按挂点搭好,update 跳过 origin/scale/angle 覆写
+            result[result.count - 1].attachParentObjId = layer.attachParentObjId   // 嵌套挂点每帧位移传播:挂点骨所属父对象
             // 动态挂点跟随:父 puppet 有骨骼动画(主体 anim206 呼吸)时,记下重算所需数据,update() 每帧把
             //   attach 部件锚点从 bind 挂点更新到**动画后**挂点(增量),让眼/睑/耳跟父头骨一起动、不脱离脸。
             //   退化兜底:动画首帧未必 == bind,故 update() 用「animAttachPos(t) − animAttachPos(0)」的增量
@@ -2384,6 +2407,10 @@ final class SceneRenderEngine {
                 let dAngle = zAngle(skinT) - layers[i].attachBindAngle     // 头骨微转(t 相对 0;bind∠用同骨蒙皮基准)
                 let ang = layers[i].attachStaticAngle + dAngle
                 layers[i].baseModel = matModel(centerPx: center, sizePx: layers[i].attachEffSize, angleDegZ: ang)
+                // pass2 用:记本层自身每帧位移/角增量(嵌套挂点把父的位移再叠给子,见 update 末尾传播 pass)
+                layers[i].attachAnimDelta = rotated
+                layers[i].attachAnimAngle = dAngle
+                layers[i].isAttachFollow = true
             } else if let pMesh = layers[i].attachParentMesh,
                let awt = pMesh.animatedAttachmentWorld(layers[i].attachName, time: time,
                                                         rate: layers[i].attachParentAnimRate,
@@ -2468,6 +2495,33 @@ final class SceneRenderEngine {
             // 视频纹理:每帧拉取当前帧替换图层纹理。
             if let vt = layers[i].video {
                 layers[i].texture = vt.currentTexture()
+            }
+        }
+
+        // ⭐2026-06-18 pass2:嵌套挂点**每帧位移传播**(晃动时五官分离修复)。pass1(上面的 per-layer 循环)已算出
+        //   各 attach-follow 层自身的本帧世界位移 attachAnimDelta;但子层(五官,挂到「头」骨)的父(头,挂到身体
+        //   「锁骨」骨)本帧也在动,pass1 没把头的位移叠给子 → 人物晃动时头动、五官留在(仅含自身头骨微动的)位置
+        //   = 五官跟脸分离。此处沿 attachParentObjId 链把祖先(头)本帧位移累加给子,重建 baseModel + mvp。
+        //   非嵌套(父不是 attach-follow → attachAnimDelta=0)累加 0 → 凯尔希等零回归。WP_NO_ATTACH_FRAME_PROPAGATE=1 退回。
+        if ProcessInfo.processInfo.environment["WP_NO_ATTACH_FRAME_PROPAGATE"] == nil {
+            func ancestorAttachDelta(_ objId: Int) -> SIMD2<Float> {
+                var acc = SIMD2<Float>.zero; var cur = objId, hops = 0
+                while cur >= 0, hops < 32, let idx = layerIndexById[cur] {
+                    hops += 1
+                    acc += layers[idx].attachAnimDelta          // 该祖先本帧自身挂点位移
+                    cur = layers[idx].attachParentObjId         // 再往上一层挂点父
+                }
+                return acc
+            }
+            for i in layers.indices where layers[i].isAttachFollow && layers[i].attachParentObjId >= 0 {
+                let acc = ancestorAttachDelta(layers[i].attachParentObjId)
+                if acc.x == 0 && acc.y == 0 { continue }         // 父链本帧无位移(非嵌套)→ 不动,零回归
+                let fc = SIMD2(layers[i].attachStaticCenter.x + layers[i].attachAnimDelta.x + acc.x,
+                               layers[i].attachStaticCenter.y + layers[i].attachAnimDelta.y + acc.y)
+                let ang = layers[i].attachStaticAngle + layers[i].attachAnimAngle
+                layers[i].baseModel = matModel(centerPx: fc, sizePx: layers[i].attachEffSize, angleDegZ: ang)
+                let off = parallaxOffset(depth: layers[i].parallax)
+                layers[i].mvp = proj * matTranslate(off.x, off.y) * layers[i].baseModel
             }
         }
 

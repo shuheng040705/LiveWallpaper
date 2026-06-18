@@ -373,12 +373,21 @@ struct PuppetMesh {
         // ---- MDLS 骨骼:u8 + u32(ptr) + u32 boneCount;每骨 u8+u32 id+i32 parent+u32(matBytes)+16f 矩阵(行主序)+ JSON cstr ----
         var parent = [Int](); var localBind = [simd_float4x4]()
         if let m = mdls {
-            var o = m + 8
-            o += 1                         // u8 flag
-            o += 4                         // u32 ptr
-            let boneCount = Int(u32(o)); o += 4
+            let hdrEnd = m + 8 + 1 + 4     // 跳 magic(8) + u8 flag + u32 ptr
+            let boneCount = Int(u32(hdrEnd))
+            var o = hdrEnd + 4             // 默认:骨区紧跟头(旧假设,兜底)
+            // 数据锚点定位 bone0(2026-06-15 修头发炸开真因):每骨 = flag1+id4+parent4+matBytes4(=64)+matrix64+cstr(NUL)+
+            //   1字节名字后缀。bone0 是唯一 parent=-1 的根骨 → 字节模式 `FF FF FF FF 40 00 00 00`(parent=-1 + matBytes=64)
+            //   全库唯一。旧解析硬设「骨区紧跟9字节头」,对某些 strand(刘海)/尾巴 puppet 的 bone0 前有 0~2 字节前缀 →
+            //   从错位起 → desync。用锚点定位 bone0 flag(=anchor-5),限定头后小窗(前缀≤8)避免误命中,失败退旧。
+            let strideFix = ProcessInfo.processInfo.environment["WP_NO_MDLS_STRIDE_FIX"] == nil
+            let mdlsEnd = mdlaRaw ?? b.count
+            if strideFix, let anchor = findTag([0xFF,0xFF,0xFF,0xFF,0x40,0x00,0x00,0x00], from: hdrEnd + 4),
+               anchor < mdlsEnd, anchor - 5 >= hdrEnd + 4, anchor - 5 <= hdrEnd + 4 + 8 {
+                o = anchor - 5             // bone0 flag = parent锚点 - (flag1+id4)
+            }
             if boneCount > 0 && boneCount < 4096 {
-                for _ in 0..<boneCount {
+                for bi in 0..<boneCount {
                     guard o + 13 + 64 <= b.count else { break }
                     o += 1                 // u8 flag
                     o += 4                 // u32 id
@@ -400,6 +409,14 @@ struct PuppetMesh {
                     // 跳过 JSON cstr(到 NUL)
                     while o < b.count && b[o] != 0 { o += 1 }
                     o += 1                 // 跳 NUL
+                    // stride 自愈(2026-06-15):吃掉 cstr 后的 1 字节名字后缀。若非末根,下一根 matBytes(o+9)应==64,
+                    // 否则逐字节前进(guard≤8)对齐。修「每骨 desync 1 字节 → 第2根 matBytes 读成 16384 → break →
+                    // hasSkin=false → 刘海渲散开 bind 姿态(头顶炸尖刺)而非播 sway 动画 anim707(frame0=自然下垂)」。
+                    // 对已正常解析的 puppet(凯尔希/御剑)下一根本就对齐(u32(o+9)==64)→ 不前进 → 零变化。
+                    if strideFix, bi < boneCount - 1 {
+                        var gd = 0
+                        while o + 13 <= b.count && u32(o + 9) != 64 && gd < 8 { o += 1; gd += 1 }
+                    }
                 }
             }
         }
