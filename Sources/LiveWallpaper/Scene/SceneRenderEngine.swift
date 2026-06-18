@@ -187,6 +187,11 @@ private struct GPULayer {
     // 用它(而非累积场景 sceneFBO)当 computeLayerEffect 的 sceneInput → 特效(tint/opacity-mask)只作用于
     // 「只含粒子」的 FBO,不染下方场景的角色/龙身(凯尔希×Mon3tr Matrix spawner 机制,真 WE,lwe 未实现)。
     var childParticleGroupIndices: [Int] = []
+    // 阴影软化(2026-06-19):本(composelayer)层的 image 后代下标 → 渲进本层 child FBO 当特效输入(opacity 软化),
+    //   而非展平后与真实部件交错硬渲盖脸(星_头眼阴影等)。renderIntoComposeId 指向本层的后代被归到此。
+    var childImageLayerIndices: [Int] = []
+    var renderIntoComposeId: Int? = nil  // 本 image 层应渲进哪个 composelayer 的 child FBO(从 LayerDesc 同名字段)
+    var renderedIntoComposeFBO = false   // 本层渲进了某 composelayer 的 child FBO → 主场景跳过(不重复硬渲)
     var abovePost = false               // 排在最后一个 postChain fullscreenlayer 之上 → postChain 跑完后再叠(不被后处理染暗,WE 语义)
     var regionFit = false               // 区域性 composelayer(非 pulse):特效在该层 region [0,1] 跑(裁场景+遮罩到 region);encode 用普通 UV 贴回。pulse=false 走全屏画布 UV(不动)。
     var effectedTexture: MTLTexture? = nil   // 每帧由 WEEffectChain 产出的特效后纹理
@@ -1458,6 +1463,7 @@ final class SceneRenderEngine {
                 baseAngleZ: layer.anglesDeg.z
             ))
             result[result.count - 1].id = layer.id   // 诊断用:按 pkg id 隐藏图层(WP_HIDE_IDS)
+            result[result.count - 1].renderIntoComposeId = layer.renderIntoComposeId   // 阴影软化:本层渲进哪个 composelayer FBO
             result[result.count - 1].name = layer.name   // 跨层写回:控制器脚本 getLayer(name) 命中目标层
             result[result.count - 1].sceneObjIndex = layer.sceneObjIndex   // 场景对象序(粒子插画锚点)
             result[result.count - 1].puppetAnimLayers = puppetAnimLayers   // 全部可见 animationlayers(additive 叠加)
@@ -1544,6 +1550,20 @@ final class SceneRenderEngine {
             result[result.count - 1].alphaKeyAnim = layer.alphaKeyAnim
         }
         layers = result
+        // ⭐阴影软化分组(2026-06-19):把带 renderIntoComposeId 的 image 后代归到目标 composelayer 的
+        //   childImageLayerIndices(渲进它 FBO 走 opacity 软化 + 在它 z 位身后合成),并标记后代主场景跳过。
+        //   SceneModel 已 gate(WP_NO_COMPOSE_IMAGE_FBO 时 renderIntoComposeId=nil → 此处空转零回归)。
+        if useComposeChildFBO {
+            var idToIdx = [Int: Int]()
+            for i in layers.indices { idToIdx[layers[i].id] = i }
+            for i in layers.indices {
+                guard let cid = layers[i].renderIntoComposeId, let ci = idToIdx[cid],
+                      ci != i, layers[ci].frameBufferInput else { continue }
+                layers[ci].childImageLayerIndices.append(i)
+                layers[i].renderedIntoComposeFBO = true
+                hasComposeChildFBO = true
+            }
+        }
         // 3D 场景:per-layer 2D 脚本各自独立 context、没有 shared(读 shared.sun_D_real/dock 坐标会抛错→文字空/位置堆原点)。
         // 把**宿主**(单-context 跑了全部脚本+Main模拟,shared 含324键)算出的 shared 快照注入每层全部脚本 →
         // update() 每帧跑这些脚本时就能算出正确文字 + 位置(dock 屏幕坐标 / 标签 3D 坐标)。
@@ -2955,7 +2975,8 @@ final class SceneRenderEngine {
     /// particleFilter 决定画哪些非折射粒子组(nil=全部;用于按 bloom 上下分批)。
     func encode(into encoder: MTLRenderCommandEncoder, drawLayers: Bool = true,
                 particleFilter: ((ParticleGroupInfo) -> Bool)? = nil,
-                layerRange: Range<Int>? = nil, drawParticles: Bool = true) {
+                layerRange: Range<Int>? = nil, drawParticles: Bool = true,
+                onlyComposeChildren: Set<Int>? = nil) {
         encoder.setFragmentSamplerState(sampler, index: 0)
         // 宽高比适配(图层与粒子顶点共用,buffer 3)。
         var ndc = ndcScale
@@ -3036,6 +3057,10 @@ final class SceneRenderEngine {
         // 开头,无此限制锚 0 会被两段重画。
         if !Self.particlesOnTop, liLo == 0, liHi > 0 || layers.isEmpty { drawGroups(anchor: 0) }
         for li in liLo..<liHi {
+            // 阴影软化:onlyComposeChildren!=nil 时只画这些后代(渲进 composelayer child FBO);否则主场景跳过这些后代
+            if let only = onlyComposeChildren {
+                if !only.contains(li) { continue }
+            } else if layers[li].renderedIntoComposeFBO { continue }
             if !Self.particlesOnTop, li > liLo { drawGroups(anchor: li) }   // 序在 layers[li] 之前的粒子
             let layer = layers[li]
             guard drawLayers, layer.visible, !Self.hideLayerIds.contains(layer.id),
@@ -4257,6 +4282,26 @@ final class SceneRenderEngine {
         return target
     }
 
+    /// 阴影软化(2026-06-19):把某 composelayer 的 image 后代(散布在层序中)渲进透明 child FBO(全场景尺寸,
+    ///   各层用自身 mvp 落到世界位),供该 composelayer 的特效链(opacity 0.6 等)软化 + 在它 z 位身后合成。
+    ///   复用 encode 的逐层绘制(onlyComposeChildren 只画这些下标,drawParticles=false 不画粒子)。
+    private func encodeChildImageFBO(layerIndices: [Int], width w: Int, height h: Int,
+                                     commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
+        guard w > 0, h > 0, !layerIndices.isEmpty,
+              let target = composeChildTarget(width: w, height: h) else { return nil }
+        let pass = MTLRenderPassDescriptor()
+        pass.colorAttachments[0].texture = target
+        pass.colorAttachments[0].loadAction = .clear
+        pass.colorAttachments[0].storeAction = .store
+        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)   // 透明底
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return nil }
+        enc.label = "composeChildImageFBO"
+        encode(into: enc, drawLayers: true, layerRange: nil, drawParticles: false,
+               onlyComposeChildren: Set(layerIndices))
+        enc.endEncoding()
+        return target
+    }
+
     /// A(WP_LWE_COMPOSITE):忠实对齐 lwe —— 图层按 z 序累积进持久场景 FBO(target = _rt_FullFrameBuffer),
     /// 每个 frameBufferInput composelayer 读「累积到它之下的真场景」作特效输入(取代 compositeSceneBelow 临场重渲),
     /// 跑特效链产出 effectedTexture,再画该层。非折射、非 postProcess 路径专用;(belowBloom)粒子在末段统一画。
@@ -4294,8 +4339,14 @@ final class SceneRenderEngine {
             // 把这些粒子画进透明 child FBO,用它当特效输入 → tint/opacity-mask 只染粒子、裁到遮罩区,
             // 不染下方场景(角色/龙身)。无 child 粒子的 composelayer(绝大多数)仍喂累积场景 sceneFBO(旧行为)。
             let childIdx = layers[i].childParticleGroupIndices
+            let childImg = layers[i].childImageLayerIndices
             var fxInput = sceneFBO
-            if useComposeChildFBO, !childIdx.isEmpty,
+            if useComposeChildFBO, !childImg.isEmpty,
+               let imgFBO = encodeChildImageFBO(layerIndices: childImg,
+                                                width: sceneFBO.width, height: sceneFBO.height,
+                                                commandBuffer: cmd) {
+                fxInput = imgFBO   // 阴影软化:特效输入=本层 image 后代(透明底),非下方场景 → opacity 只软化阴影
+            } else if useComposeChildFBO, !childIdx.isEmpty,
                let childFBO = encodeChildParticleFBO(groupIndices: childIdx,
                                                      width: sceneFBO.width, height: sceneFBO.height,
                                                      commandBuffer: cmd) {
