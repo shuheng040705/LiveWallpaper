@@ -2085,6 +2085,8 @@ final class SceneRenderEngine {
     // MARK: - WE「属性」通用区(每壁纸固定 7 控件中由引擎实现的几项)。默认值 = 现状行为(零回归)。
     /// 音频监听(audio responsive)。关时不喂系统音频频谱(音频条/oscilloscope 静默)。默认开。
     private var generalAudioListen = true
+    /// 鼠标视差开关(WE 标准属性「鼠标视差」)。关时 parallaxOffset 归 0(所有壁纸不跟鼠标晃)。默认开(不改现状)。
+    private var mouseParallaxEnabled = true
     /// 翻转(flip horizontal):最终呈现把 uv.x 镜像。默认关。
     private var generalFlip = false
     /// 图片筛选器:0=无、1=灰度、2=棕褐、3=反相、4=暖、5=冷。最终画面过一个轻量后处理滤镜。默认 0=无。
@@ -2092,13 +2094,14 @@ final class SceneRenderEngine {
     private var sceneHasTimeFilter = false   // 当前场景含时间滤镜脚本(昼夜主题)→ 启用时段色彩分级
     /// SceneRenderer 据 loadedItem 推入这 4 项(load/reloadInPlace 时调一次)。播放速度/音量在外层(时钟累积/audioPlayback)处理。
     /// WP_NO_GENERAL_PROPS 总退路:置 1 时引擎忽略这些通用项,完全走旧行为。
-    func setGeneralProps(audioListen: Bool, flip: Bool, filter: Int) {
+    func setGeneralProps(audioListen: Bool, flip: Bool, filter: Int, mouseParallax: Bool = true) {
         if ProcessInfo.processInfo.environment["WP_NO_GENERAL_PROPS"] != nil {
-            generalAudioListen = true; generalFlip = false; generalFilter = 0; return
+            generalAudioListen = true; generalFlip = false; generalFilter = 0; mouseParallaxEnabled = true; return
         }
         generalAudioListen = audioListen
         generalFlip = flip
         generalFilter = max(0, filter)
+        mouseParallaxEnabled = mouseParallax
     }
 
     /// 暂停/恢复所有视频纹理 + 壁纸音频(省电:窗口隐藏、电池模式等)。
@@ -2148,7 +2151,7 @@ final class SceneRenderEngine {
     /// (lwe referenceSize = scene width,非各轴自身)。amount 在此再出现一次(故 depth=0 层也随相机平移)。
     /// 方向:沿用本引擎既有的负号约定 —— lwe 自身坐标系的符号不适用我们(同 matModel 注释里 rotate 取负的教训)。
     private func parallaxOffset(depth: SIMD2<Float>) -> SIMD2<Float> {
-        guard cameraParallax else { return .zero }
+        guard cameraParallax, mouseParallaxEnabled else { return .zero }   // 鼠标视差开关(WE标准属性)关→无视差
         let refW = canvas.x
         let ax: Float, ay: Float
         if parallaxWGPU {

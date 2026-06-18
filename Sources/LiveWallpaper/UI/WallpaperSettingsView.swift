@@ -225,6 +225,12 @@ struct GeneralPropertiesSection: View {
                                                      set: { g.setPlaybackSpeed($0, item.id); onChange() }),
                       range: 0...100, format: "%.0f")
 
+            // 鼠标视差(bool,WE 标准属性;所有壁纸可控)
+            Toggle(isOn: Binding(get: { g.mouseParallax(item.id) },
+                                 set: { g.setMouseParallax($0, item.id); onChange() })) {
+                Text("鼠标视差").font(.system(size: 12.5))
+            }.toggleStyle(.switch).tint(accent)
+
             // 5) 翻转(bool,默认关)
             Toggle(isOn: Binding(get: { g.flip(item.id) },
                                  set: { g.setFlip($0, item.id); onChange() })) {

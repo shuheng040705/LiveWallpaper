@@ -127,7 +127,8 @@ final class SceneRenderer: WallpaperRenderer {
         let g = GeneralWallpaperSettings.shared
         engine.setGeneralProps(audioListen: g.audioListen(item.id),
                                flip: g.flip(item.id),
-                               filter: g.filter(item.id).rawValue)
+                               filter: g.filter(item.id).rawValue,
+                               mouseParallax: g.mouseParallax(item.id))
         // 音量:WE 是 per-wallpaper(0–100)。叠加全局静音/音量上限作整体乘子,喂壁纸自带 BGM 播放。
         engine.setAudioVolume(PreferencesStore.shared.volume * g.volume(item.id) / 100.0)
     }

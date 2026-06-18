@@ -63,6 +63,12 @@ final class GeneralWallpaperSettings: ObservableObject {
     /// 实际 WE 默认 100 = 1.0×,范围扩到 200 才是 2×;为兼容我们用 0–100 且 100=1.0×、可降速到 0)。
     func speedMultiplier(_ id: String) -> Double { max(0, playbackSpeed(id) / 100.0) }
 
+    // MARK: - 鼠标视差(Mouse parallax)— bool,默认开(WE 标准属性;关=强制不跟随鼠标视差。所有壁纸可控)
+    func mouseParallax(_ id: String) -> Bool {
+        hasValue(id, "mouseParallax") ? d.bool(forKey: key(id, "mouseParallax")) : true
+    }
+    func setMouseParallax(_ v: Bool, _ id: String) { d.set(v, forKey: key(id, "mouseParallax")); objectWillChange.send() }
+
     // MARK: - 5) 翻转(Flip horizontal)— bool,默认关
     func flip(_ id: String) -> Bool {
         hasValue(id, "flip") ? d.bool(forKey: key(id, "flip")) : Self.defaultFlip
