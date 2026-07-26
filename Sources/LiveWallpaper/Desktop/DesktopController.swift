@@ -75,6 +75,9 @@ final class DesktopController {
         Log.write("apply: \(renderers.count) renderer(s) active")
     }
 
+    /// 当前壁纸的渲染缺口(供 UI 弹窗指明没能渲染成功的项)。
+    func currentRenderGaps() -> [String] { renderers.first?.renderGaps ?? [] }
+
     func clear() {
         renderers.forEach { $0.stop() }
         renderers.removeAll()

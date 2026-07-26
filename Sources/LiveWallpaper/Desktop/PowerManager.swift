@@ -8,6 +8,15 @@ final class PowerManager {
     private var enabled = true
     private var pausedByPower = false
     private var pollTimer: Timer?   // 定时轮询遮挡覆盖率(窗口移动/缩放/台前调度无激活事件,需主动查)
+    /// 暂停确认延迟用的 pending work item。台前调度「显示桌面/窗口收回」那一刻会先发 activeSpace 变化通知,
+    /// 而此刻应用窗口尚未真正收回左侧栏 → 瞬间遮挡率仍达阈值 → 旧逻辑立刻 pause(CVDisplayLinkStop),
+    /// 几百 ms 后窗口收回、下一次 evaluate 才 resume → 壁纸卡顿约 1 秒。修复:遮挡达阈值不立刻暂停,
+    /// 而是延迟 settleDelay 复查仍遮挡才真正暂停(瞬时遮挡尖峰会在复查前消失 → 不暂停 → 不卡顿)。
+    private var pausePending: DispatchWorkItem?
+    private var pollTick = 0
+    /// 暂停前的「持续遮挡」确认窗口。台前调度过场遮挡尖峰远短于此 → 永不误暂停;真正全屏 App / 大窗口
+    /// 持续遮挡会跨过此窗口 → 仍会暂停省电。resume(取消遮挡)始终即时,不延迟。
+    private let settleDelay: TimeInterval = 0.8
 
     init(desktop: DesktopController) {
         self.desktop = desktop
@@ -26,8 +35,15 @@ final class PowerManager {
                        name: NSWorkspace.didWakeNotification, object: nil)
         // 遮挡覆盖率轮询(2.5s):窗口拖动/缩放不发激活通知,靠它捕捉「遮挡达阈值」的变化。开销很低
         //(一次 CGWindowList + 网格采样)。仅 enabled 时真正 evaluate。
-        let t = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in self?.evaluate() }
-        t.tolerance = 0.5
+        // ⭐自适应轮询(2026-06-26 修台前调度「显示桌面」恢复仍卡):**暂停期间每 0.5s 复查**(uncovered 即即时恢复,
+        //   消除靠 2.5s 轮询才恢复的 ~1s 滞留卡顿——「显示桌面」可能不发 activeChanged,只能靠轮询检测);
+        //   未暂停时每 2.5s 复查一次(省 CGWindowList 开销)。配合 SceneRenderer 旗标式暂停=恢复零冷启动。
+        let t = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            self.pollTick &+= 1
+            if self.pausedByPower || self.pollTick % 5 == 0 { self.evaluate() }
+        }
+        t.tolerance = 0.1
         RunLoop.main.add(t, forMode: .common)
         pollTimer = t
     }
@@ -36,16 +52,31 @@ final class PowerManager {
         get { enabled }
         set {
             enabled = newValue
-            if !enabled, pausedByPower { desktop?.resume(); pausedByPower = false }
-            else { evaluate() }
+            if !enabled {
+                cancelPendingPause()
+                if pausedByPower { desktop?.resume(); pausedByPower = false }
+            } else { evaluate() }
         }
     }
 
-    @objc private func activeChanged() { evaluate() }
+    private func cancelPendingPause() {
+        pausePending?.cancel()
+        pausePending = nil
+    }
+
+    @objc private func activeChanged() {
+        // ⭐偏向恢复(消除台前调度「显示桌面」恢复卡顿):Space/App 切换瞬间应用窗口可能还盖在屏上(过场),
+        //   旧逻辑会把这瞬时遮挡当真、滞留暂停到下次 evaluate(最长 2.5s 轮询)才恢复 → 卡顿。改:切换先
+        //   即时恢复(配合 SceneRenderer 旗标式暂停=零 CVDisplayLink 冷重启),再 evaluate 复查——真持续遮挡
+        //   会在 settleDelay 后重新暂停;「显示桌面」过场遮挡尖峰会在复查前消失 → 保持恢复 → 不卡顿。
+        if pausedByPower { desktop?.resume(); pausedByPower = false; Log.write("power: resumed (transition)") }
+        evaluate()
+    }
 
     // 审计修复 #5:willSleep 暂停时必须置 pausedByPower=true,标记“本次暂停由 PowerManager 负责恢复”,
     // 否则 didWake/evaluate 无人认领该暂停 → 唤醒后永不 resume(卡在暂停)。
     @objc private func willSleep() {
+        cancelPendingPause()   // 睡眠是确定意图,立刻暂停;丢弃任何在途的遮挡暂停确认
         guard let desktop, !desktop.isPaused else { return }
         desktop.pause(); pausedByPower = true
         Log.write("power: paused (will sleep)")
@@ -54,6 +85,7 @@ final class PowerManager {
     // 审计修复 #5:谁暂停谁恢复 —— 只有当暂停是 PowerManager 造成的(pausedByPower)才恢复。
     // 唤醒后不直接 resume,而是走 evaluate():若此刻仍被全屏遮挡则保持暂停,不会误恢复到被遮挡状态。
     @objc private func didWake() {
+        cancelPendingPause()
         guard pausedByPower else { return }
         pausedByPower = false
         desktop?.resume()   // 先恢复,再由 evaluate 决定是否因全屏遮挡重新暂停
@@ -64,20 +96,36 @@ final class PowerManager {
     /// 适配台前调度/大窗口遮挡——不必全屏也能省电。
     private func evaluate() {
         guard enabled, let desktop else { return }
-        let threshold = PreferencesStore.shared.occlusionThreshold
-        let covered: Bool
-        if threshold <= 0 {
-            covered = Self.isMainScreenCoveredByFullscreen()
+        if Self.isCovered() {
+            // 遮挡达阈值:不立刻暂停。台前调度「显示桌面」过场会让应用窗口短暂仍占满屏(几百 ms)再收回
+            //   左侧栏,这种瞬时遮挡尖峰不应触发暂停(否则 CVDisplayLinkStop→几百 ms 后才 resume = 卡顿)。
+            //   延迟 settleDelay 复查仍遮挡才真正暂停;尖峰会在复查前消失(下面 else 分支会撤销 pending)。
+            guard !desktop.isPaused, pausePending == nil else { return }   // 已暂停/已有在途确认 → 不重复排
+            let work = DispatchWorkItem { [weak self] in
+                guard let self, self.enabled, let desktop = self.desktop else { return }
+                self.pausePending = nil
+                // 复查:settleDelay 后仍持续遮挡才暂停(真全屏 App / 大窗口会跨过该窗口仍遮挡)。
+                guard Self.isCovered(), !desktop.isPaused else { return }
+                desktop.pause(); self.pausedByPower = true
+                Log.write("power: paused (occlusion, threshold=\(PreferencesStore.shared.occlusionThreshold))")
+            }
+            pausePending = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + settleDelay, execute: work)
         } else {
-            covered = Self.maxScreenCoverageFraction() * 100 >= Double(threshold)
+            // 未遮挡:撤销任何在途暂停确认(瞬时遮挡尖峰到此已消失 → 永不误暂停),并即时恢复。
+            cancelPendingPause()
+            if pausedByPower {
+                desktop.resume(); pausedByPower = false
+                Log.write("power: resumed")
+            }
         }
-        if covered, !desktop.isPaused {
-            desktop.pause(); pausedByPower = true
-            Log.write("power: paused (occlusion, threshold=\(threshold))")
-        } else if !covered, pausedByPower {
-            desktop.resume(); pausedByPower = false
-            Log.write("power: resumed")
-        }
+    }
+
+    /// 当前是否达到「暂停遮挡阈值」:0=仅真正全屏(精确匹配);其余=最大屏遮挡覆盖率 ≥ 阈值%。
+    private static func isCovered() -> Bool {
+        let threshold = PreferencesStore.shared.occlusionThreshold
+        if threshold <= 0 { return isMainScreenCoveredByFullscreen() }
+        return maxScreenCoverageFraction() * 100 >= Double(threshold)
     }
 
     /// 主屏/各屏被其他应用普通窗口遮挡的**最大**覆盖率 [0,1](网格采样窗口并集占屏比)。

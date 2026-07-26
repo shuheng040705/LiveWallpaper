@@ -18,15 +18,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     )
     private var folderWatcher: FolderWatcher?
     private lazy var downloadsWindow = DownloadsWindowController()
+    private lazy var settingsWindow = SettingsWindowController(
+        actions: makeActions(),
+        currentItem: { [weak self] in
+            guard let self, let id = self.desktop.current?.id else { return nil }
+            return self.library.item(id: id)
+        }
+    )
+    // 强引用持有,避免可缩放的订阅窗口被释放(同 settingsWindow)。
+    private lazy var subscriptionsWindow = SubscriptionsWindowController()
     private var cancellables = Set<AnyCancellable>()
     private var cancelAlertShowing = Set<String>()   // 正在弹取消询问的 job id(去重)
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
         setupMainMenu()
+        // 首页预览每次重启重新渲染一遍(清磁盘缓存),反映引擎最新改动(用户要求)。
+        RenderedPreviewCache.shared.invalidateAllOnLaunch()
         // UI 预览模式(WP_UI_PREVIEW=1,截图验证用):不启动桌面渲染/电源/轮换,
         // 只扫描库并打开主窗口 → 可对新 UI 截图,而不干扰正在运行的壁纸实例。
-        if ProcessInfo.processInfo.environment["WP_UI_PREVIEW"] != nil {
+        if WPEnv.vars["WP_UI_PREVIEW"] != nil {
             library.scan { [weak self] in self?.openLibrary() }
             return
         }
@@ -47,6 +58,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NotificationCenter.default.addObserver(
             self, selector: #selector(openDownloads), name: .showDownloads, object: nil)
         NotificationCenter.default.addObserver(
+            self, selector: #selector(openSettings), name: .showSettings, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(openSubscriptions), name: .showSubscriptions, object: nil)
+        NotificationCenter.default.addObserver(
             self, selector: #selector(onUnsubscribeWallpaper(_:)), name: .unsubscribeWallpaper, object: nil)
         WorkshopDownloader.shared.$jobs
             .receive(on: DispatchQueue.main)
@@ -55,6 +70,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc private func openDownloads() { downloadsWindow.show() }
+
+    /// 打开「设置」窗口(独立可拖拽改大小的 NSWindow,取代原 SwiftUI sheet)。
+    @objc private func openSettings() { settingsWindow.show() }
+
+    /// 打开「我的 Steam 订阅」窗口(独立可拖拽改大小的 NSWindow,取代原 SwiftUI sheet)。
+    @objc private func openSubscriptions() { subscriptionsWindow.show() }
 
     /// 网页里取消订阅 → 删除对应本地壁纸(移到废纸篓,与右键删除同一路径,处理正在播放/库刷新)。
     @objc private func onUnsubscribeWallpaper(_ note: Notification) {
@@ -95,7 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 主窗口的所有回调:把 UI 操作接到运行中的渲染器/轮换器/系统。
     private func makeActions() -> LibraryActions {
         LibraryActions(
-            onSelect: { [weak self] item in self?.apply(item) },
+            onSelect: { [weak self] item in self?.apply(item, interactive: true) },
             onMuteChanged: { [weak self] m in self?.desktop.setMuted(m) },
             onVolumeChanged: { [weak self] v in self?.desktop.setVolume(v) },
             onRotationChanged: { [weak self] in self?.rotation.reschedule() },
@@ -222,9 +243,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Actions
 
-    private func apply(_ item: WallpaperItem) {
+    private func apply(_ item: WallpaperItem, interactive: Bool = false) {
         desktop.apply(item)
         libraryWindow.updateCurrent(item.id)
+        // ⭐用户政策(2026-06-19):渲染壁纸时,pkg 能渲的全渲、**不能渲的弹窗指明**,方便纠错。
+        //   受「设置 → 渲染缺口报错」开关控制(默认关,普通使用不打扰);**开启后每次交互切壁纸都弹**。
+        if interactive && PreferencesStore.shared.reportRenderGaps { showRenderGapsIfAny(item) }
+    }
+
+    /// 加载后若有渲染缺口(没渲成功的项),弹窗列出。空=全渲成功,不弹。
+    private func showRenderGapsIfAny(_ item: WallpaperItem) {
+        let gaps = desktop.currentRenderGaps()
+        guard !gaps.isEmpty else { return }
+        let alert = NSAlert()
+        alert.messageText = "「\(item.title)」有 \(gaps.count) 项未能完全渲染"
+        alert.informativeText = "其余内容已全部渲染。以下项目没有渲染成功(用于纠错,不影响其余画面):\n\n• "
+            + gaps.joined(separator: "\n\n• ")
+        alert.alertStyle = .warning
+        alert.addButton(withTitle: "知道了")
+        alert.addButton(withTitle: "复制清单")
+        if alert.runModal() == .alertSecondButtonReturn {
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString("\(item.title) (\(item.id)) 渲染缺口:\n" + gaps.joined(separator: "\n"), forType: .string)
+        }
     }
 
     @objc private func openLibrary() {

@@ -110,7 +110,7 @@ final class VideoRenderer: WallpaperRenderer {
     /// WE「属性」通用区(视频侧):翻转(水平镜像图层)+ 播放速度(rate 倍率)+ 音量(已在 load 设)。
     /// WP_NO_GENERAL_PROPS 退回:不翻转、1.0×。默认值 = 现状,零回归。
     func applyGeneralProps() {
-        let off = ProcessInfo.processInfo.environment["WP_NO_GENERAL_PROPS"] != nil
+        let off = WPEnv.vars["WP_NO_GENERAL_PROPS"] != nil
         let g = GeneralWallpaperSettings.shared
         let flip = off ? false : g.flip(itemID)
         let speed = off ? 1.0 : g.speedMultiplier(itemID)
@@ -124,7 +124,7 @@ final class VideoRenderer: WallpaperRenderer {
         if let p = player, p.rate != 0 { p.rate = Float(speed) }
     }
 
-    func start() { player?.rate = Float(ProcessInfo.processInfo.environment["WP_NO_GENERAL_PROPS"] != nil ? 1.0 : GeneralWallpaperSettings.shared.speedMultiplier(itemID)) }
+    func start() { player?.rate = Float(WPEnv.vars["WP_NO_GENERAL_PROPS"] != nil ? 1.0 : GeneralWallpaperSettings.shared.speedMultiplier(itemID)) }
 
     func stop() {
         presObs = nil
@@ -146,7 +146,7 @@ final class VideoRenderer: WallpaperRenderer {
 
     func pause() { player?.pause() }
     func resume() {
-        let speed = ProcessInfo.processInfo.environment["WP_NO_GENERAL_PROPS"] != nil ? 1.0 : GeneralWallpaperSettings.shared.speedMultiplier(itemID)
+        let speed = WPEnv.vars["WP_NO_GENERAL_PROPS"] != nil ? 1.0 : GeneralWallpaperSettings.shared.speedMultiplier(itemID)
         player?.rate = Float(speed)
     }
     func setMuted(_ muted: Bool) { player?.isMuted = muted }

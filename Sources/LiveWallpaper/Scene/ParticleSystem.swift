@@ -228,12 +228,18 @@ struct ParticleEmitterDesc {
     var layerScale: SIMD2<Float> = SIMD2(1, 1)  // 图层各轴独立缩放(各向异性层如雨水花 (0.848,0.10))
     var layerAngleZ: Float = 0             // 图层 Z 旋转(WE angles,弧度);雨层 -0.145 → 雨丝斜下
     var layerAlpha: Float = 1              // instanceoverride.alpha(图层级整体透明度)
-    var parallaxDepth: SIMD2<Float> = SIMD2(1, 1)  // 鼠标视差深度(WE parallaxDepth);粒子层照图像层同公式平移投影
+    var parallaxDepth: SIMD2<Float> = .zero
+    var parallaxAnchorPx: SIMD2<Float> = .zero
+    var parallaxAnchorId: Int = -1
     var texturePath: String?    // pkg 内实际 .tex 路径(若存在)
     var textureName: String?    // 材质引用的纹理基名
     var normalTexturePath: String?  // 法线贴图 pkg 内路径(折射粒子 textures[1])
     var normalTextureName: String?  // 法线贴图引用名
     var blend: BlendMode = .additive
+    // ⭐眼焰标记(御剑驭龙 3233141951):检测到「有色 colorn(饱和蓝/粉)× 中性灰 colorrandom 基底 + rope」
+    // 的发射器 = 作者用 colorn 指定颜色的焰/光束(beam)。WE 实渲焰是饱和蓝紫带亮蓝芯,我方 translucent
+    // over 灰底场景把它冲淡泛白。置位后:渲染端可选 additive 合成(WP_FLAME_ADDITIVE)避免泛白。
+    var isEyeFlame: Bool = false
     // 材质 overbright(ui_editor_properties_overbright,默认 1,range[0,5])。WE genericparticle.frag:119
     // / genericropeparticle.frag:62 末尾 `color.rgb *= g_Overbright`。火焰/光点 >1 提亮、暗 halo <1 压暗。
     var overbright: Float = 1
@@ -272,6 +278,25 @@ struct ParticleEmitterDesc {
     var efHeadLifeMin: Float = 11, efHeadLifeMax: Float = 16   // 父头 lifetimerandom
     var efHeadRate: Float = 1                          // 父头 emitter.rate
     var efHeadMaxCount: Int = 10                        // 父头单列 maxcount(static child 覆盖值)
+    // 父头是否 boxrandom 发射器(直挂 spawner 的 eventfollow 子,如萤火虫拖尾:父萤火虫散布于
+    // distMin..distMax 的盒内,ghost 头应在该盒内**散布**出生,而非全堆 efHeadOrigin 单点→中心团)。
+    // 缺省 false = matrix_code 头那样单列原点出生(零回归)。
+    var efHeadIsBox: Bool = false
+    var efHeadDistMin: SIMD3<Float> = .zero
+    var efHeadDistMax: SIMD3<Float> = .zero
+    var efHeadDirections: SIMD3<Float> = SIMD3(1, 1, 0)
+    // ── ghost 头随父漂移(萤火虫拖尾聚团真因)──────────────────────────────────────────────
+    // 真因:萤火虫 ghost 头若**冻结**(efHeadVelocity=0 且无湍流),每个头在其盒内出生点静止整段寿命
+    // (8-15s),持续在 5px 球内冒 7 个/s 的 trail 子粒子 → 每头堆成一个不动的小团,~15 个静态小团 =
+    // 用户「有些萤火虫聚在一起」。真 WE:eventfollow trail 跟随**真正在游走的父萤火虫**(湍流 speed 50-80
+    // + oscillateposition 摆动),trail 沿父的游走路径铺开而非堆一点。故让 ghost 头复现父萤火虫的湍流
+    // curl-noise 游走(从父 spawner 的 turbulence 算子捕获),trail 随头移动 = 散开。缺这些参数(matrix 头)
+    // = 不漂移(零回归)。WP_NO_GHOST_WANDER=1 退回冻结头(A/B)。
+    var efHeadTurb: Bool = false
+    var efHeadTurbScale: Float = 0.005
+    var efHeadTurbTimeScale: Float = 0.01
+    var efHeadTurbSpeed: Float = 0
+    var efHeadTurbMask: SIMD3<Float> = SIMD3(1, 1, 0)
 
     // ── eventdeath 烟花子粒子(child `type:"eventdeath"`:父粒子死亡瞬间在其末位置爆发一次)─────────────
     // WE 的 child `type:"eventdeath"`:每当**父粒子**(如 fireworks1 上升的火箭)到寿死亡,在它当时所处位置
@@ -378,7 +403,7 @@ final class ParticleSimulator {
 
     // eventfollow:内部「ghost 头」(复现父 matrix_code 头的下落,见 ParticleEmitterDesc.eventFollow 注释)。
     // 仅位置/年龄/寿命/每头发射累加器——不渲染,只作 trail 子粒子的出生锚点。
-    private struct GhostHead { var pos: SIMD2<Float>; var age: Float; var life: Float; var emitAccum: Float }
+    private struct GhostHead { var pos: SIMD2<Float>; var age: Float; var life: Float; var emitAccum: Float; var burst: Bool = false; var vel: SIMD2<Float> = .zero }
     private var ghostHeads: [GhostHead] = []
     private var ghostEmitAccum: Float = 0
 
@@ -407,9 +432,14 @@ final class ParticleSimulator {
     private var animTime: Float = 0          // 累积动画时间(驱动帧前进)
     var randomFrameMode = false              // animationmode==randomframe:每粒子固定随机帧(雨/雪)
 
+    // TEXS 精灵表整轮总秒数(= Σ 各帧 frametime;matrix=71×0.0141≈1.0s)。>0 时 sequence 模式按
+    // **实时** lwe 公式 fmod(age×seqMult, totalDur) 循环(CParticle.cpp:294-296),与 .tex 真实帧时长挂钩;
+    // ==0 退回旧的「整生命循环 seqMult 次」近似(鸟类等无 TEXS 时长的精灵表沿用,见 frameIndex 注释)。
+    private let sheetTotalDuration: Float
+
     init(desc: ParticleEmitterDesc, seed: UInt64,
          sheetFrames: Int = 1, sheetCols: Int = 1, sheetUVScale: SIMD2<Float> = SIMD2(1, 1),
-         frameRects: [SIMD4<Float>] = [], frameDuration: Float = 1.0/24) {
+         frameRects: [SIMD4<Float>] = [], frameDuration: Float = 1.0/24, sheetTotalDuration: Float = 0) {
         self.desc = desc
         self.rngState = seed | 1
         self.delayTimer = desc.emitterDelay   // 发射器开喷前延迟(CParticle.cpp:416 delayTimer = emitter.delay)
@@ -418,6 +448,7 @@ final class ParticleSimulator {
         self.sheetUVScale = sheetUVScale
         self.frameRects = frameRects
         self.frameDuration = max(0.001, frameDuration)
+        self.sheetTotalDuration = sheetTotalDuration
         particles.reserveCapacity(desc.maxCount)
     }
 
@@ -458,6 +489,40 @@ final class ParticleSimulator {
         case 4:  return SIMD3(t, p, val)
         default: return SIMD3(val, p, q)     // 5
         }
+    }
+
+    /// HSV 饱和度 = (max−min)/max(供眼焰 colorn tint 判定:是否「有色」)。灰阶 → 0。
+    static func colorSaturation(_ c: SIMD3<Float>) -> Float {
+        let mx = max(c.x, max(c.y, c.z)), mn = min(c.x, min(c.y, c.z))
+        return mx <= 0 ? 0 : (mx - mn) / mx
+    }
+
+    /// 判定接近中性灰(三通道相互接近;眼焰 beam 基底 ≈0.78 灰 → true,红花田基底 → false)。
+    static func isNeutralGray(_ c: SIMD3<Float>) -> Bool {
+        let mx = max(c.x, max(c.y, c.z)), mn = min(c.x, min(c.y, c.z))
+        return (mx - mn) <= 0.08          // 通道差 ≤0.08 视为灰(0.78 灰差=0)
+    }
+
+    /// 围绕 luma 放大饱和度(k>1 去灰更纯)。保持亮度不变,只拉开通道差 → 逼近 WE 焰带更纯的蓝紫。
+    /// k=1 原样;clamp 到 [0,1] 防越界。
+    static func saturateColor(_ c: SIMD3<Float>, _ k: Float) -> SIMD3<Float> {
+        let luma = 0.299 * c.x + 0.587 * c.y + 0.114 * c.z   // Rec.601 亮度
+        let g = SIMD3<Float>(repeating: luma)
+        let s = g + (c - g) * k
+        return SIMD3(max(0, min(1, s.x)), max(0, min(1, s.y)), max(0, min(1, s.z)))
+    }
+
+    /// 眼焰色相塑形:把作者 colorn(青蓝 G 居中 / 粉)往 WE 实渲焰带的「饱和蓝紫(G 最低)」推。
+    /// WE 焰带均值(114,76,147):R≈B、G 远低 = 偏紫的蓝;colorn 蓝(127,159,250)是 G>R 的青蓝。
+    /// 做法:① luma 增饱和(k);② 把 G 通道额外压向 min(R,B)(蓝紫化,gFactor 控制保留比例)。
+    /// 不抬亮度(保 baseLuma 缩放),只改色相/饱和;clamp 防越界。WP_FLAME_SAT_K 调 k。
+    static func toFlameHue(_ c: SIMD3<Float>, _ k: Float) -> SIMD3<Float> {
+        var s = saturateColor(c, k)
+        // G 往 min(R,B) 拉:gFactor=0(完全压到 min,最紫)~1(不压);0.20 让色相明显偏 WE 的紫蓝(G 最低)。
+        let gFactor = Float(WPEnv.vars["WP_FLAME_GFACTOR"] ?? "") ?? 0.20
+        let lo = min(s.x, s.z)
+        if s.y > lo { s.y = lo + (s.y - lo) * gFactor }
+        return SIMD3(max(0, min(1, s.x)), max(0, min(1, s.y)), max(0, min(1, s.z)))
     }
 
     /// 分形布朗噪声(fBm):多个 octave 的 perlin 噪声按 amplitude(gain)/frequency(lacunarity)倍增叠加,
@@ -502,18 +567,42 @@ final class ParticleSimulator {
     /// 8 精灵帧=翅膀抖动(用户报「翅膀幅度不对」);②「原生帧率」忽略 seqMult(丢 pkg 字段,碰巧
     /// 1Hz≈1.2Hz 近似对)。seqMult 缺省 1 = 整生命播一遍(水花等一次性动画的自然语义)。
     /// WP_SEQ_LWE=1 退回 lwe 实时循环(A/B 诊断)。
+    ///
+    /// 【2026-06-20 矩阵字符修正】上面「整生命循环 seqMult 次」是对**鸟类侧车精灵表**的近似:鸟侧车
+    /// duration≈lifetime 时,生命比×seqMult 恰≈ age×seqMult/dur,故近似成立(被用户 WE 实机证实)。但
+    /// **TEXS 精灵表**(matrix「matrix spritesheet 72」71帧×0.0141s=1.0s 整轮)的真实总时长与粒子生命
+    /// (11-16s)**脱钩**:近似会让 matrix 每个下落字符整生命只翻 seqMult=2 次字形 ≈ 6.5s/字 = 几乎静止,
+    /// 与真 WE「字符快速变换」(每 dur/seqMult=0.5s 走完 71 字形)完全不同 = 用户报「字体跟 WE 不同」。
+    /// 修:有 TEXS 整轮时长(sheetTotalDuration>0)时严格照 lwe 实时公式
+    ///   p.frame = fmod(age × animSpeed, totalDur) / totalDur × n  (CParticle.cpp:294-296),
+    /// **仅作用于带真实 TEXS 时长的精灵表**(matrix);鸟类/侧车表 sheetTotalDuration==0 → 走旧近似 = 零回归。
+    /// WP_NO_MATRIX_TIMECYCLE=1 退回旧近似(A/B)。
     private func frameIndex(p: Particle, f: Float, n: Int) -> Int {
         if randomFrameMode || desc.animationMode == "randomframe" {
             return p.frame % n                      // spawn 时定的随机帧,整生命不变
         }
         let seqMult = desc.sequenceMultiplier > 0 ? desc.sequenceMultiplier : 1
-        if ProcessInfo.processInfo.environment["WP_SEQ_LWE"] != nil {
+        if WPEnv.vars["WP_SEQ_LWE"] != nil {
             let frame = p.age * seqMult / frameDuration
             let idx = Int(frame.truncatingRemainder(dividingBy: Float(n)))
             return idx < 0 ? idx + n : idx
         }
         if desc.animationMode == "once" {
             return min(Int(f * Float(n) * seqMult), n - 1)   // 播一遍并停在末帧(用 lifetimePos)
+        }
+        // TEXS 精灵表真实总时长(matrix=1.0s):照 lwe 实时循环 fmod(age×seqMult, totalDur)/totalDur × n。
+        // ⚠**收窄到只 matrix 类「连续循环字符流」**(表整轮 ≪ 生命 → 一生循环很多次):agent 初版「所有
+        //   TEXS 表→实时」把御剑樱花/落叶、伊蕾娜夜莺鸟、白影蝴蝶的 sprite 动画也改成实时快闪,而这些是
+        //   **用户 WE 实机验证过的 frac(一生循环 seqMult 次)**(见 [[particle-snow-birds-4fixes]] shader
+        //   frac() 铁证)→ 改它们=回归。判据=**整轮总时长远短于粒子生命**:matrix 表 1.0s / 生命 13s =
+        //   loops 13× = 真连续字符流;樱花/落叶/鸟/蝴蝶的表≈一生播一遍(ratio≈1-3)。lifetimeMax/sheetDur≥6
+        //   只命中 matrix 类。WP_NO_MATRIX_TIMECYCLE 退回纯 frac。
+        if sheetTotalDuration > 0,
+           desc.lifetimeMax / max(0.0001, sheetTotalDuration) >= 6,
+           WPEnv.vars["WP_NO_MATRIX_TIMECYCLE"] == nil {
+            let timeInCycle = (p.age * seqMult).truncatingRemainder(dividingBy: sheetTotalDuration)
+            let cyclePos = max(0, timeInCycle) / sheetTotalDuration   // [0,1)
+            return min(Int(cyclePos * Float(n)), n - 1)
         }
         let cycle = max(0, (f * seqMult).truncatingRemainder(dividingBy: 1))   // frac(生命比×seqMult)
         return min(Int(cycle * Float(n)), n - 1)
@@ -767,7 +856,9 @@ final class ParticleSimulator {
     }
 
     /// eventfollow 关闭开关(WP_NO_MATRIX_TRAIL=1):矩阵渐变拖尾不发射(A/B 诊断)。
-    static let eventFollowDisabled = ProcessInfo.processInfo.environment["WP_NO_MATRIX_TRAIL"] != nil
+    static let eventFollowDisabled = WPEnv.vars["WP_NO_MATRIX_TRAIL"] != nil
+    /// ghost 头随父湍流游走(萤火虫拖尾不再堆静态小团);WP_NO_GHOST_WANDER=1 退回冻结头(A/B 诊断)。
+    static let ghostWanderEnabled = WPEnv.vars["WP_NO_GHOST_WANDER"] == nil
 
     /// eventfollow 拖尾发射(本帧已 advance dt=d)。先 advance/补充 ghost 头(复现父 matrix_code 头的列内下落),
     /// 再在每个 ghost 头位置按 trail 自身 emitter.rate 发射 trail 子粒子。子粒子 pos/spawnOrigin = 该 ghost 头
@@ -783,6 +874,22 @@ final class ParticleSimulator {
             }
             // 父头速度(层局部,与 trail 子粒子同坐标系);不翻 Y(我们 Y-up,与雨/雪约定一致,见 velocityrandom 注释)。
             ghostHeads[gi].pos += SIMD2(desc.efHeadVelocity.x, desc.efHeadVelocity.y) * d
+            // ghost 头随父萤火虫游走(湍流 curl 场,复现父 spawner 的 turbulence 算子)→ trail 沿头的游走路径
+            // 铺开而非堆静止点(聚团真因修)。matrix 头 efHeadTurb=false → 不漂移(零回归)。
+            if desc.efHeadTurb && Self.ghostWanderEnabled {
+                // 湍流 curl 场叠在每头独立初速度上(curl 给微卷曲 + 初速度给方向相干性破缺)。
+                var np = SIMD3<Float>(ghostHeads[gi].pos.x, ghostHeads[gi].pos.y, 0)
+                np.x += desc.efHeadTurbTimeScale * simTime
+                np *= (desc.efHeadTurbScale * 2)
+                var cd = WENoise.curl(np)
+                let len = simd_length(cd)
+                if len > 0.0001 { cd = (cd / len) * desc.efHeadTurbSpeed }
+                ghostHeads[gi].vel += SIMD2(cd.x * desc.efHeadTurbMask.x, cd.y * desc.efHeadTurbMask.y) * d
+                // 轻阻力(非父 drag=2 重阻尼):重阻尼会立刻吃掉初速度让头停回 curl 相干漂移=又聚团。
+                // 取约 0.3/s 让初速度方向持续 ~3s(头寿命 8-15s 内游走数百 px 铺开 trail),仍逐渐衰减不无限加速。
+                ghostHeads[gi].vel *= max(0, 1 - 0.3 * d)
+                ghostHeads[gi].pos += ghostHeads[gi].vel * d
+            }
             gi += 1
         }
         // 2) 按父头 emitter.rate 补充新 ghost 头(rate 1/s,上限 efHeadMaxCount;出生在列局部头原点)。
@@ -792,18 +899,49 @@ final class ParticleSimulator {
             while add > 0, ghostHeads.count < max(1, desc.efHeadMaxCount) {
                 add -= 1
                 let life = max(0.0001, rnd(desc.efHeadLifeMin, desc.efHeadLifeMax))
-                ghostHeads.append(GhostHead(pos: SIMD2(desc.efHeadOrigin.x, desc.efHeadOrigin.y),
-                                            age: 0, life: life, emitAccum: 0))
+                // 父头出生点:boxrandom 父(萤火虫)在盒内对称散布(同 spawn() box 路径),否则单点原点(matrix)。
+                var headPos = SIMD2(desc.efHeadOrigin.x, desc.efHeadOrigin.y)
+                if desc.efHeadIsBox {
+                    let flipped = SIMD3(desc.efHeadDirections.x, -desc.efHeadDirections.y, desc.efHeadDirections.z)
+                    var rp = SIMD3<Float>(0, 0, 0)
+                    for axis in 0..<3 {
+                        var dv = rnd(desc.efHeadDistMin[axis], desc.efHeadDistMax[axis])
+                        if rnd() < 0.5 { dv = -dv }
+                        rp[axis] = dv
+                    }
+                    rp *= flipped
+                    headPos = SIMD2(desc.efHeadOrigin.x + rp.x, desc.efHeadOrigin.y + rp.y)
+                }
+                // 每头独立随机初速度(打破 curl 噪声场的方向相干性 → 相邻头朝不同方向游走、不再同向粘成团)。
+                // 幅度取湍流场速一半量级(萤火虫慢飘),方向均匀随机。efHeadTurb=false(matrix 头)→ 0 不动(零回归)。
+                var headVel = SIMD2<Float>.zero
+                if desc.efHeadTurb && Self.ghostWanderEnabled {
+                    let ang = rnd(0, 2 * .pi)
+                    let mag = desc.efHeadTurbSpeed * 0.5 * rnd(0.3, 1.0)
+                    headVel = SIMD2(cos(ang) * mag, sin(ang) * mag)
+                }
+                ghostHeads.append(GhostHead(pos: headPos, age: 0, life: life, emitAccum: 0, vel: headVel))
             }
         }
-        // 3) 在每个 ghost 头位置发射 trail 子粒子(trail 自身 emitter.rate=2/s/头)。
+        // 3) 在每个 ghost 头位置发射 trail 子粒子。两条节奏:
+        //    rate>0 → 持续按 rate 发(firefliestrail rate=7;matrix_trail rate=2);
+        //    rate==0 && instantaneous>0 → 该头出生瞬间 burst 一次 instantaneous 个(shootingstarglow:rate=0 instantaneous=1
+        //    每颗流星头各冒 1 个 glow)。缺此 burst 分支 → rate=0 的 glow 永不发=流星丢辉光(回归)。
         for hi in ghostHeads.indices {
-            guard desc.rate > 0 else { break }
-            ghostHeads[hi].emitAccum += desc.rate * d
-            var em = Int(ghostHeads[hi].emitAccum); ghostHeads[hi].emitAccum -= Float(em)
-            while em > 0, particles.count < desc.maxCount {
-                em -= 1
-                particles.append(spawn(eventFollowAnchor: ghostHeads[hi].pos))
+            if desc.rate > 0 {
+                ghostHeads[hi].emitAccum += desc.rate * d
+                var em = Int(ghostHeads[hi].emitAccum); ghostHeads[hi].emitAccum -= Float(em)
+                while em > 0, particles.count < desc.maxCount {
+                    em -= 1
+                    particles.append(spawn(eventFollowAnchor: ghostHeads[hi].pos))
+                }
+            } else if desc.emitterInstantaneous > 0 && !ghostHeads[hi].burst {
+                ghostHeads[hi].burst = true
+                var em = desc.emitterInstantaneous
+                while em > 0, particles.count < desc.maxCount {
+                    em -= 1
+                    particles.append(spawn(eventFollowAnchor: ghostHeads[hi].pos))
+                }
             }
         }
     }
@@ -943,8 +1081,8 @@ final class ParticleSimulator {
             // 湍流方向:默认 lwe 钳制(scale 当 ±scale/2 锥角)。曾试 blend=normalize(forward+curl)(指标更接近
             // WE 采集真值 H262 vs 钳制105/WE~200)但用户实机否决("乱飘"=逐粒子方向散导致 rope 抖动),已回滚。
             // WP_TURB_BLEND=1 / WP_TURB_FREECONE=1 仅作诊断。眼焰形态与 WE 的残差(焰羽高度)留观。
-            let useBlend = ProcessInfo.processInfo.environment["WP_TURB_BLEND"] != nil
-            let freeCone = ProcessInfo.processInfo.environment["WP_TURB_FREECONE"] != nil
+            let useBlend = WPEnv.vars["WP_TURB_BLEND"] != nil
+            let freeCone = WPEnv.vars["WP_TURB_FREECONE"] != nil
             if useBlend {
                 let bl = fwd + result
                 let bln = length(bl)
@@ -961,12 +1099,12 @@ final class ParticleSimulator {
             if abs(desc.tvOffset) > 0.0001 { result = rotate(result, normalize(desc.tvRight), -desc.tvOffset) }
             result.z = 0                                  // 2D 粒子投影到 XY 平面
             let l2 = length(result); if l2 > 0.0001 { result /= l2 }
-            // ⭐湍流初速**默认不乘** instanceoverride.speed(2026-06-10,御剑眼焰实测定):
-            //   lwe 乘(CParticle.cpp:928)→ 眼焰 0.6×250=150px/s,亮区缩在内眼角(用户报"偏左");
-            //   不乘(全速 250)→ 焰延伸 X[2166,2430] 亮区落眼尾、射向右上 = WE 实况(用户:"从右眼尾射向右上")。
-            //   判定 lwe 此处 ≠ 真 WE(同 ropetrail 先例:lwe 实现≠WE 真义)。WP_TURB_IOSPEED=1 退回 lwe 行为(A/B)。
-            //   ⚠️库级影响:所有 turbulentvelocityrandom + speed override 的粒子(烟/光等)初速回到 pkg 原值。
-            let turbSpeedScale = ProcessInfo.processInfo.environment["WP_TURB_IOSPEED"] != nil ? desc.ioSpeed : 1
+            // ⭐湍流初速**默认乘** instanceoverride.speed(= lwe CParticle.cpp:928 忠实做法):
+            //   2026-06-20 用户用新 WE 实拍(iShot 19.17.53)定:御剑眼焰是**短促紧凑贴眼**的,对应 0.6×250=150px/s
+            //   (lwe 行为),**推翻** 2026-06-10 旧决策(那次按另一张实测设成全速 250 = 偏高偏飘,与新 WE 矛盾)。
+            //   铁律 WE 实渲=最终真值 → 以新 WE 图为准回归 lwe。WP_TURB_FULLSPEED=1 退回旧全速 250(A/B)。
+            //   ⚠️库级影响:所有 turbulentvelocityrandom + speed override 的粒子(烟/光等)初速 = pkg 原值×override(lwe 同)。
+            let turbSpeedScale = WPEnv.vars["WP_TURB_FULLSPEED"] != nil ? 1 : desc.ioSpeed
             vel += result * rnd(desc.turbSpeedMin, desc.turbSpeedMax) * turbSpeedScale
         }
         // 精灵朝向(WE ComputeParticleTangents,common_particles.h:21):普通精灵恒用 **rotation**
@@ -995,7 +1133,7 @@ final class ParticleSimulator {
             spawnColor = ParticleSimulator.hsv2rgb(rnd(desc.hueMin, desc.hueMax),
                                                    rnd(desc.satMin, desc.satMax),
                                                    rnd(desc.valMin, desc.valMax))
-        } else if ProcessInfo.processInfo.environment["WP_COLORRAND_PERCH"] != nil {
+        } else if WPEnv.vars["WP_COLORRAND_PERCH"] != nil {
             spawnColor = rnd3(desc.colorMin, desc.colorMax)
         } else {
             let t = rnd(); spawnColor = desc.colorMin + (desc.colorMax - desc.colorMin) * t
@@ -1173,7 +1311,7 @@ final class ParticleSimulator {
         //   实测纯白贴图也碎=纯几何问题,非贴图/UV)。向心参数化(knot 间距=|Δp|^0.5)数学上保证样条不越出
         //   控制点凸包、无环、无尖点,过同样的点 → 平滑连续拖尾(= 真 WE 观感)。lwe 用均匀=lwe≠真 WE。
         //   均匀间距(闪电/绳索类密集粒子)下向心≈均匀,零差异 → 不影响其它 rope。WP_UNIFORM_ROPE 退回均匀。
-        let useCentripetal = ProcessInfo.processInfo.environment["WP_UNIFORM_ROPE"] == nil
+        let useCentripetal = WPEnv.vars["WP_UNIFORM_ROPE"] == nil
 
         func catmullRom(_ p0: SIMD2<Float>, _ p1: SIMD2<Float>, _ p2: SIMD2<Float>, _ p3: SIMD2<Float>, _ t: Float) -> SIMD2<Float> {
             if useCentripetal {
@@ -1285,16 +1423,16 @@ final class ParticleSimulator {
 
     /// 输出当前所有粒子的渲染实例(世界像素坐标 + 当前 alpha/size/旋转/颜色)。
     // controlpointattract 力学剖面退路:WP_CPATTRACT_CONST=1 退回 lwe 半径内恒力(无衰减)。
-    static let cpAttractConstForce = ProcessInfo.processInfo.environment["WP_CPATTRACT_CONST"] != nil
+    static let cpAttractConstForce = WPEnv.vars["WP_CPATTRACT_CONST"] != nil
     // alphafade 语义:默认按真 WE「fadeouttime=淡出时长(最后 fadeOut)」;WP_FADE_STARTPOINT 退回 lwe「淡出起点」。
-    static let fadeStartPoint = ProcessInfo.processInfo.environment["WP_FADE_STARTPOINT"] != nil
+    static let fadeStartPoint = WPEnv.vars["WP_FADE_STARTPOINT"] != nil
 
     // 精灵宽度语义【2026-06-11 WE 实机截图裁决】:全宽 = pkg/2(= p.size 半径值直接当 quad 宽)。
     // 曾推断「lwe /2 + shader ±0.5 两头减半=半大」并 ×2,但 Postscript 鸟 WE 实测(画布≈1:1 截图)
     // 暗斑宽中位 ~6/主体 3-12px,半幅版中位 8/4-11 吻合、×2 版中位 17 恰好大一倍 → ×2 证伪回滚。
     // 即 WE 的 CPU 喂给 shader 的 size 属性本身就是 pkg/2(lwe CParticle.cpp:738 是对的)。
     // WP_SPRITE_FULL=1 = 诊断用全宽(pkg 值)。
-    static let spriteHalfLegacy = ProcessInfo.processInfo.environment["WP_SPRITE_FULL"] == nil
+    static let spriteHalfLegacy = WPEnv.vars["WP_SPRITE_FULL"] == nil
 
     func instances() -> [ParticleInstance] {
         particles.map { p in
@@ -1406,7 +1544,8 @@ enum ParticleParser {
     static func parseLayers(scene: [String: Any], source: SceneSource,
                             effectiveVisible: (Int) -> Bool = { _ in true },
                             absoluteOrigin: (Int) -> SIMD3<Float> = { _ in .zero },
-                            absoluteScale: (Int) -> SIMD3<Float> = { _ in SIMD3(1, 1, 1) }) -> [ParticleEmitterDesc] {
+                            absoluteScale: (Int) -> SIMD3<Float> = { _ in SIMD3(1, 1, 1) },
+                            effectiveParallax: (Int) -> SceneParallaxState = { _ in SceneParallaxState() }) -> [ParticleEmitterDesc] {
         let objects = scene["objects"] as? [[String: Any]] ?? []
         // 后处理层(fullscreenlayer:bloom/filmgrain/...)在场景对象序列中的下标(可见且带 effect 的)。
         // 排在它**之后**的粒子层不被后处理(见 ParticleEmitterDesc.aboveBloom)。无则为 Int.max(都在其下)。
@@ -1441,10 +1580,11 @@ enum ParticleParser {
                 desc.layerOrigin = SIMD2(layerOrigin.x, layerOrigin.y)
                 desc.layerScale = SIMD2(layerScale.x, layerScale.y)  // 逐轴各向异性缩放
                 desc.layerAngleZ = VecParse.f3(obj["angles"]).z   // 图层倾斜(雨丝斜下,WE 弧度)
-                // 鼠标视差深度:图像/文字层已做、粒子层原来漏了(眼焰 vapor 粒子 parallaxDepth=1.3 → 鼠标移动时
-                //   脸图层跟着视差移、眼焰粒子不动 → 火焰脱离眼睛偏移)。照图像层同 parallaxOffset 公式在 encode 平移投影。
-                let pd = VecParse.f3(obj["parallaxDepth"], default: SIMD3(1, 1, 1))
-                desc.parallaxDepth = SIMD2(pd.x, pd.y)
+                // 粒子与图像层共用同一父级传播控制节点；0 深度必须保持 0，不能再强钳到 0.65。
+                let ps = objId >= 0 ? effectiveParallax(objId) : SceneParallaxState()
+                desc.parallaxDepth = ps.depth
+                desc.parallaxAnchorPx = ps.anchorPx
+                desc.parallaxAnchorId = ps.anchorId
                 // instanceoverride:alpha(图层级整体透明度)+ colorn/color(实例染色乘子,乘进每粒子色;
                 // 如 2B 壁纸把玫瑰花瓣染暗红配红花田。漏掉 colorn → 花瓣显基色粉白被误认成"樱花")。
                 // controlpointattract 中心解析(见 CPAttract 注释):io "controlpointN"(世界)> worldSpace offset(世界)> 局部 offset。
@@ -1470,10 +1610,12 @@ enum ParticleParser {
                     // 顶层(build 里 L1103)读过,对象级这里漏读 → 像雾林 halo_2(对象级 count 0.41/size 0.44)被按
                     // 全尺寸全数量渲染 → 又大又多的折射 halo 透出暗青雾 = 满屏青碎片。WE 把对象级覆盖作乘子叠加,
                     // 此处补齐(乘进 build 已设的预设级值)。对照 ObjectParser.cpp:1097 + Object.h:532。
-                    if let v = VecParse.unwrap(io["count"])    as? NSNumber { desc.maxCount = max(0, Int(Float(desc.maxCount) * v.floatValue)) }
+                    // count:script 包裹的昼夜/天气粒子(萤火虫/蝴蝶/星/雨)取稳态乘子(见 scriptedMul),
+                    // 否则就是原 unwrap 值 → 修「夜间粒子 value=0 → maxCount=0 一只不发」。
+                    if let v = scriptedMul(io["count"], key: "count") { desc.maxCount = max(0, Int(Float(desc.maxCount) * v)) }
                     if let v = VecParse.unwrap(io["size"])     as? NSNumber { desc.ioSize     *= v.floatValue }
                     if let v = VecParse.unwrap(io["speed"])    as? NSNumber { desc.ioSpeed    *= v.floatValue }
-                    if let v = VecParse.unwrap(io["rate"])     as? NSNumber { desc.rate       *= v.floatValue }
+                    if let v = scriptedMul(io["rate"], key: "rate")  { desc.rate       *= v }
                     if let v = VecParse.unwrap(io["lifetime"]) as? NSNumber { desc.ioLifetime *= v.floatValue }
                     var tint: SIMD3<Float>? = nil
                     if let s = VecParse.unwrap(io["colorn"]) as? String {           // 归一化 0-1
@@ -1481,7 +1623,46 @@ enum ParticleParser {
                     } else if let s = VecParse.unwrap(io["color"]) as? String {     // 0-255
                         let v = VecParse.floats(s); if v.count >= 3 { tint = SIMD3(v[0]/255, v[1]/255, v[2]/255) }
                     }
-                    if let t = tint { desc.colorMin *= t; desc.colorMax *= t }
+                    if let t = tint {
+                        // 默认(WE/lwe 忠实):colorn 作乘子稀释 colorrandom 基底。
+                        // ⭐眼焰修复(御剑驭龙 3233141951,以 WE 实渲为最终真值):焰 beam 的 colorrandom 基底是
+                        // 接近中性灰(min≈max≈0.78),作者用 instanceoverride.colorn 把焰**指定**成饱和蓝(0.498,
+                        // 0.624,0.980)/粉(0.973,0.749,0.914)。乘法 = 灰×蓝 → 焰带蓝像素饱和度只剩 0.26、G 通道
+                        // 没被压低 = 泛灰泛白(WE 实测焰带饱和 0.46、G 远低于 R/B 的饱和蓝紫)。WE 实渲眼焰是
+                        // **饱和蓝紫带亮蓝芯**,我方乘灰基底冲淡了作者明确指定的有色 tint。
+                        // 修:当 colorn 是「高饱和有色 tint」且 colorrandom 基底是「接近中性灰」时,不让灰基底稀释
+                        // colorn —— 直接以 colorn 为焰色基(保住作者指定的蓝紫饱和度),并保留基底的明度(luma)缩放,
+                        // 这样既忠实作者意图(蓝/粉)又不凭空提亮。lwe 一律乘灰 = 不一定对(用户铁律:lwe 仅参考)。
+                        // 仅命中「有色 colorn × 灰基底」的少数壁纸(焰组);2B 玫瑰(暗红 colorn × 红花田基底,基底非灰)
+                        // 不触发、继续走乘法。WP_NO_FLAME_SAT=1 退回旧的纯乘法(A/B 诊断)。
+                        let tintSat = ParticleSimulator.colorSaturation(t)
+                        let baseGray = ParticleSimulator.isNeutralGray(desc.colorMin) && ParticleSimulator.isNeutralGray(desc.colorMax)
+                        if WPEnv.vars["WP_FLAME_DIAG"] != nil {
+                            FileHandle.standardError.write("[FLAMEDIAG] colorn=\(t) tintSat=\(tintSat) base min=\(desc.colorMin) max=\(desc.colorMax) baseGray=\(baseGray)\n".data(using: .utf8)!)
+                        }
+                        // 焰判据:有色 colorn(sat>0.20,含较淡的粉焰 0.23)× 中性灰基底。比照蓝/粉两焰组
+                        // (sat 0.49/0.23),阈值 0.20 同时纳入粉焰;2B 红玫瑰基底非灰(baseGray=false)不触发。
+                        if WPEnv.vars["WP_NO_FLAME_SAT"] == nil,
+                           tintSat > 0.20, baseGray {
+                            desc.isEyeFlame = true   // 渲染端默认 additive 合成(WP_NO_FLAME_ADDITIVE 退回 translucent)
+                            // 〔已撤回 2026-06-21〕御剑眼焰 forward 倾角(-36°)位置修改按用户要求撤回(没改对):
+                            //   焰用默认 forward=(0,1,0)(= lwe ObjectParser 缺省),不再人为抬 X 分量。
+                            //   御剑「位置不对」待重新结合 pkg + WE 截图精确定位后再处理。
+                            // 基底明度(灰阶级别,如 0.78)作为 colorn 的亮度缩放,保留作者饱和色相。
+                            let baseLuma = max(0.001, (desc.colorMin.x + desc.colorMin.y + desc.colorMin.z) / 3)
+                            // 饱和+紫调校正:WE 实渲焰带是**偏紫**的蓝(R≈B>G,焰带均值(114,76,147)G 最低),
+                            // 而 colorn 蓝是青蓝(G 居中,99,124,195)。saturateColor 围绕 luma 增饱和会抬 G(方向错),
+                            // 改用 toFlameHue:在保亮度前提下把 G 通道往下压(蓝紫化)+ 整体增饱和 → 匹配 WE 紫蓝焰。
+                            // 强度 satK(WP_FLAME_SAT_K,默认 2.2;实测把焰核 sat 0.28→0.39、G 164→143);clamp 防越界。
+                            let satK = Float(WPEnv.vars["WP_FLAME_SAT_K"] ?? "") ?? 2.2
+                            let shaped = ParticleSimulator.toFlameHue(t, satK)
+                            // colorn 已是 [0,1] 归一蓝/粉;× baseLuma 还原 beam 原本的亮度档(≈0.78)。
+                            desc.colorMin = shaped * baseLuma
+                            desc.colorMax = shaped * baseLuma
+                        } else {
+                            desc.colorMin *= t; desc.colorMax *= t
+                        }
+                    }
                 }
                 if let c = obj["color"], let arr = (VecParse.unwrap(c) as? String).map(VecParse.floats), arr.count >= 3 {
                     let tint = SIMD3(arr[0], arr[1], arr[2]); desc.colorMin = tint; desc.colorMax = tint  // 对象级整体染色
@@ -1527,7 +1708,7 @@ enum ParticleParser {
                     // honor probability(0 → 跳过不建)。**不**在 t=0 自动 instantaneous(由父死亡运行期驱动)。
                     // WP_NO_EVENTDEATH=1 整体关闭(不建任何 eventdeath child → 父子均如基线无 burst)。
                     if childType == "eventdeath" {
-                        if ProcessInfo.processInfo.environment["WP_NO_EVENTDEATH"] != nil { continue }
+                        if WPEnv.vars["WP_NO_EVENTDEATH"] != nil { continue }
                         let prob = (child["probability"] as? NSNumber)?.floatValue ?? 1
                         if prob <= 0 { continue }   // probability 0 = 该 child 不参与(fireworkshitdistort 等可被作者关掉)
                         cdesc.isEventDeath = true
@@ -1538,6 +1719,52 @@ enum ParticleParser {
                         applyChildTransform(&cdesc, child)
                         // 父也打同 tag,运行期把父死亡末位置中继给该 child sim。
                         if let pi = parentResultIndex { result[pi].eventDeathGroupTag = objId }
+                        result.append(cdesc)
+                        continue
+                    }
+                    // ── 直挂 spawner 的 eventfollow 子(萤火虫拖尾 firefliestrail):被跟随的「头」=**父 spawner 自身的
+                    // 粒子**(散布的萤火虫),不是某个 grandchild 头。复用 ghost-头机制:ghost 头按**父 spawner 的发射器**
+                    // (boxrandom distMin..distMax)在盒内散布出生,每个 ghost 头按 trail 自身 rate 发 trail 子粒子。
+                    // 缺此分流(旧码)→ 该子被当**独立 sphere 发射器**喷在层原点(distMax=5)→ 25 个拖尾粒子全堆在
+                    // 画面正中=中心亮团(真因)。WP_NO_EVENTFOLLOW_CHILD=1 退回旧行为(A/B)。
+                    if childType == "eventfollow",
+                       WPEnv.vars["WP_NO_EVENTFOLLOW_CHILD"] == nil,
+                       let pEm = (pj["emitter"] as? [[String: Any]])?.first {
+                        cdesc.eventFollow = true
+                        // 父头出生几何 = spawner 发射器(boxrandom 散布;sphere/单点 fallback 也支持)。
+                        let pName = (pEm["name"] as? String) ?? "sphererandom"
+                        cdesc.efHeadIsBox = pName.contains("box")
+                        cdesc.efHeadOrigin = VecParse.f3(pEm["origin"])
+                        cdesc.efHeadDistMin = VecParse.f3(pEm["distancemin"], default: .zero)
+                        cdesc.efHeadDistMax = VecParse.f3(pEm["distancemax"], default: SIMD3(256, 256, 0))
+                        if let n = pEm["distancemin"] as? NSNumber { let v = n.floatValue; cdesc.efHeadDistMin = SIMD3(v, v, 0) }
+                        if let n = pEm["distancemax"] as? NSNumber { let v = n.floatValue; cdesc.efHeadDistMax = SIMD3(v, v, 0) }
+                        cdesc.efHeadDirections = VecParse.f3(pEm["directions"], default: SIMD3(1, 1, 0))
+                        cdesc.efHeadRate = (pEm["rate"] as? NSNumber)?.floatValue ?? 1
+                        // 父头寿命 = spawner lifetimerandom(萤火虫 8-15s);ghost 头按此时长在盒内闪现再换位。
+                        var hLifeMin: Float = 8, hLifeMax: Float = 15
+                        for ini in pj["initializer"] as? [[String: Any]] ?? [] where (ini["name"] as? String) == "lifetimerandom" {
+                            hLifeMin = (ini["min"] as? NSNumber)?.floatValue ?? hLifeMin
+                            hLifeMax = (ini["max"] as? NSNumber)?.floatValue ?? hLifeMax
+                        }
+                        cdesc.efHeadLifeMin = hLifeMin; cdesc.efHeadLifeMax = hLifeMax
+                        // 头数上限 = 父 maxcount(同时存活的萤火虫数);ghost 头不超过它,trail 子粒子各头独立发。
+                        cdesc.efHeadMaxCount = max(1, (pj["maxcount"] as? NSNumber)?.intValue ?? 100)
+                        cdesc.efHeadVelocity = .zero   // 萤火虫头无确定性下落(散布闪现),ghost 头停留盒内位置
+                        // 捕获父 spawner 的 turbulence → ghost 头随父湍流游走(聚团修,见 GhostHead wander 注释)。
+                        //   父无 turbulence(matrix 头)→ efHeadTurb 留 false 不漂移(零回归)。
+                        for pop in pj["operator"] as? [[String: Any]] ?? [] where (pop["name"] as? String) == "turbulence" {
+                            cdesc.efHeadTurb = true
+                            cdesc.efHeadTurbScale = (pop["scale"] as? NSNumber)?.floatValue ?? 0.005
+                            cdesc.efHeadTurbTimeScale = (pop["timescale"] as? NSNumber)?.floatValue ?? 0.01
+                            let sMin = (pop["speedmin"] as? NSNumber)?.floatValue ?? 500
+                            let sMax = (pop["speedmax"] as? NSNumber)?.floatValue ?? 1000
+                            cdesc.efHeadTurbSpeed = (sMin + sMax) * 0.5   // 头用区间中值(确定性,父逐发射器随机一次)
+                            cdesc.efHeadTurbMask = VecParse.f3(pop["mask"], default: SIMD3(1, 1, 0))
+                        }
+                        if let mc = (child["maxcount"] as? NSNumber)?.intValue { cdesc.maxCount = mc }
+                        applyObjectLayer(&cdesc)
+                        applyChildTransform(&cdesc, child)
                         result.append(cdesc)
                         continue
                     }
@@ -1686,14 +1913,14 @@ enum ParticleParser {
                 // 旧实现 min 默认白 → 缺 min 的 colorrandom(如 getsuga 拖尾 child max"0 0 0" 无 min)
                 // 渲成 lerp(白,黑)=灰,WE 真值是 lerp(黑,黑)=纯黑。WP_NO_COLORRAND_BLACK_DEFAULT=1 退回旧白默认(A/B)。
                 let colorMinDefault: SIMD3<Float> =
-                    ProcessInfo.processInfo.environment["WP_NO_COLORRAND_BLACK_DEFAULT"] != nil
+                    WPEnv.vars["WP_NO_COLORRAND_BLACK_DEFAULT"] != nil
                     ? SIMD3(255, 255, 255) : SIMD3(0, 0, 0)
                 d.colorMin = VecParse.f3(ini["min"], default: colorMinDefault) / 255
                 d.colorMax = VecParse.f3(ini["max"], default: SIMD3(255,255,255)) / 255
             case "hsvcolorrandom":
                 // WE 真特性(lwe 无):h/s/v 各通道独立随机范围,spawn 时 hsv2rgb 得粒子色。
                 // 缺省取全域(h 0..1 / s 0..1 / v 0..1);本壁纸只给 huemin/huemax/satmin/valmin → max 默认 1。
-                if ProcessInfo.processInfo.environment["WP_NO_HSVCOLOR"] == nil {
+                if WPEnv.vars["WP_NO_HSVCOLOR"] == nil {
                     d.hasHSVColor = true
                     d.hueMin = num(ini["huemin"], 0);        d.hueMax = num(ini["huemax"], 1)
                     d.satMin = num(ini["saturationmin"], 0); d.satMax = num(ini["saturationmax"], 1)
@@ -1954,6 +2181,57 @@ enum ParticleParser {
 
     private static func num(_ v: Any?, _ def: Float) -> Float {
         (v as? NSNumber)?.floatValue ?? def
+    }
+
+    /// instanceoverride 的 count/rate 乘子取值。多数壁纸里这是裸数字或 {user,value}(VecParse.unwrap 直接解出)。
+    /// 但**昼夜/天气事件驱动**的粒子(白影 3497488774 萤火虫/蝴蝶/星星/雨,御剑等同框架)把 count/rate 包成
+    ///   {"script": "...count = tsNightFactor*(1-rdFactorForAnimals)*scriptProperties.count...",
+    ///    "scriptproperties": {"count": {"user":"ff_count","value":1}}, "value": 0.0}
+    /// 其中**顶层 value 是脚本跑前的初始值(0)**,真正稳态值由脚本经 tsNightUpdate/rainyDayUpdate 事件算出:
+    /// count = <时段/天气因子> × scriptProperties.count。引擎不实现 WE 的 time_switching 事件框架,VecParse.unwrap
+    /// 只会拿到陈旧的 value=0 → maxCount = 100×0 = 0 → 萤火虫等夜间粒子**一只都不发射**。
+    /// ⭐2026-06-20 按 pkg 公式完整实现(用户:「萤火虫全部按 pkg 来做」「有的地方太亮了」=日间不该出现的萤火虫):
+    ///   count = <时段因子>(tsNightFactor/tsDayFactor/…)× (1-rdFactorForAnimals) × scriptProperties.count。
+    ///   时段因子按脚本引用的因子名,从**当前本地时间档**算(与 time_switching/timeStageValue 同阈值):
+    ///     stage: <05:30 或 ≥19:00=夜(0/4)、05:30-07:30=晨(1)、07:30-18:00=日(2)、18:00-19:00=昏(3)。
+    ///     tsNightFactor=max(0,|stage-2|-1)=夜1其余0;tsDayFactor=max(0,1-|stage-2|)=日1;晨/昏同理。
+    ///   → **萤火虫(tsNightFactor)日间=0 一只不出**(对齐 WE 日间无萤火虫)、夜间=ff_count;蝴蝶(tsDayFactor)反之。
+    ///   rdFactorForAnimals(雨天减动物)暂默认 0(天气 rainyDayUpdate 随机态未建模,默认不下雨→1-0=1)。
+    ///   WP_FORCE_HOUR 覆盖测各档;WP_NO_PARTICLE_TIMEFACTOR=1 退回旧(因子=1 全时段渲,A/B);WP_NO_PARTICLE_SCRIPT_COUNT 全退。
+    private static func scriptedMul(_ field: Any?, key: String) -> Float? {
+        if let n = VecParse.unwrap(field) as? NSNumber, CFGetTypeID(n) != CFBooleanGetTypeID() {
+            if let dict = field as? [String: Any], let script = dict["script"] as? String,
+               WPEnv.vars["WP_NO_PARTICLE_SCRIPT_COUNT"] == nil {
+                // base = scriptProperties[key](ff_count/bf_count… 用户可控,默认 1)。
+                var base: Float = n.floatValue
+                if let sp = dict["scriptproperties"] as? [String: Any],
+                   let inner = VecParse.unwrap(sp[key]) as? NSNumber, CFGetTypeID(inner) != CFBooleanGetTypeID() {
+                    base = inner.floatValue
+                }
+                // 时段因子(按脚本引用名乘):WP_NO_PARTICLE_TIMEFACTOR 退回旧「因子恒 1」。
+                if WPEnv.vars["WP_NO_PARTICLE_TIMEFACTOR"] != nil { return base }
+                let f = particleTimeFactors()
+                var factor: Float = 1
+                if script.contains("tsNightFactor")   { factor *= f.night }
+                if script.contains("tsDayFactor")     { factor *= f.day }
+                if script.contains("tsMorningFactor") { factor *= f.morning }
+                if script.contains("tsSunsetFactor")  { factor *= f.sunset }
+                return base * factor   // rdFactorForAnimals 默认 0(不下雨)→ (1-0)=1 已含
+            }
+            return n.floatValue
+        }
+        return nil
+    }
+
+    /// 当前本地时间档的时段因子(与 SceneRenderEngine.timeStageValue 同阈值/同 updateStageFactors 公式)。
+    /// 供 scriptedMul 按 pkg 公式给昼夜粒子(萤火虫只夜出/蝴蝶只昼出)算 count。WP_FORCE_HOUR 覆盖。
+    private static func particleTimeFactors() -> (night: Float, day: Float, morning: Float, sunset: Float) {
+        // ⭐与 LUT/调色同源:VecParse.effectiveTimeStage(连通 ts_mode 锁定/自定义阈值)→ 锁定夜晚时萤火虫出、日间不出。
+        let stage = VecParse.effectiveTimeStage()
+        return (night:   max(0, abs(stage - 2) - 1),
+                day:     max(0, 1 - abs(stage - 2)),
+                morning: max(0, 1 - abs(stage - 1)),
+                sunset:  max(0, 1 - abs(stage - 3)))
     }
 
     // 【审计修复】确定性 RNG 辅助(替代 turbulence 里的系统 Float.random)。与 ParticleSimulator.rnd()

@@ -2,7 +2,7 @@ import Foundation
 
 /// 统一访问一个 scene 壁纸的内部文件。
 /// 既支持已解包的文件夹(如样本 3504284734),也支持打包的 scene.pkg。
-protocol SceneSource {
+protocol SceneSource: AnyObject {
     func data(for relativePath: String) -> Data?
     var allPaths: [String] { get }
 }
@@ -105,7 +105,24 @@ final class PackageSceneSource: SceneSource {
 /// 到兄弟工坊目录 <libraryRoot>/<id>/ 里取真实文件,而不是自造一张糊弄。
 /// 未订阅该依赖(本地没有 <id>/)时返回 nil —— 上层据此跳过该发射器,宁可不画也不画假的。
 enum CrossWorkshopAssets {
-    private static var cache: [String: SceneSource?] = [:]
+    /// 依赖项的**轻量**定位结果(只缓存「在哪/是否存在」,不持有 pkg 字节)。
+    /// `.pkg(url)` = 打包依赖,需开 PackageSceneSource(把整包读进内存);`.folder(url)` = 松散目录;
+    /// `.missing` = 找过但本地没订阅(避免每次重复 fileExists)。
+    private enum Location { case pkg(URL); case folder(URL); case missing }
+    // ⚠ 内存泄漏修复:此前缓存的是 `SceneSource?`,而 PackageSceneSource 会把**整包字节**(可达数百 MB)
+    //   读进 RAM 并按 id 永久驻留 → 浏览/渲染含跨工坊依赖的壁纸越多,这个 static 字典越大(无上限、永不清)
+    //   = 进程内存只涨不回收(实测 374MB→1.38GB 的主因之一)。改为只缓存「定位结果」(URL/枚举,几十字节),
+    //   重的 PackageSceneSource 只在单次 textureData/textureSidecar 调用内**短暂**存在、函数返回即释放。
+    private static var locationCache: [String: Location] = [:]
+    private static let lock = NSLock()
+
+    /// 重的 SceneSource 临时复用缓存:一次 load 内同一依赖常被取多张贴图,逐张重开整包浪费。
+    /// 用 NSCache(系统内存吃紧时自动逐出,且有 count 上限)托管,既复用又不会无界驻留。
+    private static let sourceCache: NSCache<NSString, AnyObject> = {
+        let c = NSCache<NSString, AnyObject>()
+        c.countLimit = 4   // 同时最多缓存 4 个依赖源;再多按 LRU 逐出(整包字节随之释放)
+        return c
+    }()
 
     /// ref 形如 "workshop/<id>/<rest>";到兄弟项目里取 <rest> 对应的 .tex 字节。
     static func textureData(forReference ref: String) -> Data? {
@@ -129,20 +146,30 @@ enum CrossWorkshopAssets {
         return src.data(for: "materials/\(rest).tex-json") ?? src.data(for: "\(rest).tex-json")
     }
 
-    private static func source(forWorkshopId id: String) -> SceneSource? {
-        if let cached = cache[id] { return cached }   // 含「找过但没有」(.some(nil))
+    private static func location(forWorkshopId id: String) -> Location {
+        if let cached = locationCache[id] { return cached }
         let folder = PreferencesStore.shared.libraryRoot.appendingPathComponent(id)
         let fm = FileManager.default
-        var src: SceneSource? = nil
+        var loc: Location = .missing
         if fm.fileExists(atPath: folder.path) {
             let pkg = folder.appendingPathComponent("scene.pkg")
-            if fm.fileExists(atPath: pkg.path) {
-                src = PackageSceneSource(pkgURL: pkg)
-            } else {
-                src = FolderSceneSource(root: folder)   // 松散 materials/ 也能直接读
-            }
+            loc = fm.fileExists(atPath: pkg.path) ? .pkg(pkg) : .folder(folder)
         }
-        cache[id] = src
+        locationCache[id] = loc
+        return loc
+    }
+
+    private static func source(forWorkshopId id: String) -> SceneSource? {
+        lock.lock(); defer { lock.unlock() }
+        // 临时复用缓存命中(NSCache,内存吃紧时已被系统逐出 → 重新开)。
+        if let cached = sourceCache.object(forKey: id as NSString) as? SceneSource { return cached }
+        let src: SceneSource?
+        switch location(forWorkshopId: id) {
+        case .pkg(let url):    src = PackageSceneSource(pkgURL: url)   // 整包字节:仅存活于 NSCache(可被逐出),不再永久驻留
+        case .folder(let url): src = FolderSceneSource(root: url)     // 松散 materials/ 也能直接读(本就不持字节)
+        case .missing:         src = nil
+        }
+        if let src { sourceCache.setObject(src as AnyObject, forKey: id as NSString) }
         return src
     }
 }

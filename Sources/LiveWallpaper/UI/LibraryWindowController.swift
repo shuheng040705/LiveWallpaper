@@ -24,6 +24,10 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
     func show(currentID: String?) {
         self.currentID = currentID
 
+        // 库窗口打开 → 允许渲染壁纸预览回退图(近全黑首帧的场景卡片);窗口关/最小化时停。
+        // 后台壁纸进程平时(无库窗口)不渲库预览,避免与正在播放的桌面壁纸抢 GPU/CPU。
+        RenderedPreviewCache.shared.setWindowVisible(true)
+
         // 升为常规 app,使窗口受台前调度/常规激活管理。
         NSApp.setActivationPolicy(.regular)
 
@@ -62,8 +66,8 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
     /// 用 cacheDisplay 直接渲染视图层(不依赖窗口前台/窗口ID/录屏权限),彻底避开截图抓错窗口的问题。
     /// WP_UI_SHOT_DELAY 调延迟(默认 4s,等缩略图加载)。生产不设这些 env 时无任何影响。
     private func captureIfRequested() {
-        guard let path = ProcessInfo.processInfo.environment["WP_UI_SHOT"], let w = window else { return }
-        let delay = Double(ProcessInfo.processInfo.environment["WP_UI_SHOT_DELAY"] ?? "4") ?? 4
+        guard let path = WPEnv.vars["WP_UI_SHOT"], let w = window else { return }
+        let delay = Double(WPEnv.vars["WP_UI_SHOT_DELAY"] ?? "4") ?? 4
         DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
             if let cv = w.contentView,
                let rep = cv.bitmapImageRepForCachingDisplay(in: cv.bounds) {
@@ -76,9 +80,18 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
         }
     }
 
-    /// 窗口关闭:降回菜单栏代理(不占 Dock、不在台前调度里逗留)。
+    /// 窗口关闭:降回菜单栏代理(不占 Dock、不在台前调度里逗留),并停掉壁纸预览渲染。
     func windowWillClose(_ notification: Notification) {
+        RenderedPreviewCache.shared.setWindowVisible(false)
         NSApp.setActivationPolicy(.accessory)
+    }
+
+    /// 最小化:库不可见 → 停壁纸预览渲染(还原时再开)。
+    func windowDidMiniaturize(_ notification: Notification) {
+        RenderedPreviewCache.shared.setWindowVisible(false)
+    }
+    func windowDidDeminiaturize(_ notification: Notification) {
+        RenderedPreviewCache.shared.setWindowVisible(true)
     }
 
     func updateCurrent(_ id: String?) {

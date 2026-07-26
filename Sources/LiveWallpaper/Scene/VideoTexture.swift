@@ -114,9 +114,13 @@ final class VideoTexture {
     /// 把本帧产出的视频缓冲挂到命令缓冲的完成回调,GPU 读完才释放(消除撕裂)。
     /// 渲染引擎在 commit 前对每个视频图层调用。
     func attachRetention(to cmd: MTLCommandBuffer) {
-        guard !pending.isEmpty else { return }
+        // 与 currentTexture() 对 pending 的 append 使用同一把锁。只在锁内完成原子「交换」,
+        // completion handler 的注册放在锁外,避免 Metal 驱动调用进入锁区。
+        avLock.lock()
         let hold = pending
         pending.removeAll(keepingCapacity: true)
+        avLock.unlock()
+        guard !hold.isEmpty else { return }
         cmd.addCompletedHandler { _ in _ = hold }   // 闭包持有到 GPU 完成,之后释放
     }
 

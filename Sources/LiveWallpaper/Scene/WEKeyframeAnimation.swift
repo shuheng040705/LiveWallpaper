@@ -114,9 +114,16 @@ struct WEKeyframeAnimation {
         let t: Float
         switch mode {
         case .single: t = min(max(frame, 0), length)
-        case .loop:   t = length > 0 ? frame.truncatingRemainder(dividingBy: length) : 0
+        case .loop:
+            if length > 0 {
+                let phase = frame.truncatingRemainder(dividingBy: length)
+                t = phase < 0 ? phase + length : phase
+            } else {
+                t = 0
+            }
         case .mirror:                                   // 三角波:0→length→0
-            let p = length > 0 ? frame.truncatingRemainder(dividingBy: 2 * length) : 0
+            let raw = length > 0 ? frame.truncatingRemainder(dividingBy: 2 * length) : 0
+            let p = raw < 0 ? raw + 2 * length : raw
             t = p <= length ? p : (2 * length - p)
         }
         var out: [Float] = []

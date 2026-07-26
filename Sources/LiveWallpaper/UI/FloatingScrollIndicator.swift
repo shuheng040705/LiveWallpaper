@@ -58,7 +58,7 @@ extension View {
 private struct FloatingScrollIndicatorModifier: ViewModifier {
     @State private var metrics = ScrollMetrics()
     // WP_SCROLLBAR_DEBUG=1 时强制常显(截图验证用),生产为 false 走正常淡入淡出。
-    @State private var visible = ProcessInfo.processInfo.environment["WP_SCROLLBAR_DEBUG"] != nil
+    @State private var visible = WPEnv.vars["WP_SCROLLBAR_DEBUG"] != nil
     @State private var hideWork: DispatchWorkItem?
     @State private var isHovering = false
 
@@ -67,7 +67,7 @@ private struct FloatingScrollIndicatorModifier: ViewModifier {
     private let thumbWidth: CGFloat = 5
     private let minThumbHeight: CGFloat = 36
     private let verticalPadding: CGFloat = 8 // 上下留白
-    private var forceVisible: Bool { ProcessInfo.processInfo.environment["WP_SCROLLBAR_DEBUG"] != nil }
+    private var forceVisible: Bool { WPEnv.vars["WP_SCROLLBAR_DEBUG"] != nil }
 
     func body(content: Content) -> some View {
         GeometryReader { geo in

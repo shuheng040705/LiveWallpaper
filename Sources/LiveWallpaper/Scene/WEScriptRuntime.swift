@@ -10,6 +10,21 @@ import JavaScriptCore
 ///   - 每次刷新调用 update(currentValue),拿返回值(String / Vec3)。
 /// JSC 原生支持 new Date()。脚本抛错/用到不可用 API 时,调用方回退到旧近似(并 Log)。
 final class WEScript {
+    /// 注入脚本上下文的 scene 对象元数据。这里保留的是 pkg 的局部变换，
+    /// 因为 WE 脚本通过 `parent.origin + thisLayer.origin` 等方式自行组合父子坐标。
+    struct SceneLayerDefinition: Equatable {
+        var id: Int
+        var name: String
+        var parentId: Int?
+        var visible: Bool
+        var alpha: Float
+        var color: SIMD4<Float>
+        var origin: SIMD3<Float>
+        var scale: SIMD3<Float>
+        var angles: SIMD3<Float>
+        var size: SIMD2<Float>
+    }
+
     enum Result {
         case string(String)
         case vec3(SIMD3<Float>)
@@ -17,15 +32,25 @@ final class WEScript {
     }
 
     private let context = JSContext()!
+    /// 已安装对象树。相同定义重复传入时必须保持 JS 对象身份：脚本常在 init 中缓存 parent，
+    /// 若 SceneRenderEngine.load 再建一遍，缓存引用会与 thisScene/getParent 的新注册表分叉。
+    private var installedSceneLayerDefs: [SceneLayerDefinition]? = nil
     private let updateFn: JSValue?
     /// 脚本声明的属性最终值(name → JS 值),已套用图层覆盖。供调试 / 日志。
     private(set) var resolvedProps: [String: Any] = [:]
     /// JS 异常标记。用 class 引用盒,避免在 init 里 exceptionHandler 闭包过早捕获 self。
-    private final class Flag { var hit = false }
+    private final class Flag {
+        var hit = false
+        var formattingException = false
+        var exception: JSValue? = nil
+    }
     private let exFlag = Flag()
     var didFail: Bool {
         get { exFlag.hit }
-        set { exFlag.hit = newValue }
+        set {
+            exFlag.hit = newValue
+            if !newValue { exFlag.exception = nil }
+        }
     }
     let sourceTag: String        // 仅用于日志(图层名)
 
@@ -45,6 +70,9 @@ final class WEScript {
     private let mediaPropertiesChangedFn: JSValue?
     private let mediaTimelineChangedFn: JSValue?
     private let mediaPlaybackChangedFn: JSValue?
+    private let mediaThumbnailChangedFn: JSValue?
+    /// 任一媒体回调存在。渲染器只给这类脚本推送媒体快照，普通脚本零额外工作。
+    private(set) var usesMediaEvents = false
     /// 纯 media 驱动文本层(无 update,只有 mediaPropertiesChanged):歌名/艺术家。失败不回退时钟。
     let isMediaDriven: Bool
     /// 脚本是否用音频(调 engine.registerAudioBuffers / 读 __audio*)→ 引擎据此采集音频并每帧喂 setAudioSpectrum。
@@ -62,6 +90,18 @@ final class WEScript {
     private var lastMediaPropertiesSig: String? = nil
     private var lastMediaTimelineSig: String? = nil
     private var lastMediaPlaybackSig: String? = nil
+    private var lastMediaThumbnailSig: String? = nil
+    private struct MediaState {
+        var title: String
+        var artist: String
+        var position: Double
+        var duration: Double
+        var playbackState: Int?
+        var thumbnailRevision: Int?
+        var thumbnailPalette: NowPlayingProvider.ThumbnailPalette?
+    }
+    /// 调用方先写入最新快照；真正回调在下一次 tickFrame 的 init 之后派发，保证 WE 生命周期顺序。
+    private var pendingMediaState: MediaState? = nil
 
     /// - Parameters:
     ///   - script: 原始脚本源码(含 ES module 语法)。
@@ -78,14 +118,18 @@ final class WEScript {
         // 纯局部检查:脚本是否运行时建层(thisScene.createLayer,音频条 64 根 bar)。
         self.createsLayers = script.contains("createLayer")
         // 纯局部检查:脚本是否用跨层 API(getLayer/getObjectBy*)→ 控制器脚本写**其它**层(Dock 显隐等)。
-        self.usesLayerAPI = script.contains("getLayer") || script.contains("getObjectByName") || script.contains("getObjectById")
+        self.usesLayerAPI = script.contains("getLayer") || script.contains("getObjectByName")
+            || script.contains("getObjectById") || script.contains("getParent")
 
         // JS 异常 → 记一笔并标记失败(update() 仍可能返回 undefined,调用方据 didFail/nil 回退)。
         // 只捕获引用盒(非 self),避免在所有存储属性初始化完成前引用 self。
         let flag = exFlag
         context.exceptionHandler = { _, exc in
             flag.hit = true
-            Log.write("WEScript[\(tag)] JS exception: \(exc?.toString() ?? "?")")
+            // exceptionHandler 正运行在 JSC 抛异常的栈上。在这里读取 JSValue 的 message/toString
+            // 都可能再次进入 JSC 并同步重入 handler。只保存句柄；等 call/evaluateScript 完全返回后
+            // 再由 reportException() 格式化，彻底切断 handler → JS → handler 的递归链。
+            if !flag.formattingException { flag.exception = exc }
         }
 
         // 0) 注入 WE prelude(Vec2/3/4、WEMath、WEColor、console no-op、localStorage、input、
@@ -110,7 +154,7 @@ final class WEScript {
         //     缺 video 全局每帧抛 TypeError(刷日志),可见性脚本据 isPlaying=true 正常返回可见。方法均 no-op
         //     (播放真由 VideoTexture 控,脚本的 start/end/speed 修剪暂不接,层照常全程播放)。
         context.evaluateScript("""
-        var video = {
+        globalThis.video = {
           isPlaying: true, rate: 1.0, duration: 1e9,
           play: function(){}, pause: function(){}, stop: function(){},
           setRate: function(){}, setCurrentTime: function(){}, getCurrentTime: function(){ return 0; }
@@ -126,7 +170,10 @@ final class WEScript {
         // 2) 去 module 化脚本体,eval 之。eval 后 scriptProperties / update 落在全局。
         let body = WEScript.stripModuleSyntax(script)
         context.evaluateScript(body)
-        if exFlag.hit { return nil }   // 直接读引用盒(此时 updateFn 尚未赋值,不能用 self.didFail)
+        if exFlag.hit {
+            Self.reportException(exFlag, tag: tag)
+            return nil
+        }   // 直接读引用盒(此时 updateFn 尚未赋值,不能用 self.didFail)
 
         // 3) 取 update 句柄。注意:这是核心契约——文本/矢量脚本都靠 update(value) 的**返回值**
         //    模型(实测时钟脚本就是返回 string;别破坏)。update 缺失才判失败。
@@ -141,7 +188,8 @@ final class WEScript {
             guard let f = ctx.objectForKeyedSubscript(n) else { return false }
             return !f.isUndefined && !f.isNull && f.isObject
         }
-        guard hasUpdate || hasGlobalFn(context, "mediaPropertiesChanged") || hasGlobalFn(context, "mediaTimelineChanged") else {
+        guard hasUpdate || hasGlobalFn(context, "mediaPropertiesChanged") || hasGlobalFn(context, "mediaTimelineChanged")
+            || hasGlobalFn(context, "mediaPlaybackChanged") || hasGlobalFn(context, "mediaThumbnailChanged") else {
             Log.write("WEScript[\(tag)] no update() nor media callback after eval")
             return nil
         }
@@ -168,6 +216,9 @@ final class WEScript {
         self.mediaPropertiesChangedFn = grabFn(context, "mediaPropertiesChanged")
         self.mediaTimelineChangedFn = grabFn(context, "mediaTimelineChanged")
         self.mediaPlaybackChangedFn = grabFn(context, "mediaPlaybackChanged")
+        self.mediaThumbnailChangedFn = grabFn(context, "mediaThumbnailChanged")
+        self.usesMediaEvents = self.mediaPropertiesChangedFn != nil || self.mediaTimelineChangedFn != nil
+            || self.mediaPlaybackChangedFn != nil || self.mediaThumbnailChangedFn != nil
         // applyUserProperties(WE 生命周期:用户改属性时回调):Dock 等控制器脚本导出。有则记下,引擎在场景
         //   加载后(scriptProperties 已注入用户值)派发已变化的属性名,触发脚本重置派生状态。
         self.hasApplyUserProperties = hasGlobalFn(context, "applyUserProperties")
@@ -184,6 +235,32 @@ final class WEScript {
         }
     }
 
+    /// 在 JS call/evaluateScript 已经退栈后格式化并记录最近一次异常。
+    ///
+    /// 只读取字符串异常本身或标准 Error.message，不执行任意异常对象的 toString。读取 message
+    /// 若碰到恶意 getter 再次抛错，exceptionHandler 会因 formattingException=true 仅记 hit，
+    /// 不会覆盖原异常或递归格式化。
+    private static func reportException(_ flag: Flag, tag: String) {
+        guard flag.hit else { return }
+        flag.formattingException = true
+        var message = "JavaScript exception"
+        if let exc = flag.exception {
+            if exc.isString {
+                message = exc.toString() ?? message
+            } else if let errorMessage = exc.objectForKeyedSubscript("message"),
+                      errorMessage.isString {
+                message = errorMessage.toString() ?? message
+            }
+        }
+        flag.exception = nil
+        flag.formattingException = false
+        Log.write("WEScript[\(tag)] JS exception: \(message)")
+    }
+
+    private func reportException() {
+        Self.reportException(exFlag, tag: sourceTag)
+    }
+
     /// 跑一次脚本,传入当前值。回退判定交给调用方(failed / 非预期类型)。
     /// 审计修复(#1):新增可选 simTime/frametime 参数;上层应传以保证脚本动画与 sim-time 同步、
     ///   无头渲染确定。默认 nil 时 tickFrame 回退用墙钟 Date()(旧行为,调用方不改也能编)。
@@ -192,6 +269,7 @@ final class WEScript {
     ///     传入时 engine.frametime 直接取此真实帧间隔;nil 时回退用 runtime 差近似。
     func runString(current: String, simTime: Double? = nil, frametime: Double? = nil) -> Result {
         didFail = false
+        tickFrame(initArg: current, simTime: simTime, frametime: frametime)
         // 纯 media 文本(歌名/艺术家):无 update()。now-playing 由 dispatchMediaState 写进 thisLayer.text,
         // 这里直接读回(不需要 update 返回值)。无歌曲信息时 text 为空 → .failed 让调用方回退 pkg value/空。
         if updateFn == nil {
@@ -203,8 +281,10 @@ final class WEScript {
             return .failed
         }
         let fn = updateFn!
-        tickFrame(initArg: current, simTime: simTime, frametime: frametime)  // 刷新 engine.runtime/frametime/timeOfDay + 首帧 init(传当前值) + 跑 intervals
-        guard let ret = fn.call(withArguments: [current]), !didFail else { return .failed }
+        guard let ret = fn.call(withArguments: [current]), !didFail else {
+            reportException()
+            return .failed
+        }
         if ret.isString { return .string(ret.toString()) }
         // 某些脚本可能返回 number 等;转成字符串兜底。
         if ret.isNumber { return .string(ret.toString()) }
@@ -224,12 +304,21 @@ final class WEScript {
     /// 审计修复(#1):同 runString,新增可选 simTime/frametime;上层应传引擎 sim 时间(秒)做时间源、
     ///   本帧 sim dt 做 frametime,默认 nil 回退墙钟/runtime 差。
     func runVec3(current: SIMD3<Float>, simTime: Double? = nil, frametime: Double? = nil) -> Result {
-        guard let fn = updateFn else { return .failed }
         didFail = false
-        // 传一个带 x/y/z 的普通对象;脚本会读写其分量并 return。
-        let arg: [String: Any] = ["x": current.x, "y": current.y, "z": current.z]
+        // WE 传入的属性矢量是 Vec3，不是仅有 x/y/z 的桥接字典。官方脚本会直接调用
+        // value.copy()/multiply()/hasOwnProperty()；普通对象会在这些调用处失败。
+        context.setObject([Double(current.x), Double(current.y), Double(current.z)],
+                          forKeyedSubscript: "__weCurrentVec3" as NSString)
+        guard let arg = context.evaluateScript(
+            "new Vec3(__weCurrentVec3[0], __weCurrentVec3[1], __weCurrentVec3[2])"
+        ) else { return .failed }
         tickFrame(initArg: arg, simTime: simTime, frametime: frametime)      // 同 runString:刷新 runtime + 首帧 init(传当前 Vec3) + 跑 intervals
-        guard let ret = fn.call(withArguments: [arg]), !didFail else { return .failed }
+        // 只有媒体回调的属性脚本也必须完成 init + 事件派发；没有 update 返回值时保留静态/关键帧通道。
+        guard let fn = updateFn else { return .failed }
+        guard let ret = fn.call(withArguments: [arg]), !didFail else {
+            reportException()
+            return .failed
+        }
         // WE 标量缩放:scale 脚本(如「主三角」音频缩放)update() 直接 return 一个数字 → 各轴同乘该标量。
         // 旧代码只认 ret.isObject,数字返回必失败回退。这里先收标量分支。
         if ret.isNumber {
@@ -248,10 +337,18 @@ final class WEScript {
     /// 布尔脚本(对象/特效 visible:lwe 每帧 reevaluate)。update(value) 据 engine.timeOfDay / Date /
     /// Math.random / 音频 返回 bool(或可转 bool 的数字)。返回 nil = 脚本不可用/抛错 → 调用方回退静态值。
     func runBool(current: Bool, simTime: Double? = nil, frametime: Double? = nil) -> Bool? {
-        guard let fn = updateFn else { return nil }
         didFail = false
         tickFrame(initArg: current, simTime: simTime, frametime: frametime)
-        guard let ret = fn.call(withArguments: [current]), !didFail else { return nil }
+        guard let fn = updateFn else {
+            guard !didFail, let layer = context.objectForKeyedSubscript("thisLayer"), layer.isObject,
+                  let value = layer.objectForKeyedSubscript("visible"),
+                  value.isBoolean || value.isNumber else { return nil }
+            return value.toBool()
+        }
+        guard let ret = fn.call(withArguments: [current]), !didFail else {
+            reportException()
+            return nil
+        }
         if ret.isBoolean || ret.isNumber { return ret.toBool() }
         // 部分脚本不 return、直接写 thisLayer.visible。
         if let layer = context.objectForKeyedSubscript("thisLayer"), layer.isObject,
@@ -264,10 +361,18 @@ final class WEScript {
     /// 标量脚本(alpha:lwe 每帧 reevaluate)。update(value) 传当前标量、期望返回数字。
     /// 返回 nil = 不可用/抛错/非有限 → 调用方回退静态值。
     func runScalar(current: Float, simTime: Double? = nil, frametime: Double? = nil) -> Float? {
-        guard let fn = updateFn else { return nil }
         didFail = false
         tickFrame(initArg: current, simTime: simTime, frametime: frametime)
-        guard let ret = fn.call(withArguments: [Double(current)]), !didFail else { return nil }
+        guard let fn = updateFn else {
+            guard !didFail, let layer = context.objectForKeyedSubscript("thisLayer"), layer.isObject,
+                  let value = layer.objectForKeyedSubscript("alpha"), value.isNumber else { return nil }
+            let result = value.toDouble()
+            return result.isFinite ? Float(result) : nil
+        }
+        guard let ret = fn.call(withArguments: [Double(current)]), !didFail else {
+            reportException()
+            return nil
+        }
         if ret.isNumber { let d = ret.toDouble(); return d.isFinite ? Float(d) : nil }
         return nil
     }
@@ -306,6 +411,71 @@ final class WEScript {
           thisLayer.angles = new Vec3(\(angles.x), \(angles.y), \(angles.z));
         })();
         """)
+    }
+
+    /// 把模板层的真实 WE `size` 注入脚本上下文。
+    ///
+    /// `thisLayer.size` 是 scene.json 当前对象的局部尺寸。拖拽/屏幕边界脚本会将它与
+    /// `thisLayer.scale` 相乘；缺失时位置脚本直接抛 TypeError，随后回退到 pkg 的裸 value。
+    /// prelude 的 size getter 返回 copy，因此脚本可原地修改读取值而不会逐帧污染真实尺寸。
+    func setTemplateLayerSize(_ size: SIMD2<Float>) {
+        guard let layer = context.objectForKeyedSubscript("thisLayer"), layer.isObject else { return }
+        context.evaluateScript("""
+        (function(){
+          if (typeof thisLayer === 'undefined' || !thisLayer) return;
+          thisLayer.size = new Vec2(\(size.x), \(size.y));
+        })();
+        """)
+    }
+
+    /// 绑定当前脚本所属对象的身份和基础属性。`getParent()` 会在 setSceneLayers 安装对象树后，
+    /// 按 parent id 返回同一个注册层对象；无父对象时严格返回 null。
+    func setTemplateLayerIdentity(id: Int, name: String, parentId: Int?,
+                                  visible: Bool, alpha: Float, color: SIMD4<Float>) {
+        guard let layer = context.objectForKeyedSubscript("thisLayer"), layer.isObject else { return }
+        layer.setObject(id, forKeyedSubscript: "id" as NSString)
+        layer.setObject(name, forKeyedSubscript: "name" as NSString)
+        layer.setObject(parentId.map(NSNumber.init(value:)) ?? NSNull(),
+                        forKeyedSubscript: "_parentId" as NSString)
+        layer.setObject(visible, forKeyedSubscript: "visible" as NSString)
+        layer.setObject(Double(alpha), forKeyedSubscript: "alpha" as NSString)
+        context.setObject([Double(color.x), Double(color.y), Double(color.z), Double(color.w)],
+                          forKeyedSubscript: "__weTemplateColor" as NSString)
+        context.evaluateScript("""
+        if (globalThis.thisLayer && Array.isArray(globalThis.__weTemplateColor)) {
+          thisLayer.color = new Vec4(__weTemplateColor[0], __weTemplateColor[1],
+                                     __weTemplateColor[2], __weTemplateColor[3]);
+        }
+        """)
+    }
+
+    /// 配置当前属性脚本对应的 WE 关键帧时间轴。脚本经 thisLayer/thisObject.getAnimation()
+    /// 修改 rate/play/pause/stop/setFrame，Swift 求值关键帧时再读取同一控制器的当前帧。
+    func setTemplateAnimation(frameCount: Float, fps: Float) {
+        context.evaluateScript("""
+        if (globalThis.__weAnimationController) {
+          __weAnimationController.frameCount = \(max(0, frameCount));
+          __weAnimationController.fps = \(max(0.0001, fps));
+          __weAnimationController._baseFrame = 0;
+          __weAnimationController._baseRuntime = engine.runtime;
+        }
+        """)
+    }
+
+    /// 把脚本控制器的当前帧换算成关键帧求值秒数。未绑定时间轴时返回默认全局时间。
+    func controlledAnimationTime(defaultTime: Float) -> Float {
+        context.setObject(Double(defaultTime), forKeyedSubscript: "__weAnimationDefaultTime" as NSString)
+        guard let value = context.evaluateScript("""
+        (function(){
+          var animation = globalThis.__weAnimationController;
+          if (!animation || !(animation.frameCount > 0) || !(animation.fps > 0)) {
+            return globalThis.__weAnimationDefaultTime;
+          }
+          return animation.getFrame() / animation.fps;
+        })()
+        """), value.isNumber else { return defaultTime }
+        let time = value.toDouble()
+        return time.isFinite ? Float(time) : defaultTime
     }
 
     /// 驱动一帧「动态层脚本」(音频条):首帧先跑 init()(建 bars 数组),再每帧跑 update()(按音频
@@ -390,18 +560,31 @@ final class WEScript {
 
     // MARK: - thisScene/thisLayer 真实层绑定(审计修复 #2)
 
-    /// 把真实场景层(名/id)注入 __layers 注册表 + __layerList 列表,让 `thisScene.getLayer(name)`
-    /// 命中真实层、`thisScene.enumerateLayers()` 返回真实列表(此前返回 __missingLayer / [])。
+    /// 把完整 scene 对象树注入 __layers 注册表 + __layerList 列表,让 `thisScene.getLayer(name)`
+    /// 命中真实层、`thisLayer.getParent()` 返回真实父对象、`enumerateLayers()` 返回真实列表。
     /// 对标 lwe `installSceneLayers`:按 id 与 name 双键登记同一层对象。
-    /// 本轮范围:层对象带 name/id + 基础矢量属性桩(origin/scale/... 取默认,够 getLayer 命中读 name/id),
-    /// **属性写回(把脚本对层对象的修改 applyLayerUpdates 回灌引擎)留 TODO**,见下。
     /// **调用方应在场景层就绪后(通常构造脚本实例后、首帧前)调用一次**;层集合变化时可重复调用。
-    /// - Parameter layers: (name, id) 列表;name 为空的层只按 id 登记。
-    func setSceneLayers(_ layers: [(name: String, id: Int)]) {
-        // 把 (name,id) 列表交给一段 JS 重建注册表 + 列表,层对象在 JS 侧造,getMaterial 等才是
+    /// - Parameter layers: 所有 scene 对象的局部属性；无 image 的父容器也必须保留。
+    func setSceneLayers(_ layers: [SceneLayerDefinition]) {
+        if installedSceneLayerDefs == layers { return }
+        installedSceneLayerDefs = layers
+        // 把对象定义交给一段 JS 重建注册表 + 列表,层对象在 JS 侧造,getMaterial 等才是
         // 真正可调用的 JS 函数(原生 Swift 闭包 setObject 不会被桥成可调用 JS function)。
         // 用原生注入的 __weLayerDefs 传数据(避免拼字符串/转义问题),由 installLayersSource 消费。
-        let defs: [[String: Any]] = layers.map { ["name": $0.name, "id": $0.id] }
+        let defs: [[String: Any]] = layers.map {
+            [
+                "name": $0.name,
+                "id": $0.id,
+                "parentId": $0.parentId.map(NSNumber.init(value:)) ?? NSNull(),
+                "visible": $0.visible,
+                "alpha": Double($0.alpha),
+                "color": [Double($0.color.x), Double($0.color.y), Double($0.color.z), Double($0.color.w)],
+                "origin": [Double($0.origin.x), Double($0.origin.y), Double($0.origin.z)],
+                "scale": [Double($0.scale.x), Double($0.scale.y), Double($0.scale.z)],
+                "angles": [Double($0.angles.x), Double($0.angles.y), Double($0.angles.z)],
+                "size": [Double($0.size.x), Double($0.size.y)]
+            ]
+        }
         context.setObject(defs, forKeyedSubscript: "__weLayerDefs" as NSString)
         context.evaluateScript(WEScript.installLayersSource)
         // 跨层写回:installLayersSource 已用 defineProperty 把每个层对象的 visible/alpha/color/origin/
@@ -486,36 +669,93 @@ final class WEScript {
     ///   - artist: 艺人(nil 视为空串)。
     ///   - positionSec: 当前播放位置(秒,nil 视为 0)。
     ///   - lengthSec: 总时长(秒,nil 视为 0)。
-    func dispatchMediaState(title: String?, artist: String?, positionSec: Double?, lengthSec: Double?) {
-        let t = title ?? ""
-        let a = artist ?? ""
-        let pos = positionSec ?? 0
-        let len = lengthSec ?? 0
+    func dispatchMediaState(title: String?, artist: String?, positionSec: Double?, lengthSec: Double?,
+                            playbackState: Int? = nil, thumbnailRevision: Int? = nil,
+                            thumbnailPalette: NowPlayingProvider.ThumbnailPalette? = nil) {
+        guard usesMediaEvents else { return }
+        pendingMediaState = MediaState(
+            title: title ?? "",
+            artist: artist ?? "",
+            position: positionSec ?? 0,
+            duration: lengthSec ?? 0,
+            playbackState: playbackState,
+            thumbnailRevision: thumbnailRevision,
+            thumbnailPalette: thumbnailPalette
+        )
+    }
 
+    /// 在 init 完成后派发最新媒体快照。签名去重与 lwe 一致，调用方可每帧写入而不重复触发。
+    private func dispatchPendingMediaState() {
+        guard let state = pendingMediaState else { return }
         // 1) properties:title+artist 变化时派发(同 lwe propertiesSignature = title\nartist)。
         if let fn = mediaPropertiesChangedFn {
-            let sig = t + "\n" + a
+            let sig = state.title + "\n" + state.artist
             if lastMediaPropertiesSig != sig {
                 lastMediaPropertiesSig = sig
-                let event: [String: Any] = ["title": t, "artist": a, "albumTitle": ""]
+                let event: [String: Any] = [
+                    "title": state.title,
+                    "artist": state.artist,
+                    "albumTitle": ""
+                ]
                 _ = fn.call(withArguments: [event])
             }
         }
 
         // 2) timeline:position(取整秒)+duration 变化时派发(同 lwe timelineSignature)。
         if let fn = mediaTimelineChangedFn {
-            let sig = "\(Int(max(0, pos)))\n\(len)"
+            let sig = "\(Int(max(0, state.position)))\n\(state.duration)"
             if lastMediaTimelineSig != sig {
                 lastMediaTimelineSig = sig
-                let event: [String: Any] = ["position": pos, "duration": len]
+                let event: [String: Any] = ["position": state.position, "duration": state.duration]
                 _ = fn.call(withArguments: [event])
             }
         }
 
-        // TODO(playback/thumbnail):lwe 还派发 mediaPlaybackChanged({state})、mediaThumbnailChanged
-        //   ({url, primary/secondary/tertiary/highContrastColor})。播放态/封面数据源就绪后,
-        //   调用方可扩展本方法签名传入,并按下方 mediaPlaybackChangedFn 句柄派发。
-        _ = mediaPlaybackChangedFn  // 句柄已取,数据源就绪后启用(去重用 lastMediaPlaybackSig)。
+        // 3) playback:0 stopped / 1 playing / 2 paused。数据源是系统 MediaRemote，
+        //    无系统会话时回退壁纸 AudioPlayback 的真实状态。
+        if let fn = mediaPlaybackChangedFn, let playback = state.playbackState {
+            let sig = String(playback)
+            if lastMediaPlaybackSig != sig {
+                lastMediaPlaybackSig = sig
+                _ = fn.call(withArguments: [["state": playback]])
+            }
+        }
+
+        // 4) thumbnail:只按封面内容 revision 派发，不因同封面的曲目/时间线变化而重复触发。
+        // 颜色全部是 Vec3（官方 MediaThumbnailEvent 类型），不能用 Swift 字典冒充，否则脚本的
+        // subtract/multiply/add 等 Vec3 方法会在回调后续 update 中失败。
+        if let fn = mediaThumbnailChangedFn,
+           let revision = state.thumbnailRevision,
+           let palette = state.thumbnailPalette {
+            let sig = String(revision)
+            if lastMediaThumbnailSig != sig {
+                lastMediaThumbnailSig = sig
+                context.setObject([
+                    Double(palette.primaryColor.x), Double(palette.primaryColor.y), Double(palette.primaryColor.z),
+                    Double(palette.secondaryColor.x), Double(palette.secondaryColor.y), Double(palette.secondaryColor.z),
+                    Double(palette.tertiaryColor.x), Double(palette.tertiaryColor.y), Double(palette.tertiaryColor.z),
+                    Double(palette.textColor.x), Double(palette.textColor.y), Double(palette.textColor.z),
+                    Double(palette.highContrastColor.x), Double(palette.highContrastColor.y),
+                    Double(palette.highContrastColor.z)
+                ], forKeyedSubscript: "__weMediaThumbnailColors" as NSString)
+                context.setObject(palette.hasThumbnail,
+                                  forKeyedSubscript: "__weMediaHasThumbnail" as NSString)
+                let event = context.evaluateScript("""
+                (function(){
+                  var c = globalThis.__weMediaThumbnailColors;
+                  return {
+                    hasThumbnail: !!globalThis.__weMediaHasThumbnail,
+                    primaryColor: new Vec3(c[0], c[1], c[2]),
+                    secondaryColor: new Vec3(c[3], c[4], c[5]),
+                    tertiaryColor: new Vec3(c[6], c[7], c[8]),
+                    textColor: new Vec3(c[9], c[10], c[11]),
+                    highContrastColor: new Vec3(c[12], c[13], c[14])
+                  };
+                })()
+                """)
+                if let event { _ = fn.call(withArguments: [event]) }
+            }
+        }
     }
 
     // MARK: - 生命周期 / 每帧刷新
@@ -556,6 +796,8 @@ final class WEScript {
                 _ = initF.call(withArguments: [initArg])   // 抛错由 exceptionHandler 记录;不阻断后续 update
             }
         }
+        // 2b) WE 在对象 init 后派媒体事件；事件可直接改 thisLayer.visible/alpha/text。
+        dispatchPendingMediaState()
         // 3) 跑 intervals(注册在默认 bucket;回调到点才触发)。纯 JS,缺失则 no-op。
         if let runIntervals = context.objectForKeyedSubscript("__weRunIntervals"),
            runIntervals.isObject {
@@ -651,6 +893,92 @@ final class WEScript {
       copy() { return new Vec4(this.x, this.y, this.z, this.w); }
       toString() { return this.x + ' ' + this.y + ' ' + this.z + ' ' + this.w; }
     };
+    // WE Matrix4 至少以 column-major `m[12...14]` 暴露世界平移。场景脚本用它判断组件位于
+    // 画布哪一侧；这里按当前父链的局部 origin/scale/angles 动态合成，跨层脚本改值后也立即生效。
+    globalThis.__weWorldTransform = function(layer, seen) {
+      if (!layer) return { origin: new Vec3(0, 0, 0), scale: new Vec3(1, 1, 1), angle: 0 };
+      seen = seen || Object.create(null);
+      var key = String(layer.id);
+      if (seen[key]) return { origin: layer.origin.copy(), scale: layer.scale.copy(), angle: layer.angles.z || 0 };
+      seen[key] = true;
+      var parent = typeof layer.getParent === 'function' ? layer.getParent() : null;
+      var lo = layer.origin, ls = layer.scale, la = layer.angles;
+      if (!parent) return { origin: lo.copy(), scale: ls.copy(), angle: Number(la.z) || 0 };
+      var p = __weWorldTransform(parent, seen);
+      var x = p.scale.x * lo.x, y = p.scale.y * lo.y;
+      var c = Math.cos(p.angle), s = Math.sin(p.angle);
+      return {
+        origin: new Vec3(p.origin.x + c * x - s * y, p.origin.y + s * x + c * y,
+                         p.origin.z + p.scale.z * lo.z),
+        scale: new Vec3(p.scale.x * ls.x, p.scale.y * ls.y, p.scale.z * ls.z),
+        angle: p.angle + (Number(la.z) || 0)
+      };
+    };
+    globalThis.__weGetTransformMatrix = function(layer) {
+      var t = __weWorldTransform(layer), c = Math.cos(t.angle), s = Math.sin(t.angle);
+      return { m: [
+        c * t.scale.x, s * t.scale.x, 0, 0,
+        -s * t.scale.y, c * t.scale.y, 0, 0,
+        0, 0, t.scale.z, 0,
+        t.origin.x, t.origin.y, t.origin.z, 1
+      ] };
+    };
+    // 图层脚本期望从 thisLayer 取得控制对象。当前 VideoTexture 仍由宿主连续播放，
+    // 因此这里只提供不抛异常的兼容控制面；真实剪辑/暂停/倍速仍由审计列为缺口。
+    globalThis.__weVideoStub = {
+      duration: 1e9, rate: 1,
+      isPlaying: function(){ return 1; },
+      play: function(){}, pause: function(){}, stop: function(){},
+      setRate: function(v){ this.rate = Number(v) || 0; },
+      setCurrentTime: function(){}, getCurrentTime: function(){ return 0; }
+    };
+    globalThis.__weAnimationStub = {
+      pause: function(){}, play: function(){}, stop: function(){},
+      setFrame: function(){}, getFrame: function(){ return 0; },
+      frameCount: 0, rate: 1
+    };
+    globalThis.__weAnimationController = {
+      frameCount: 0, fps: 30,
+      _rate: 1, _playing: true, _baseFrame: 0, _baseRuntime: 0,
+      _sync: function() {
+        if (this._playing) {
+          this._baseFrame += (engine.runtime - this._baseRuntime) * this.fps * this._rate;
+          this._baseRuntime = engine.runtime;
+        }
+      },
+      get rate() { return this._rate; },
+      set rate(value) {
+        this._sync();
+        var next = Number(value);
+        this._rate = Number.isFinite(next) ? next : 1;
+      },
+      play: function() {
+        this._sync();
+        this._playing = true;
+        this._baseRuntime = engine.runtime;
+      },
+      pause: function() {
+        this._sync();
+        this._playing = false;
+      },
+      stop: function() {
+        this._playing = false;
+        this._baseFrame = 0;
+        this._baseRuntime = engine.runtime;
+      },
+      setFrame: function(frame) {
+        var next = Number(frame);
+        this._baseFrame = Number.isFinite(next) ? next : 0;
+        this._baseRuntime = engine.runtime;
+      },
+      getFrame: function() {
+        this._sync();
+        return this._baseFrame;
+      }
+    };
+    globalThis.thisObject = globalThis.thisObject || {
+      getAnimation: function(){ return globalThis.__weAnimationController; }
+    };
     globalThis.WEColor = {
       rgb2hsv(c) {
         var r = c.x, g = c.y, b = c.z, max = Math.max(r, g, b), min = Math.min(r, g, b), d = max - min;
@@ -705,6 +1033,7 @@ final class WEScript {
     globalThis.__audio32 = { average: Array(32).fill(0), left: Array(32).fill(0), right: Array(32).fill(0) };
     globalThis.__audio64 = { average: Array(64).fill(0), left: Array(64).fill(0), right: Array(64).fill(0) };
     globalThis.__intervals = [];
+    globalThis.__timeouts = [];
     globalThis.shared = globalThis.shared || {};
     globalThis.localStorage = globalThis.localStorage || {
       __data: Object.create(null),
@@ -740,6 +1069,17 @@ final class WEScript {
         interval.next = engine.runtime + interval.delay;
         interval.callback();
       }
+      var timeouts = globalThis.__timeouts;
+      for (var j = 0; j < timeouts.length; j++) {
+        var timeout = timeouts[j];
+        if (!timeout.active || typeof timeout.callback !== 'function') continue;
+        if (engine.runtime < timeout.next) continue;
+        timeout.active = false;
+        timeout.callback();
+      }
+      if (timeouts.length > 128) {
+        globalThis.__timeouts = timeouts.filter(function(timeout) { return timeout.active; });
+      }
     };
     globalThis.engine = {
       runtime: 0,
@@ -761,18 +1101,44 @@ final class WEScript {
         globalThis.__intervals.push(interval);
         return function() { interval.active = false; };
       },
+      setTimeout(callback, delayMs) {
+        var d = Math.max(0, Number(delayMs || 0) / 1000);
+        var timeout = { callback: callback, next: this.runtime + d, active: true };
+        globalThis.__timeouts.push(timeout);
+        return function() { timeout.active = false; };
+      },
       openUserShortcut() { return undefined; }
     };
     globalThis.__missingLayer = {
-      text: '', name: '', visible: false, alpha: 0,
+      id: -1, _parentId: null, text: '', name: '', visible: false, alpha: 0,
       origin: new Vec3(0, 0, 0), scale: new Vec3(1, 1, 1), angles: new Vec3(0, 0, 0),
-      color: new Vec4(0, 0, 0, 0), parallaxDepth: new Vec2(0, 0),
+      color: new Vec4(0, 0, 0, 0), parallaxDepth: new Vec2(0, 0), size: new Vec2(0, 0),
+      getParent() { return null; },
+      getTransformMatrix() { return __weGetTransformMatrix(this); },
+      getAnimation() { return __weAnimationStub; },
+      getVideoTexture() { return __weVideoStub; },
+      getTextureAnimation() { return __weAnimationStub; },
       getMaterial() { return null; }
     };
     globalThis.thisLayer = globalThis.thisLayer || {
-      text: '', name: '', visible: true, alpha: 1,
+      id: -1, _parentId: null, text: '', name: '', visible: true, alpha: 1,
       origin: new Vec3(0, 0, 0), scale: new Vec3(1, 1, 1), angles: new Vec3(0, 0, 0),
       color: new Vec4(1, 1, 1, 1), parallaxDepth: new Vec2(0, 0),
+      _size: new Vec2(0, 0),
+      // WE 的原生 size getter 返回一个向量值。官方拖拽/反弹脚本会先取
+      // `imageSize = thisLayer.size` 再原地乘 scale；若这里返回持久对象，图层尺寸会每帧
+      // 被再次缩小。返回 copy 才与 WE 的值语义一致。
+      get size() { return this._size.copy(); },
+      set size(v) { this._size = new Vec2(v && v.x, v && v.y); },
+      getParent() {
+        if (this._parentId === null || this._parentId === undefined) return null;
+        var key = String(this._parentId);
+        return globalThis.__layers && globalThis.__layers[key] ? globalThis.__layers[key] : null;
+      },
+      getTransformMatrix() { return __weGetTransformMatrix(this); },
+      getAnimation() { return __weAnimationController; },
+      getVideoTexture() { return __weVideoStub; },
+      getTextureAnimation() { return __weAnimationStub; },
       getMaterial() { return null; }
     };
     // 运行时动态建层:音频条脚本 init() 调 thisScene.createLayer 建 N 根 bar、getLayerIndex 取基准、
@@ -786,7 +1152,7 @@ final class WEScript {
         name: '', model: String(modelPath || ''),
         visible: true, alpha: 1, text: '',
         origin: new Vec3(0, 0, 0), scale: new Vec3(1, 1, 1), angles: new Vec3(0, 0, 0),
-        color: new Vec4(1, 1, 1, 1), parallaxDepth: new Vec2(0, 0),
+        color: new Vec4(1, 1, 1, 1), parallaxDepth: new Vec2(0, 0), size: new Vec2(0, 0),
         alignment: 'centre',
         getMaterial: function() { return null; }
       };
@@ -838,7 +1204,7 @@ final class WEScript {
 
     // MARK: - 场景层安装(setSceneLayers 用)
 
-    /// 消费原生注入的 __weLayerDefs([{name,id}]),重建 __layers(name→obj、id→obj 双键)+
+    /// 消费原生注入的 __weLayerDefs,重建 __layers(name→obj、id→obj 双键)+
     /// __layerList(有序),并把 thisScene.getLayer/enumerateLayers 指向它们(覆盖 prelude 死桩)。
     /// 层对象在 JS 侧构造,getMaterial 是真正的 JS 函数;属性与 thisLayer/__missingLayer 同构,
     /// 脚本读 name/id/origin/scale/... 均不抛错。对标 lwe installSceneLayers 的双键登记。
@@ -852,24 +1218,48 @@ final class WEScript {
       var defs = globalThis.__weLayerDefs || [];
       var layers = {};
       var list = [];
-      var videoStub = { isPlaying: true, rate: 1, duration: 1e9,
-        play: function(){}, pause: function(){}, stop: function(){},
-        setRate: function(){}, setCurrentTime: function(){}, getCurrentTime: function(){ return 0; } };
-      var animStub = { pause: function(){}, play: function(){}, setFrame: function(){}, getFrame: function(){ return 0; } };
+      function vec(a, n, fallback) {
+        var out = [];
+        for (var i = 0; i < n; i++) {
+          var value = a && a.length > i ? Number(a[i]) : fallback[i];
+          out.push(Number.isFinite(value) ? value : fallback[i]);
+        }
+        return out;
+      }
       function mk(d) {
+        var c = vec(d.color, 4, [1, 1, 1, 1]);
+        var o3 = vec(d.origin, 3, [0, 0, 0]);
+        var s3 = vec(d.scale, 3, [1, 1, 1]);
+        var a3 = vec(d.angles, 3, [0, 0, 0]);
+        var sz = vec(d.size, 2, [0, 0]);
         var o = { id: d.id, name: String(d.name || ''), text: '',
+                  _parentId: d.parentId === null || d.parentId === undefined ? null : Number(d.parentId),
                   _v: null, _al: null, _c: null, _o: null, _s: null, _an: null,
+                  _baseVisible: d.visible !== false, _baseAlpha: Number(d.alpha),
+                  _baseColor: new Vec4(c[0], c[1], c[2], c[3]),
+                  _baseOrigin: new Vec3(o3[0], o3[1], o3[2]),
+                  _baseScale: new Vec3(s3[0], s3[1], s3[2]),
+                  _baseAngles: new Vec3(a3[0], a3[1], a3[2]),
+                  size: new Vec2(sz[0], sz[1]),
                   parallaxDepth: new Vec2(0, 0),
+                  getParent: function(){
+                    if (this._parentId === null || this._parentId === undefined) return null;
+                    var key = String(this._parentId);
+                    return globalThis.__layers && globalThis.__layers[key] ? globalThis.__layers[key] : null;
+                  },
+                  getTransformMatrix: function(){ return __weGetTransformMatrix(this); },
+                  getAnimation: function(){ return __weAnimationStub; },
                   getMaterial: function(){ return null; },
-                  getVideoTexture: function(){ return videoStub; },
-                  getTextureAnimation: function(){ return animStub; },
+                  getVideoTexture: function(){ return __weVideoStub; },
+                  getTextureAnimation: function(){ return __weAnimationStub; },
                   play: function(){}, pause: function(){}, stop: function(){} };
-        Object.defineProperty(o, 'visible', { get: function(){ return this._v === null ? true : this._v; }, set: function(v){ this._v = !!v; }, configurable: true, enumerable: true });
-        Object.defineProperty(o, 'alpha',   { get: function(){ return this._al === null ? 1 : this._al; }, set: function(v){ this._al = +v; }, configurable: true, enumerable: true });
-        Object.defineProperty(o, 'color',   { get: function(){ return this._c || new Vec4(1,1,1,1); }, set: function(v){ this._c = v; }, configurable: true, enumerable: true });
-        Object.defineProperty(o, 'origin',  { get: function(){ return this._o || new Vec3(0,0,0); }, set: function(v){ this._o = v; }, configurable: true, enumerable: true });
-        Object.defineProperty(o, 'scale',   { get: function(){ return this._s || new Vec3(1,1,1); }, set: function(v){ this._s = v; }, configurable: true, enumerable: true });
-        Object.defineProperty(o, 'angles',  { get: function(){ return this._an || new Vec3(0,0,0); }, set: function(v){ this._an = v; }, configurable: true, enumerable: true });
+        if (!Number.isFinite(o._baseAlpha)) o._baseAlpha = 1;
+        Object.defineProperty(o, 'visible', { get: function(){ return this._v === null ? this._baseVisible : this._v; }, set: function(v){ this._v = !!v; }, configurable: true, enumerable: true });
+        Object.defineProperty(o, 'alpha',   { get: function(){ return this._al === null ? this._baseAlpha : this._al; }, set: function(v){ this._al = +v; }, configurable: true, enumerable: true });
+        Object.defineProperty(o, 'color',   { get: function(){ return this._c || this._baseColor.copy(); }, set: function(v){ this._c = v; }, configurable: true, enumerable: true });
+        Object.defineProperty(o, 'origin',  { get: function(){ return this._o || this._baseOrigin.copy(); }, set: function(v){ this._o = v; }, configurable: true, enumerable: true });
+        Object.defineProperty(o, 'scale',   { get: function(){ return this._s || this._baseScale.copy(); }, set: function(v){ this._s = v; }, configurable: true, enumerable: true });
+        Object.defineProperty(o, 'angles',  { get: function(){ return this._an || this._baseAngles.copy(); }, set: function(v){ this._an = v; }, configurable: true, enumerable: true });
         return o;
       }
       for (var i = 0; i < defs.length; i++) {

@@ -7,6 +7,9 @@ struct LibraryView: View {
     var currentID: String?
     var actions: LibraryActions
 
+    /// 首页「创意工坊热门」在线货架数据源(浏览/推荐 Steam 工坊壁纸)。
+    @ObservedObject private var workshopFeed = WorkshopFeed.shared
+
     enum Tab: String, CaseIterable, Identifiable {
         case home, library, workshop
         var id: String { rawValue }
@@ -27,15 +30,14 @@ struct LibraryView: View {
     }
 
     @State private var tab: Tab = {
-        if let t = ProcessInfo.processInfo.environment["WP_PREVIEW_TAB"], let tab = Tab(rawValue: t) { return tab }
+        if let t = WPEnv.vars["WP_PREVIEW_TAB"], let tab = Tab(rawValue: t) { return tab }
         return .home
     }()
     @State private var search = ""
     @State private var favVersion = 0
     @State private var settingsItem: WallpaperItem?    // 选中壁纸的检视面板
     @State private var showSettings =
-        ProcessInfo.processInfo.environment["WP_PREVIEW_SETTINGS"] != nil   // 设置 sheet
-    @State private var heroIndex = 0
+        WPEnv.vars["WP_PREVIEW_SETTINGS"] != nil   // 设置 sheet
 
     // 壁纸库筛选:类型(nil=全部)、仅收藏、搜索、分级、排序、网格大小。
     @State private var typeFilter: WallpaperType? = nil
@@ -114,41 +116,62 @@ struct LibraryView: View {
     var body: some View {
         ZStack {
             WaifuTheme.background.ignoresSafeArea()
-            VStack(spacing: 0) {
-                topBar
-                // 内容 + 右侧壁纸检视面板**并排**(面板不覆盖内容;选中壁纸时内容区自动变窄、网格重排)。
-                HStack(spacing: 0) {
-                    content
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    if let item = settingsItem {
-                        Divider().overlay(Color.white.opacity(0.06))
-                        WallpaperSettingsPanel(
-                            item: item,
-                            onApply: { actions.onApplySettings(item) },
-                            onClose: { withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil } },
-                            onUnsubscribe: item.id.allSatisfy(\.isNumber) ? {
-                                actions.onUnsubscribe(item); favVersion += 1
-                                withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil }
-                            } : nil
-                        )
-                        .frame(width: 340)
-                        .transition(.move(edge: .trailing))
-                    }
+            // 首页:hero 大图铺到窗口最顶部,顶部标签栏浮在其上(半透明玻璃)。
+            // 其余 tab:标签栏在上、内容在下(常规堆叠)。
+            if tab == .home {
+                ZStack(alignment: .top) {
+                    contentRow
+                    topBar.background(topBarGlass)
+                }
+            } else {
+                VStack(spacing: 0) {
+                    topBar
+                    contentRow
                 }
             }
         }
         .frame(minWidth: 1000, minHeight: 660)
         .preferredColorScheme(.dark)
-        .sheet(isPresented: $showSettings) {
-            SettingsSheet(actions: actions,
-                          currentItem: currentID.flatMap { id in library.items.first { $0.id == id } },
-                          onClose: { showSettings = false })
-        }
         .onAppear {
-            if ProcessInfo.processInfo.environment["WP_PREVIEW_PANEL"] != nil, settingsItem == nil {
+            if WPEnv.vars["WP_PREVIEW_PANEL"] != nil, settingsItem == nil {
                 settingsItem = filtered.first
             }
+            // 截图验证用:WP_PREVIEW_SETTINGS 时自动打开设置窗口。
+            if showSettings { NotificationCenter.default.post(name: .showSettings, object: nil); showSettings = false }
         }
+    }
+
+    /// 内容 + 右侧壁纸检视面板**并排**(面板不覆盖内容;选中壁纸时内容区自动变窄、网格重排)。
+    private var contentRow: some View {
+        HStack(spacing: 0) {
+            content
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+            if let item = settingsItem {
+                Divider().overlay(Color.white.opacity(0.06))
+                WallpaperSettingsPanel(
+                    item: item,
+                    onApply: { actions.onApplySettings(item) },
+                    onClose: { withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil } },
+                    onUnsubscribe: item.id.allSatisfy(\.isNumber) ? {
+                        actions.onUnsubscribe(item); favVersion += 1
+                        withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil }
+                    } : nil
+                )
+                .frame(width: 340)
+                .transition(.move(edge: .trailing))
+            }
+        }
+    }
+
+    /// 首页标签栏浮在 hero 之上时的玻璃背景:顶部更暗的渐变 + 模糊,保证亮/暗 hero 上文字都可读。
+    private var topBarGlass: some View {
+        ZStack {
+            LinearGradient(colors: [.black.opacity(0.55), .black.opacity(0.22), .clear],
+                           startPoint: .top, endPoint: .bottom)
+            Rectangle().fill(.ultraThinMaterial).opacity(0.35)
+        }
+        .allowsHitTesting(false)
+        .ignoresSafeArea(edges: .top)
     }
 
     // MARK: - 顶部标签栏
@@ -161,15 +184,18 @@ struct LibraryView: View {
                 ForEach(Tab.allCases) { t in tabButton(t) }
             }
             .padding(4)
-            .background(Capsule().fill(.white.opacity(0.06)))
-            .overlay(Capsule().strokeBorder(.white.opacity(0.06)))
+            // 浮在 hero 之上时给胶囊更实的背景(玻璃)+ 阴影,保证亮图上也清晰。
+            .background(Capsule().fill(tab == .home ? AnyShapeStyle(.ultraThinMaterial) : AnyShapeStyle(Color.white.opacity(0.06))))
+            .overlay(Capsule().strokeBorder(.white.opacity(0.10)))
+            .shadow(color: .black.opacity(tab == .home ? 0.35 : 0), radius: 8, y: 2)
             Spacer()
-            Button { showSettings = true } label: {
+            Button { NotificationCenter.default.post(name: .showSettings, object: nil) } label: {
                 Image(systemName: "gearshape")
                     .font(.system(size: 16, weight: .medium))
-                    .foregroundStyle(WaifuTheme.secondary)
+                    .foregroundStyle(.white.opacity(0.9))
                     .frame(width: 36, height: 32)
-                    .background(Circle().fill(.white.opacity(0.06)))
+                    .background(Circle().fill(tab == .home ? AnyShapeStyle(.ultraThinMaterial) : AnyShapeStyle(Color.white.opacity(0.06))))
+                    .shadow(color: .black.opacity(tab == .home ? 0.35 : 0), radius: 8, y: 2)
             }
             .buttonStyle(.plain).help("设置")
             .padding(.trailing, 16)
@@ -209,61 +235,204 @@ struct LibraryView: View {
         }
     }
 
-    // MARK: - 首页(大图 hero + 横向货架)
+    // MARK: - 首页(工坊壁纸:hero + 工坊货架 + 库入口)
 
+    /// 「我的壁纸库」入口货架用:本地壁纸按最近添加排序。
     private var recentItems: [WallpaperItem] {
         ratingFilteredItems.sorted { $0.modifiedDate > $1.modifiedDate }
     }
-    private var favoriteItems: [WallpaperItem] {
-        let fav = PreferencesStore.shared.favorites
-        return ratingFilteredItems.filter { fav.contains($0.id) }
-    }
-    /// 精选(hero):当前壁纸优先,其后最近添加,去重取前 8。
-    private var featuredItems: [WallpaperItem] {
-        var seen = Set<String>(); var out: [WallpaperItem] = []
-        if let cur = currentID, let c = library.items.first(where: { $0.id == cur }) { out.append(c); seen.insert(c.id) }
-        for it in recentItems where !seen.contains(it.id) { out.append(it); seen.insert(it.id); if out.count >= 8 { break } }
-        return out
-    }
 
+    /// 首页主体 = **创意工坊壁纸**(浏览 Steam 工坊,而非用户自己的壁纸库)。
+    /// 布局:hero = 工坊精选 6 张(大图轮播 + 玻璃缩略选择条)→ **「我的壁纸」首排**(本地库)→
+    ///       工坊「本周最热」「评分最高」「最新」货架。
+    /// 加载中显示骨架占位;全部失败/无网时优雅降级(给重试 + 回退到本地库内容)。
     private var homeView: some View {
         GeometryReader { geo in
+            // full-bleed hero 高度:16:9 占满窗口宽度,但 hero 不超过窗口高度的 ~62%(留出下方货架),
+            // 也不低于 320(小窗仍有存在感)。hero 内用 .fit 显示整张壁纸,留白处由同图虚化补底。
+            let heroH = min(geo.size.width * 9.0 / 16.0, max(320, geo.size.height * 0.62))
+            let picks = workshopFeed.heroItems(6)
             ScrollView {
                 VStack(alignment: .leading, spacing: 26) {
-                    if !featuredItems.isEmpty {
-                        // 16:9 大图 hero,高度上限 = 视口高 - 一整行货架(标题+卡片+留白),让「最近添加」完整露出。
-                        HeroCarousel(items: featuredItems, index: $heroIndex, currentID: currentID,
-                                     maxHeight: max(280, geo.size.height - 350),
-                                     onSet: { selectAndConfigure($0) },
-                                     onToggleFav: { PreferencesStore.shared.toggleFavorite($0.id); favVersion += 1 })
-                            .padding(.horizontal, 26).padding(.top, 10)
+                    if !picks.isEmpty {
+                        // full-bleed 16:9 工坊 hero「6 张精选」轮播,铺到窗口最顶部(标签栏浮在其上)。
+                        WorkshopHeroCarousel(items: picks,
+                                             height: heroH,
+                                             inLibrary: { workshopInLibrary($0) },
+                                             onDownload: { startWorkshopDownload($0) })
+                    } else if workshopFeed.isLoadingAny {
+                        workshopHeroPlaceholder(height: heroH)
+                    } else if workshopFeed.allFailed {
+                        workshopUnavailableBanner
+                            .padding(.horizontal, 26).padding(.top, 70)
                     }
-                    shelf("最近添加", Array(recentItems.prefix(14)))
-                    if !favoriteItems.isEmpty { shelf("我的收藏", Array(favoriteItems.prefix(14))) }
-                    ForEach([WallpaperType.scene, .video, .web], id: \.self) { t in
-                        let items = ratingFilteredItems.filter { $0.type == t }
-                        if !items.isEmpty { shelf(t.displayName, Array(items.prefix(14))) }
+
+                    // 「我的壁纸」首排(本地库,最近添加在前)—— 排在所有工坊货架之前(hero 之下第一排)。
+                    if !recentItems.isEmpty { myLibraryShelf }
+
+                    // 工坊「本周最热」「评分最高」「最新」货架(主内容)。
+                    ForEach(WorkshopFeed.Sort.allCases, id: \.self) { sort in
+                        workshopShelf(sort)
                     }
                 }
                 .padding(.bottom, 30)
                 .id(favVersion)
             }
             .scrollIndicators(.hidden)
+            .ignoresSafeArea(edges: .top)   // 让 hero 铺到窗口最顶部(标签栏浮于其上)
+        }
+        .onAppear { workshopFeed.loadHome(limit: 18) }
+    }
+
+    /// 单条工坊货架(热门 / 最新):远程缩略卡片,可横向滚动;点击 → 跳工坊 tab 看详情/订阅。
+    /// 加载中显示骨架;失败且无数据时给「重试」入口(不静默空白)。
+    @ViewBuilder
+    private func workshopShelf(_ sort: WorkshopFeed.Sort) -> some View {
+        let sec = workshopFeed.section(sort)
+        if !sec.items.isEmpty {
+            VStack(alignment: .leading, spacing: 12) {
+                shelfHeader(sort)
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 16) {
+                        ForEach(sec.items) { item in
+                            WorkshopCard(item: item,
+                                         inLibrary: workshopInLibrary(item.id),
+                                         onDownload: { startWorkshopDownload(item) })
+                                .frame(width: 248)
+                        }
+                    }
+                    .padding(.horizontal, 26)
+                }
+            }
+        } else if sec.isLoading {
+            workshopShelfPlaceholder(sort)
+        } else if sec.failed {
+            workshopShelfRetry(sort)
         }
     }
 
-    /// 横向货架:标题 + 一行可横向滚动的卡片。
-    private func shelf(_ title: String, _ items: [WallpaperItem]) -> some View {
+    /// 工坊货架标题行(图标 + 标题 + 「浏览全部」跳工坊 tab)。「浏览全部」做成玻璃胶囊。
+    private func shelfHeader(_ sort: WorkshopFeed.Sort) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: sort.shelfIcon).font(.system(size: 13)).foregroundStyle(.orange)
+            Text(sort.shelfTitle).font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
+                .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+            Spacer()
+            Button { tab = .workshop } label: {
+                HStack(spacing: 3) {
+                    Text("浏览全部").font(.system(size: 12, weight: .medium))
+                    Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold))
+                }
+                .foregroundStyle(WaifuTheme.secondary)
+                .padding(.horizontal, 11).padding(.vertical, 6)
+                .glassCapsule()
+            }.buttonStyle(.plain)
+        }
+        .padding(.horizontal, 26)
+    }
+
+    /// 工坊货架加载占位(骨架卡片)。
+    private func workshopShelfPlaceholder(_ sort: WorkshopFeed.Sort) -> some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack(spacing: 6) {
-                Text(title).font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
-                Text("\(items.count)").font(.system(size: 13, weight: .medium)).foregroundStyle(WaifuTheme.tertiary)
+                Image(systemName: sort.shelfIcon).font(.system(size: 13)).foregroundStyle(.orange)
+                Text(sort.shelfTitle).font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
+                ProgressView().controlSize(.small).scaleEffect(0.7)
                 Spacer()
             }
             .padding(.horizontal, 26)
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 16) {
-                    ForEach(items) { item in
+                    ForEach(0..<5, id: \.self) { _ in
+                        RoundedRectangle(cornerRadius: 14, style: .continuous)
+                            .fill(.white.opacity(0.05))
+                            .aspectRatio(16.0/9.0, contentMode: .fit)
+                            .frame(width: 248)
+                    }
+                }
+                .padding(.horizontal, 26)
+            }
+        }
+    }
+
+    /// 工坊单货架失败时的「重试」行(无网/限流降级,不静默空白)。
+    private func workshopShelfRetry(_ sort: WorkshopFeed.Sort) -> some View {
+        HStack(spacing: 10) {
+            Image(systemName: sort.shelfIcon).font(.system(size: 13)).foregroundStyle(.orange)
+            Text(sort.shelfTitle).font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
+            Text("加载失败").font(.system(size: 12)).foregroundStyle(WaifuTheme.tertiary)
+            Spacer()
+            Button { workshopFeed.loadIfNeeded(sort: sort, limit: 18, force: true) } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "arrow.clockwise").font(.system(size: 11, weight: .semibold))
+                    Text("重试").font(.system(size: 12, weight: .medium))
+                }
+                .foregroundStyle(WaifuTheme.secondary)
+                .padding(.horizontal, 12).padding(.vertical, 6)
+                .glassCapsule()
+            }.buttonStyle(.plain)
+        }
+        .padding(.horizontal, 26)
+    }
+
+    /// hero 区加载骨架(full-bleed 大图占位,与正式 hero 同高同铺满)。
+    private func workshopHeroPlaceholder(height: CGFloat) -> some View {
+        Rectangle().fill(.white.opacity(0.05))
+            .frame(maxWidth: .infinity)
+            .frame(height: height)
+            .overlay(ProgressView().controlSize(.large))
+    }
+
+    /// 工坊整体不可用(全部区段失败/无网)时的降级横幅:提示 + 重试,不空白崩。
+    private var workshopUnavailableBanner: some View {
+        VStack(spacing: 10) {
+            Image(systemName: "wifi.exclamationmark").font(.system(size: 34)).foregroundStyle(WaifuTheme.tertiary)
+            Text("暂时无法加载创意工坊").font(.system(size: 16, weight: .semibold)).foregroundStyle(WaifuTheme.secondary)
+            Text("检查网络后重试,或浏览下方「我的壁纸库」").font(.system(size: 12)).foregroundStyle(WaifuTheme.tertiary)
+            HStack(spacing: 10) {
+                Button { workshopFeed.loadHome(limit: 18, force: true) } label: {
+                    Label("重试", systemImage: "arrow.clockwise")
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                        .padding(.horizontal, 16).padding(.vertical, 9)
+                        .background(Capsule().fill(Color.accentColor))
+                }.buttonStyle(.plain)
+                Button { tab = .library } label: {
+                    Label("打开壁纸库", systemImage: "square.grid.2x2")
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                        .padding(.horizontal, 16).padding(.vertical, 9)
+                        .glassCapsule()
+                }.buttonStyle(.plain)
+            }
+            .padding(.top, 4)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 48)
+        .glassCard(cornerRadius: 18)
+    }
+
+    /// 首页 hero 下第一排「我的壁纸」货架:展示用户自己壁纸库(最近添加在前),点击进详情/设为壁纸。
+    private var myLibraryShelf: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            HStack(spacing: 6) {
+                Image(systemName: "square.grid.2x2").font(.system(size: 13)).foregroundStyle(WaifuTheme.secondary)
+                Text("我的壁纸").font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
+                    .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
+                Text("\(ratingFilteredItems.count)").font(.system(size: 13, weight: .medium)).foregroundStyle(WaifuTheme.tertiary)
+                Spacer()
+                Button { tab = .library } label: {
+                    HStack(spacing: 3) {
+                        Text("全部").font(.system(size: 12, weight: .medium))
+                        Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold))
+                    }
+                    .foregroundStyle(WaifuTheme.secondary)
+                    .padding(.horizontal, 11).padding(.vertical, 6)
+                    .glassCapsule()
+                }.buttonStyle(.plain)
+            }
+            .padding(.horizontal, 26)
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 16) {
+                    ForEach(Array(recentItems.prefix(14))) { item in
                         WallpaperCard(item: item, isCurrent: item.id == currentID,
                                       isFavorite: PreferencesStore.shared.isFavorite(item.id),
                                       onSelect: { selectAndConfigure(item) },
@@ -275,6 +444,33 @@ struct LibraryView: View {
                 .padding(.horizontal, 26)
             }
         }
+    }
+
+    private func workshopInLibrary(_ id: String) -> Bool {
+        library.items.contains { $0.id == id }
+    }
+
+    /// 点击工坊推荐卡片/hero:**直接在 app 内订阅 + 下载**该壁纸到本地库(不再跳转创意工坊网页 tab)。
+    /// 走既有 SteamCMD 下载机制(WorkshopDownloader):enqueue 后内部用已配置的 Steam 账号(没配则匿名)
+    /// 登录下载 → 完成移入壁纸库 → FolderWatcher 自动入库刷新。进度/已在库/失败由卡片自身的下载状态展示。
+    /// 失败(无 SteamCMD / 未登录 Steam / 限流等)由 WorkshopDownloader 给出明确文案:
+    ///   - 没装 SteamCMD:这里直接弹窗提示安装(下载根本无法进行)。
+    ///   - 新发布壁纸需登录 Steam 账号:下载会失败并把 reason 写进 job.state(卡片上显示),
+    ///     同时 downloader.loginExpired 置位 → 工坊页/下载管理弹「重新登录」。匿名能下的老壁纸正常完成。
+    private func startWorkshopDownload(_ item: WorkshopFeed.Item) {
+        // 已在库:无需下载,点击不跳转(保持在首页)。
+        if workshopInLibrary(item.id) { return }
+        guard WorkshopDownloader.shared.isSteamCMDAvailable else {
+            let alert = NSAlert()
+            alert.messageText = "未检测到 SteamCMD"
+            alert.informativeText = "直接下载创意工坊壁纸需要 SteamCMD。请在终端运行:\nbrew install --cask steamcmd\n安装后重试。"
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "好")
+            alert.runModal()
+            return
+        }
+        // 立即入队并开始下载(尺寸只用于进度估算,这里拿不到精确大小传 0,不影响下载与块进度)。
+        WorkshopDownloader.shared.enqueue(id: item.id, title: item.title)
     }
 
     // MARK: - 壁纸库(问候语 + 大标题 + 胶囊筛选 + 网格)
@@ -337,8 +533,10 @@ struct LibraryView: View {
                 }
             }
             .padding(.horizontal, 26).padding(.top, 10).padding(.bottom, 30)
+            .trackScrollOffset()
         }
         .scrollIndicators(.hidden)
+        .floatingScrollIndicator()
     }
 
     private var searchBar: some View {
@@ -353,8 +551,8 @@ struct LibraryView: View {
             }
         }
         .padding(.horizontal, 14).padding(.vertical, 10)
-        .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(.white.opacity(0.06)))
-        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(.white.opacity(0.07)))
+        .background(RoundedRectangle(cornerRadius: 11, style: .continuous).fill(.ultraThinMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 11, style: .continuous).strokeBorder(.white.opacity(0.10)))
         .frame(maxWidth: 520)
     }
 
@@ -367,7 +565,7 @@ struct LibraryView: View {
         }
     }
 
-    /// 胶囊筛选 chip(选中=强调色填充)。
+    /// 胶囊筛选 chip(选中=强调色填充;未选=玻璃 material 托底)。
     private func chip(_ title: String, icon: String, on: Bool, _ act: @escaping () -> Void) -> some View {
         Button { withAnimation(.easeOut(duration: 0.15)) { act() } } label: {
             HStack(spacing: 5) {
@@ -376,8 +574,8 @@ struct LibraryView: View {
             }
             .foregroundStyle(on ? .white : WaifuTheme.secondary)
             .padding(.horizontal, 13).padding(.vertical, 7)
-            .background(Capsule().fill(on ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.white.opacity(0.06))))
-            .overlay(Capsule().strokeBorder(.white.opacity(on ? 0 : 0.07)))
+            .background(Capsule().fill(on ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.ultraThinMaterial)))
+            .overlay(Capsule().strokeBorder(.white.opacity(on ? 0 : 0.10)))
             .contentShape(Capsule())
         }
         .buttonStyle(.plain)
@@ -400,7 +598,8 @@ struct LibraryView: View {
             }
         }
         .padding(2)
-        .background(RoundedRectangle(cornerRadius: 9).fill(.white.opacity(0.06)))
+        .background(RoundedRectangle(cornerRadius: 9).fill(.ultraThinMaterial))
+        .overlay(RoundedRectangle(cornerRadius: 9).strokeBorder(.white.opacity(0.08)))
     }
 
     private var sortMenu: some View {
@@ -419,7 +618,8 @@ struct LibraryView: View {
             }
             .foregroundStyle(WaifuTheme.secondary)
             .padding(.horizontal, 11).padding(.vertical, 7)
-            .background(Capsule().fill(.white.opacity(0.06)))
+            .background(Capsule().fill(.ultraThinMaterial))
+            .overlay(Capsule().strokeBorder(.white.opacity(0.08)))
         }
         .menuStyle(.borderlessButton).fixedSize()
     }
@@ -483,119 +683,260 @@ enum WaifuTheme {
     static let secondary = Color.white.opacity(0.62)
     static let tertiary = Color.white.opacity(0.40)
     static let card = Color.white.opacity(0.06)
+    /// 玻璃描边(白 ~10% 透明的细 hairline)。
+    static let glassStroke = Color.white.opacity(0.10)
+    static let glassStrokeStrong = Color.white.opacity(0.14)
 }
 
-/// 首页大图 hero 轮播:大预览 + 标题/元信息 + 设为壁纸/收藏 + 左右切换 + 圆点。
-struct HeroCarousel: View {
-    let items: [WallpaperItem]
-    @Binding var index: Int
-    var currentID: String?
-    var maxHeight: CGFloat = 360
-    var onSet: (WallpaperItem) -> Void
-    var onToggleFav: (WallpaperItem) -> Void
+// MARK: - 玻璃质感修饰符(frosted glass)
+//
+// 统一首页/货架的玻璃视觉:material 模糊托底 + 圆角 + 细描边(白 ~10%)+ 柔和阴影。
+// 深色背景下文字另行提白加阴影(各处文字已 .foregroundStyle(.white) + shadow)。
 
-    @State private var thumb: NSImage?
-    @State private var loadToken = 0        // 防止切换后旧异步图覆盖
-    @State private var hasRendered = false   // 已显示实际渲染图 → 不再被 gif 占位覆盖
+extension View {
+    /// 玻璃**卡片**:圆角矩形 material 托底 + hairline 描边 + 柔和阴影(用于 hero 标题卡、区块头等)。
+    func glassCard(cornerRadius: CGFloat = 16,
+                   material: Material = .ultraThinMaterial,
+                   strong: Bool = false) -> some View {
+        let shape = RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+        return self
+            .background(shape.fill(material))
+            .overlay(shape.strokeBorder(strong ? WaifuTheme.glassStrokeStrong : WaifuTheme.glassStroke, lineWidth: 1))
+            .clipShape(shape)
+            .shadow(color: .black.opacity(0.32), radius: 14, y: 6)
+    }
 
-    private var item: WallpaperItem { items[min(index, items.count - 1)] }
+    /// 玻璃**胶囊**:Capsule material 托底 + hairline 描边 + 阴影(用于角标、状态胶囊等)。
+    func glassCapsule(material: Material = .ultraThinMaterial) -> some View {
+        self
+            .background(Capsule().fill(material))
+            .overlay(Capsule().strokeBorder(WaifuTheme.glassStroke, lineWidth: 1))
+            .clipShape(Capsule())
+            .shadow(color: .black.opacity(0.28), radius: 8, y: 3)
+    }
+}
 
-    // 图片为基底 + 所有装饰用 .overlay 钉在基底 320 高的框上(避免 .aspectRatio(.fill) 把 ZStack 撑大
-    // 导致底部信息被裁掉看不见 —— 这是之前标题不显示的根因)。
+/// 首页 hero「6 张精选」轮播:full-bleed 大图区展示当前选中的精选(复用 `WorkshopHero` 的完整壁纸 +
+/// 玻璃质感 + 直接下载),底部右侧浮一条**玻璃缩略选择条**(6 张精选),点选切换大图 / 自动每 6 秒轮播;
+/// 下方一排玻璃圆点指示当前页。点击大图或「下载」按钮 → 直接下载当前精选(沿用 WorkshopHero 逻辑)。
+struct WorkshopHeroCarousel: View {
+    let items: [WorkshopFeed.Item]
+    var height: CGFloat
+    var inLibrary: (String) -> Bool
+    var onDownload: (WorkshopFeed.Item) -> Void
+
+    @State private var index = 0
+    // 自动轮播:每 6 秒前进一张(用户点选缩略图会切到该张,计时继续)。
+    private let autoAdvance = Timer.publish(every: 6, on: .main, in: .common).autoconnect()
+
+    private var current: WorkshopFeed.Item { items[min(index, items.count - 1)] }
+
     var body: some View {
-        // 16:9 box(用户要求按 16:9,避免人物被裁;占满宽度,过高时按 maxHeight 收窄居中,留出下方货架一行)。
-        Color.clear
-            .aspectRatio(16.0 / 9.0, contentMode: .fit)
-            .frame(maxWidth: .infinity, maxHeight: maxHeight)
-            .background {
-                Group {
-                    if let thumb { Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill) }
-                    else { Rectangle().fill(.white.opacity(0.06)) }
-                }
+        ZStack(alignment: .bottomTrailing) {
+            // 大图区:当前精选(按 id 切换 → 干净换图 + 渐隐过渡)。完整 16:9 + 玻璃 + 直接下载全在 WorkshopHero。
+            WorkshopHero(item: current,
+                         inLibrary: inLibrary(current.id),
+                         height: height,
+                         onDownload: { onDownload(current) })
+                .id(current.id)
+                .transition(.opacity)
+
+            // 底部右侧:玻璃缩略选择条 + 圆点指示(避开左下标题卡)。
+            VStack(alignment: .trailing, spacing: 8) {
+                heroThumbStrip
+                heroDots
             }
-            .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay {   // 暗化渐变(左 + 下),保证标题可读
+            .padding(.trailing, 36).padding(.bottom, 30)
+            .allowsHitTesting(true)
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: height)
+        .clipped()
+        .onReceive(autoAdvance) { _ in
+            guard items.count > 1 else { return }
+            withAnimation(.easeInOut(duration: 0.45)) { index = (index + 1) % items.count }
+        }
+        .onChange(of: items.count) { _ in if index >= items.count { index = 0 } }
+    }
+
+    /// 玻璃缩略选择条:6 张精选小图,点选切换大图;当前张高亮描边。
+    private var heroThumbStrip: some View {
+        HStack(spacing: 8) {
+            ForEach(Array(items.enumerated()), id: \.element.id) { i, it in
+                HeroThumbChip(item: it, selected: i == index)
+                    .onTapGesture { withAnimation(.easeInOut(duration: 0.4)) { index = i } }
+            }
+        }
+        .padding(6)
+        .glassCard(cornerRadius: 14)
+    }
+
+    /// 圆点页码指示(当前页强调色填充)。
+    private var heroDots: some View {
+        HStack(spacing: 6) {
+            ForEach(items.indices, id: \.self) { i in
+                Capsule()
+                    .fill(i == index ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.white.opacity(0.35)))
+                    .frame(width: i == index ? 16 : 6, height: 6)
+                    .animation(.easeInOut(duration: 0.3), value: index)
+            }
+        }
+        .padding(.horizontal, 8).padding(.vertical, 5)
+        .glassCapsule()
+    }
+}
+
+/// 轮播缩略选择条里的单个小图(完整 16:9 缩略图 + 选中态描边/缩放)。远程缩略图异步加载。
+struct HeroThumbChip: View {
+    let item: WorkshopFeed.Item
+    var selected: Bool
+    @State private var thumb: NSImage?
+    @State private var hovering = false
+
+    var body: some View {
+        CompleteThumb(image: thumb)
+            .frame(width: 64, height: 36)   // 16:9
+            .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8, style: .continuous)
+                    .strokeBorder(selected ? AnyShapeStyle(Color.accentColor)
+                                           : AnyShapeStyle(Color.white.opacity(hovering ? 0.4 : 0.12)),
+                                  lineWidth: selected ? 2 : 1)
+            )
+            .scaleEffect(selected ? 1.08 : (hovering ? 1.04 : 1.0))
+            .shadow(color: .black.opacity(selected ? 0.4 : 0.2), radius: selected ? 8 : 4, y: 2)
+            .animation(.spring(response: 0.3, dampingFraction: 0.7), value: selected)
+            .animation(.easeOut(duration: 0.15), value: hovering)
+            .contentShape(Rectangle())
+            .onHover { hovering = $0 }
+            .help(item.title)
+            .onAppear {
+                guard thumb == nil else { return }
+                ThumbnailCache.shared.remoteThumbnail(for: item.previewURL) { img in self.thumb = img }
+            }
+    }
+}
+
+/// 首页**工坊**大图 hero:工坊热门第一张做大预览 + 标题 + 「下载」按钮。
+/// **full-bleed + 完整壁纸**:占满窗口宽度、铺到窗口最顶部(标签栏浮于其上);16:9 框内用 `.fit` 显示
+/// **整张**壁纸(不裁人物/边缘),框内非 16:9 的留白处用同图虚化放大 + 玻璃暗化补底(无死黑边)。
+/// 标题/下载按钮/来源角标用玻璃卡片浮在上面。远程缩略图(CDN)异步加载。
+/// 点击整块或「下载」按钮 → **直接在 app 内订阅 + SteamCMD 下载**(不再跳转创意工坊网页 tab)。
+struct WorkshopHero: View {
+    let item: WorkshopFeed.Item
+    var inLibrary: Bool
+    var height: CGFloat
+    var onDownload: () -> Void
+
+    @ObservedObject private var downloader = WorkshopDownloader.shared
+    @State private var thumb: NSImage?
+
+    /// 该 hero 对应的下载任务(若正在下/排队/失败,卡片据此显示进度/失败)。
+    private var job: WorkshopDownloader.Job? { downloader.jobs.first { $0.id == item.id } }
+
+    var body: some View {
+        ZStack {
+            // ① 虚化放大的同图铺满做底(玻璃高级感,避免 fit 留死黑边)。
+            if let thumb {
+                Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: height)
+                    .clipped()
+                    .blur(radius: 40)
+                    .opacity(0.55)
+                    .overlay(Color.black.opacity(0.28))   // 玻璃暗化,统一压暗虚化底
+            } else {
+                Rectangle().fill(.white.opacity(0.06))
+                    .frame(maxWidth: .infinity).frame(height: height)
+            }
+
+            // ② 完整壁纸(16:9 框内 .fit,整张图都在、不裁人物/边缘)。
+            if let thumb {
+                Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fit)
+                    .frame(maxWidth: .infinity)
+                    .frame(height: height)
+            } else {
+                ProgressView().controlSize(.large)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: height)
+        .clipped()
+        .overlay {   // 暗化渐变(左 + 下),保证标题/标签栏文字可读
             ZStack {
-                LinearGradient(colors: [.black.opacity(0.72), .black.opacity(0.15), .clear],
+                LinearGradient(colors: [.black.opacity(0.62), .black.opacity(0.10), .clear],
                                startPoint: .leading, endPoint: .trailing)
-                LinearGradient(colors: [.clear, .black.opacity(0.2), .black.opacity(0.62)],
+                LinearGradient(colors: [.clear, .black.opacity(0.18), .black.opacity(0.58)],
                                startPoint: .center, endPoint: .bottom)
             }
             .allowsHitTesting(false)
         }
-        .overlay(alignment: .bottomLeading) {
-            VStack(alignment: .leading, spacing: 12) {
-                TypeBadge(type: item.type)
-                Text(item.title).font(.system(size: 42, weight: .bold)).foregroundStyle(.white)
-                    .lineLimit(2).shadow(color: .black.opacity(0.65), radius: 8)
-                HStack(spacing: 8) {
-                    Text(item.type.displayName)
-                    Text("·"); Text(sizeText(item.fileSize))
-                }.font(.system(size: 13, weight: .medium)).foregroundStyle(.white.opacity(0.88))
-                HStack(spacing: 10) {
-                    Button { onSet(item) } label: {
-                        Label(item.id == currentID ? "正在播放" : "设为壁纸",
-                              systemImage: item.id == currentID ? "checkmark.circle.fill" : "play.fill")
-                            .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
-                            .padding(.horizontal, 18).padding(.vertical, 10)
-                            .background(Capsule().fill(item.id == currentID ? AnyShapeStyle(.white.opacity(0.22)) : AnyShapeStyle(Color.accentColor)))
-                    }.buttonStyle(.plain)
-                    Button { onToggleFav(item) } label: {
-                        Image(systemName: PreferencesStore.shared.isFavorite(item.id) ? "heart.fill" : "heart")
-                            .font(.system(size: 14, weight: .semibold))
-                            .foregroundStyle(PreferencesStore.shared.isFavorite(item.id) ? .pink : .white)
-                            .frame(width: 38, height: 38).background(Circle().fill(.white.opacity(0.18)))
-                    }.buttonStyle(.plain)
-                }
-                .padding(.top, 4)
+        .overlay(alignment: .topLeading) {
+            // 「创意工坊」来源角标 —— 玻璃胶囊托底(下移避开浮动标签栏)。
+            HStack(spacing: 5) {
+                Image(systemName: "flame.fill").font(.system(size: 10, weight: .bold)).foregroundStyle(.orange)
+                Text("创意工坊热门").font(.system(size: 12, weight: .bold)).foregroundStyle(.white)
             }
+            .padding(.horizontal, 11).padding(.vertical, 6)
+            .glassCapsule()
+            .padding(.leading, 28).padding(.top, 64)
+        }
+        .overlay(alignment: .bottomLeading) {
+            // 标题 + 下载按钮 —— 玻璃卡片浮在完整壁纸上。
+            VStack(alignment: .leading, spacing: 14) {
+                Text(item.title).font(.system(size: 38, weight: .bold)).foregroundStyle(.white)
+                    .lineLimit(2).shadow(color: .black.opacity(0.7), radius: 10, y: 2)
+                heroActionButton
+            }
+            .padding(.horizontal, 22).padding(.vertical, 18)
+            .glassCard(cornerRadius: 22)
             .padding(36)
         }
-        .overlay(alignment: .leading) {
-            heroArrow("chevron.left") { index = (index - 1 + items.count) % items.count }.padding(.leading, 12)
+        .overlay(alignment: .top) {
+            Rectangle().strokeBorder(.white.opacity(0.06), lineWidth: 1).allowsHitTesting(false)
         }
-        .overlay(alignment: .trailing) {
-            heroArrow("chevron.right") { index = (index + 1) % items.count }.padding(.trailing, 12)
+        .contentShape(Rectangle())
+        .onTapGesture { if !inLibrary { onDownload() } }
+        .onAppear {
+            guard thumb == nil else { return }
+            ThumbnailCache.shared.remoteThumbnail(for: item.previewURL) { img in self.thumb = img }
         }
-        .overlay(alignment: .bottom) {
-            HStack(spacing: 6) {
-                ForEach(items.indices, id: \.self) { i in
-                    Circle().fill(.white.opacity(i == index ? 0.95 : 0.35)).frame(width: 6, height: 6)
-                }
-            }
-            .padding(.bottom, 12)
-        }
-        .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-        .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(.white.opacity(0.10)))
-        .shadow(color: .black.opacity(0.4), radius: 18, y: 8)
-        .onChange(of: index) { _ in loadThumb() }
-        .onChange(of: item.id) { _ in loadThumb() }
-        .onAppear { loadThumb() }
     }
 
-    private func heroArrow(_ icon: String, _ act: @escaping () -> Void) -> some View {
-        Button(action: { withAnimation(.easeOut(duration: 0.2)) { act() } }) {
-            Image(systemName: icon).font(.system(size: 14, weight: .bold)).foregroundStyle(.white)
-                .frame(width: 36, height: 36).background(Circle().fill(.black.opacity(0.4)))
-        }.buttonStyle(.plain).opacity(items.count > 1 ? 1 : 0)
+    /// hero 行动按钮:已在库=绿标;下载中=进度;失败=可重试;否则「下载」。
+    @ViewBuilder
+    private var heroActionButton: some View {
+        if inLibrary {
+            heroPill("已在库", icon: "checkmark.circle.fill", bg: AnyShapeStyle(.ultraThinMaterial))
+        } else if let job, WorkshopDownloader.isActive(job.state) {
+            HStack(spacing: 8) {
+                ProgressView().controlSize(.small).scaleEffect(0.8).tint(.white)
+                Text(job.fraction.map { String(format: "下载中 %d%%", Int($0 * 100)) } ?? "下载中…")
+                    .font(.system(size: 13, weight: .semibold).monospacedDigit()).foregroundStyle(.white)
+            }
+            .padding(.horizontal, 18).padding(.vertical, 10)
+            .glassCapsule()
+        } else if let job, case .failed(let reason) = job.state {
+            Button(action: onDownload) {
+                heroPill(reason.count > 16 ? "下载失败 · 重试" : "重试", icon: "arrow.clockwise", bg: AnyShapeStyle(Color.red.opacity(0.75)))
+            }.buttonStyle(.plain).help(reason)
+        } else {
+            Button(action: onDownload) {
+                heroPill("下载", icon: "arrow.down.circle.fill", bg: AnyShapeStyle(Color.accentColor))
+            }
+            .buttonStyle(.plain)
+            .disabled(!downloader.isSteamCMDAvailable)
+            .help(downloader.isSteamCMDAvailable ? "直接下载到壁纸库" : "未安装 SteamCMD")
+        }
     }
 
-    private func loadThumb() {
-        guard items.indices.contains(index) else { thumb = nil; return }
-        loadToken += 1
-        let token = loadToken
-        let target = item
-        hasRendered = false
-        // ① preview.gif 大图快速占位(可能低清)
-        if let url = target.previewURL {
-            ThumbnailCache.shared.largeImage(for: url) { img in
-                if token == self.loadToken, !self.hasRendered, let img { self.thumb = img }
-            }
-        }
-        // ② 实际渲染图(场景引擎离屏渲染 / 视频抽帧)替换占位,更清晰真实
-        RenderedPreviewCache.shared.image(for: target) { img in
-            if token == self.loadToken, let img { self.thumb = img; self.hasRendered = true }
-        }
+    private func heroPill(_ text: String, icon: String, bg: AnyShapeStyle) -> some View {
+        Label(text, systemImage: icon)
+            .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+            .padding(.horizontal, 18).padding(.vertical, 10)
+            .background(Capsule().fill(bg))
+            .overlay(Capsule().strokeBorder(.white.opacity(0.16)))
+            .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
     }
 }
 
@@ -625,6 +966,27 @@ struct EmptyStateView: View {
     }
 }
 
+/// 完整缩略图:在框内显示**整张**图(.fit,不裁人物/边缘),两侧/上下用同图虚化放大补底(玻璃暗化),
+/// 无图时显示占位骨架 + 进度。用于货架卡片(WallpaperCard / WorkshopCard)。
+struct CompleteThumb: View {
+    let image: NSImage?
+    var body: some View {
+        ZStack {
+            if let image {
+                // 同图虚化放大铺满做底(避免 fit 留死黑边)。
+                Image(nsImage: image).resizable().aspectRatio(contentMode: .fill)
+                    .blur(radius: 18)
+                    .overlay(Color.black.opacity(0.25))
+                // 完整图(.fit,整张都在)。
+                Image(nsImage: image).resizable().aspectRatio(contentMode: .fit)
+            } else {
+                Rectangle().fill(.white.opacity(0.05))
+                ProgressView().controlSize(.small)
+            }
+        }
+    }
+}
+
 /// 壁纸卡片(WaifuX 风:连续圆角 + 类型/大小角标 + 悬停放大 + 渐变标题)。
 struct WallpaperCard: View {
     let item: WallpaperItem
@@ -638,13 +1000,11 @@ struct WallpaperCard: View {
 
     var body: some View {
         ZStack {
-            Group {
-                if let thumb { Image(nsImage: thumb).resizable().aspectRatio(contentMode: .fill) }
-                else { Rectangle().fill(.white.opacity(0.05)).overlay(ProgressView().controlSize(.small)) }
-            }
-            .frame(maxWidth: .infinity)
-            .aspectRatio(16.0/9.0, contentMode: .fit)
-            .clipped()
+            // 16:9 卡框内显示**完整**缩略图(.fit),两侧/上下用同图虚化做底,避免死黑边。
+            CompleteThumb(image: thumb)
+                .frame(maxWidth: .infinity)
+                .aspectRatio(16.0/9.0, contentMode: .fit)
+                .clipped()
 
             VStack {
                 Spacer()
@@ -695,9 +1055,16 @@ struct WallpaperCard: View {
         .frame(maxWidth: .infinity)
         .background(Color.black.opacity(0.001))
         .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        // 悬停时上缘玻璃高光,呼应 frosted glass。
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(LinearGradient(colors: [.white.opacity(hovering ? 0.14 : 0), .clear],
+                                     startPoint: .top, endPoint: .center))
+                .allowsHitTesting(false)
+        )
         .overlay(
             RoundedRectangle(cornerRadius: 14, style: .continuous).strokeBorder(
-                isCurrent ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.white.opacity(0.08)),
+                isCurrent ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(Color.white.opacity(hovering ? 0.16 : 0.08)),
                 lineWidth: isCurrent ? 3 : 1)
         )
         .shadow(color: .black.opacity(hovering ? 0.38 : 0.20), radius: hovering ? 18 : 9, y: hovering ? 10 : 4)
@@ -709,8 +1076,153 @@ struct WallpaperCard: View {
         .onHover { hovering = $0 }
         .onAppear {
             guard thumb == nil, let url = item.previewURL else { return }
-            ThumbnailCache.shared.thumbnail(for: url) { img in self.thumb = img }
+            // 先取本地 preview(快,绝大多数卡片到此为止)。
+            ThumbnailCache.shared.thumbnail(for: url) { img in
+                self.thumb = img
+                // 仅当:scene 类型 + 取到的本地 preview 首帧近全黑(开场动画类壁纸的 preview.gif 首帧是黑幕)
+                // → 回退用引擎离屏渲染图(惰性 + 磁盘缓存,且仅库窗口可见时才渲)。
+                // 非黑卡片 / video / web 不触发,避免全量渲染拖慢、烧 GPU。
+                guard item.type == .scene,
+                      let img, ThumbnailCache.shared.isNearBlack(img) else { return }
+                RenderedPreviewCache.shared.image(for: item) { rendered in
+                    if let rendered { self.thumb = rendered }
+                }
+            }
         }
+        // 卡片滚出视口(LazyVGrid 回收):撤销尚未开始的离屏渲染请求,
+        // 避免快速滚动时把整库的近黑场景卡片都排进渲染队列烧 GPU。
+        .onDisappear { RenderedPreviewCache.shared.cancel(item.id) }
+    }
+}
+
+/// 创意工坊在线推荐卡片(首页货架用):远程缩略图 + 标题 + 「热门」/「在库」/「下载中」角标。
+/// 点击 → **直接在 app 内订阅 + SteamCMD 下载**到壁纸库(不再跳转工坊网页)。视觉与 WallpaperCard 一致。
+struct WorkshopCard: View {
+    let item: WorkshopFeed.Item
+    var inLibrary: Bool
+    var onDownload: () -> Void
+
+    @ObservedObject private var downloader = WorkshopDownloader.shared
+    @State private var thumb: NSImage?
+    @State private var hovering = false
+
+    private var job: WorkshopDownloader.Job? { downloader.jobs.first { $0.id == item.id } }
+    private var isDownloading: Bool { job.map { WorkshopDownloader.isActive($0.state) } ?? false }
+    private var failedReason: String? {
+        if let job, case .failed(let r) = job.state { return r }; return nil
+    }
+
+    var body: some View {
+        ZStack {
+            // 16:9 卡框内显示**完整**缩略图(.fit),两侧/上下用同图虚化做底,避免死黑边。
+            CompleteThumb(image: thumb)
+                .frame(maxWidth: .infinity)
+                .aspectRatio(16.0/9.0, contentMode: .fit)
+                .clipped()
+
+            VStack {
+                Spacer()
+                HStack {
+                    Text(item.title).font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                        .lineLimit(1).shadow(color: .black.opacity(0.5), radius: 3, y: 1)
+                    Spacer()
+                }
+                .padding(.horizontal, 12).padding(.bottom, 9).padding(.top, 30)
+                .background(LinearGradient(colors: [.clear, .black.opacity(0.35), .black.opacity(0.82)],
+                                           startPoint: .top, endPoint: .bottom))
+            }
+
+            // 悬停时中心图标:已在库=√、下载中=进度、其余=下载箭头。
+            if hovering || isDownloading {
+                if isDownloading {
+                    VStack(spacing: 4) {
+                        ProgressView().controlSize(.small).tint(.white)
+                        if let f = job?.fraction {
+                            Text(String(format: "%d%%", Int(f * 100)))
+                                .font(.system(size: 11, weight: .bold).monospacedDigit()).foregroundStyle(.white)
+                        }
+                    }
+                    .padding(12).background(.black.opacity(0.5), in: RoundedRectangle(cornerRadius: 12))
+                    .transition(.scale.combined(with: .opacity))
+                } else {
+                    Image(systemName: inLibrary ? "checkmark.circle.fill" : "arrow.down.circle.fill")
+                        .font(.system(size: 42))
+                        .foregroundStyle(.white.opacity(0.95)).shadow(radius: 6)
+                        .transition(.scale.combined(with: .opacity))
+                }
+            }
+
+            VStack {
+                HStack(alignment: .top) {
+                    // 「热门工坊」角标
+                    HStack(spacing: 3) {
+                        Image(systemName: "flame.fill").font(.system(size: 8, weight: .bold))
+                        Text("工坊").font(.system(size: 10, weight: .bold))
+                    }
+                    .padding(.horizontal, 7).padding(.vertical, 3)
+                    .background(Color.orange.opacity(0.92), in: Capsule())
+                    .foregroundStyle(.white)
+                    Spacer()
+                    statusBadge
+                }
+                Spacer()
+            }
+            .padding(8)
+        }
+        .frame(maxWidth: .infinity)
+        .background(Color.black.opacity(0.001))
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+        // 悬停时上缘玻璃高光,呼应 frosted glass。
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(LinearGradient(colors: [.white.opacity(hovering ? 0.14 : 0), .clear],
+                                     startPoint: .top, endPoint: .center))
+                .allowsHitTesting(false)
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .strokeBorder(Color.white.opacity(hovering ? 0.16 : 0.08), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(hovering ? 0.38 : 0.20), radius: hovering ? 18 : 9, y: hovering ? 10 : 4)
+        .scaleEffect(hovering ? 1.03 : 1.0)
+        .animation(.spring(response: 0.32, dampingFraction: 0.72), value: hovering)
+        .contentShape(Rectangle())
+        .onTapGesture { if !inLibrary && !isDownloading { onDownload() } }
+        .onHover { hovering = $0 }
+        .help(helpText)
+        .onAppear {
+            guard thumb == nil else { return }
+            ThumbnailCache.shared.remoteThumbnail(for: item.previewURL) { img in self.thumb = img }
+        }
+    }
+
+    /// 右上角状态角标:已在库 / 下载中 % / 失败。
+    @ViewBuilder
+    private var statusBadge: some View {
+        if inLibrary {
+            badge("已在库", icon: "checkmark", color: .green)
+        } else if isDownloading {
+            badge(job?.fraction.map { String(format: "%d%%", Int($0 * 100)) } ?? "下载中", icon: "arrow.down", color: .accentColor)
+        } else if failedReason != nil {
+            badge("失败", icon: "exclamationmark", color: .red)
+        }
+    }
+
+    private func badge(_ text: String, icon: String, color: Color) -> some View {
+        HStack(spacing: 3) {
+            Image(systemName: icon).font(.system(size: 8, weight: .bold))
+            Text(text).font(.system(size: 10, weight: .bold).monospacedDigit())
+        }
+        .padding(.horizontal, 7).padding(.vertical, 3)
+        .background(color.opacity(0.85), in: Capsule())
+        .foregroundStyle(.white)
+    }
+
+    private var helpText: String {
+        if inLibrary { return "已在壁纸库中" }
+        if isDownloading { return "下载中…" }
+        if let r = failedReason { return "下载失败:\(r)(点击重试)" }
+        return downloader.isSteamCMDAvailable ? "点击直接下载到壁纸库" : "未安装 SteamCMD,无法下载"
     }
 }
 
@@ -730,30 +1242,5 @@ struct TypeBadge: View {
     }
     private var color: Color {
         switch type { case .video: return .blue; case .scene: return .purple; case .web: return .green; default: return .gray }
-    }
-}
-
-/// 设置 sheet(WaifuX 风:深色,复用分组设置表单 + 关闭按钮)。
-struct SettingsSheet: View {
-    let actions: LibraryActions
-    var currentItem: WallpaperItem?
-    var onClose: () -> Void
-
-    var body: some View {
-        VStack(spacing: 0) {
-            HStack {
-                Text("设置").font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
-                Spacer()
-                Button(action: onClose) {
-                    Image(systemName: "xmark.circle.fill").font(.system(size: 18)).foregroundStyle(WaifuTheme.secondary)
-                }.buttonStyle(.plain).keyboardShortcut(.cancelAction)
-            }
-            .padding(.horizontal, 20).padding(.vertical, 14)
-            Divider().opacity(0.3)
-            SettingsForm(actions: actions, currentItem: currentItem)
-        }
-        .frame(width: 720, height: 620)
-        .background(WaifuTheme.background.ignoresSafeArea())
-        .preferredColorScheme(.dark)
     }
 }

@@ -25,7 +25,7 @@ final class Scene3DScriptHost {
     /// **速度**:pkg 默认 timenum=1/timedw=0 = 实时(1 秒/秒,行星几乎不可见地慢——这是写实科普壁纸,用户拖速度滑块加速)。
     ///   WP_SOLAR_SPEED 不直接乘 Date.now()(会被脚本 clamp(…,100) 吃掉,无效),而是**预置 storage 的 timedw 档位**
     ///   (走 pkg 自己的速度脚本 id=859/860 路径,忠实)让模拟以该速度跑,供验证/演示。值=时间单位档 0-6(默认 nil=不预置=实时)。
-    static let solarSpeedUnit: Int? = ProcessInfo.processInfo.environment["WP_SOLAR_SPEED"].flatMap { Int($0) }.map { max(0, min(6, $0)) }
+    static let solarSpeedUnit: Int? = WPEnv.vars["WP_SOLAR_SPEED"].flatMap { Int($0) }.map { max(0, min(6, $0)) }
     private var nowAnchorMs: Double = 0      // 首帧锚定的真实当前毫秒(模拟起算日期)
     private var nowAnchored = false
     /// sim 时钟开关:**仅日心太阳系模拟启用**(让 Date.now() 随 engine.runtime 推进 → 行星公转)。
@@ -578,7 +578,7 @@ final class Scene3DRuntime {
         func isScript(_ v: Any?) -> Bool { (v as? [String: Any])?["script"] != nil }
 
         // 脚本宿主:注册全部对象全部 {script} 属性(共享单 context 的 globalThis.shared)。WP_NO_3D_SCRIPTS=1 关。
-        let h: Scene3DScriptHost? = ProcessInfo.processInfo.environment["WP_NO_3D_SCRIPTS"] == nil ? Scene3DScriptHost() : nil
+        let h: Scene3DScriptHost? = WPEnv.vars["WP_NO_3D_SCRIPTS"] == nil ? Scene3DScriptHost() : nil
         var hasHeliocentricSim = false   // 日心太阳系模拟(Main 写 shared.currentFocus)→ 启用 Date.now() sim 时钟,行星公转
         if let h = h {
             for o in objects {
@@ -589,14 +589,14 @@ final class Scene3DRuntime {
                     if src.contains("shared.currentFocus") { hasHeliocentricSim = true }
                     var sp = d["scriptproperties"] as? [String: Any] ?? [:]
                     // 调试覆盖(默认遵 pkg 值):mode(1中点log/2线性/3/4真比例)、initialFocus(0总览 1-13天体)。
-                    if let m = ProcessInfo.processInfo.environment["WP_SOLAR_MODE"], let mv = Double(m), sp["mode"] != nil { sp["mode"] = mv }
-                    if let fc = ProcessInfo.processInfo.environment["WP_SOLAR_FOCUS"], let fv = Double(fc), sp["initialFocus"] != nil { sp["initialFocus"] = fv }
+                    if let m = WPEnv.vars["WP_SOLAR_MODE"], let mv = Double(m), sp["mode"] != nil { sp["mode"] = mv }
+                    if let fc = WPEnv.vars["WP_SOLAR_FOCUS"], let fv = Double(fc), sp["initialFocus"] != nil { sp["initialFocus"] = fv }
                     let sv: SIMD3<Float> = (prop == "scale") ? SIMD3(1, 1, 1) : Self.f3(d["value"], .zero)
                     h.register(id: id, prop: prop, source: src, scriptProps: sp, staticValue: sv)
                 }
             }
             // 仅日心太阳系启用 sim 时钟(Date.now() 随 engine.runtime 推进 → 行星公转);WP_NO_SOLAR_ORBIT=1 关。
-            if hasHeliocentricSim && ProcessInfo.processInfo.environment["WP_NO_SOLAR_ORBIT"] == nil { h.enableSimClock() }
+            if hasHeliocentricSim && WPEnv.vars["WP_NO_SOLAR_ORBIT"] == nil { h.enableSimClock() }
             // 安装真实场景层(name/id→层对象),让 Main 模拟 thisScene.getLayer(name).origin=轨道位置 命中真层。
             var ldefs: [[String: Any]] = []
             for o in objects { if let id = intOf(o["id"]) { ldefs.append(["id": id, "name": (o["name"] as? String) ?? ""]) } }

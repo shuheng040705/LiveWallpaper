@@ -9,6 +9,7 @@ struct SettingsForm: View {
 
     @State private var showSteamLogin = false
     @State private var steamAccount = PreferencesStore.shared.steamAccount
+    @State private var subscribedSummary = "检测你账号订阅的全部工坊壁纸,可批量下载"
 
     var body: some View {
         Form {
@@ -27,6 +28,7 @@ struct SettingsForm: View {
         .sheet(isPresented: $showSteamLogin) {
             SteamLoginSheet(onDone: { steamAccount = PreferencesStore.shared.steamAccount })
         }
+        .task { subscribedSummary = await SteamSubscriptions.summaryLine() }
     }
 
     // MARK: - 通用行辅助(标题 + 可选副标题 + 右侧控件)
@@ -162,6 +164,7 @@ struct SettingsForm: View {
 
     @State private var metalFX = PreferencesStore.shared.metalFXEnabled
     @State private var renderScale = PreferencesStore.shared.renderScale
+    @State private var presentScale = PreferencesStore.shared.presentScale
     @State private var fxaa = PreferencesStore.shared.fxaaEnabled
     @State private var scaleMode = PreferencesStore.shared.wallpaperScaleMode
     @State private var syncPresent = PreferencesStore.shared.syncPresent
@@ -183,6 +186,19 @@ struct SettingsForm: View {
                         .frame(width: 40, alignment: .trailing)
                 }
             }
+            row("呈现分辨率", "唯一能降 WindowServer(系统合成器)占用的项:越低越省 GPU;100% = 原生") {
+                HStack(spacing: 8) {
+                    Slider(value: $presentScale, in: 0.5...1.0, step: 0.05)
+                        .frame(width: 170)
+                        .onChange(of: presentScale) { v in
+                            PreferencesStore.shared.presentScale = v
+                            actions.onAssetsPathChanged()
+                        }
+                    Text(String(format: "%.0f%%", presentScale * 100))
+                        .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
+                        .frame(width: 40, alignment: .trailing)
+                }
+            }
             toggleRow("FXAA 抗锯齿", "呈现时做一次快速抗锯齿,边缘更平滑(开销很低)", $fxaa) {
                 PreferencesStore.shared.fxaaEnabled = $0
             }
@@ -196,7 +212,7 @@ struct SettingsForm: View {
                     actions.onAssetsPathChanged()
                 }
             }
-            toggleRow("同步呈现(修内屏撕裂)", "内屏(120Hz ProMotion)出现横向分带 / 撕裂时开启;若变黑请关掉", $syncPresent) {
+            toggleRow("同步呈现(修内屏撕裂)", "内屏(120Hz ProMotion)出现横向分带 / 撕裂时开启；使用垂直同步双缓冲，需重启壁纸生效", $syncPresent) {
                 PreferencesStore.shared.syncPresent = $0
                 actions.onAssetsPathChanged()
             }
@@ -226,6 +242,7 @@ struct SettingsForm: View {
     @State private var loginEnabled = LoginItem.isEnabled
     @State private var powerEnabled = true
     @State private var occlusionThreshold = PreferencesStore.shared.occlusionThreshold
+    @State private var reportGaps = PreferencesStore.shared.reportRenderGaps
 
     private var generalSection: some View {
         Section("通用") {
@@ -234,6 +251,9 @@ struct SettingsForm: View {
             }
             toggleRow("遮挡时自动暂停", "桌面被全屏 / 窗口遮挡时暂停渲染省电", $powerEnabled) {
                 actions.onPowerChanged($0)
+            }
+            toggleRow("渲染缺口报错", "开发/纠错用:每次切换壁纸时,弹窗列出该壁纸没能正确渲染的项(特效/贴图/合成层等)", $reportGaps) {
+                PreferencesStore.shared.reportRenderGaps = $0
             }
             row("暂停遮挡阈值", "遮挡达此比例即停渲染;「仅全屏」只在真正全屏时停") {
                 Picker("", selection: $occlusionThreshold) {
@@ -254,9 +274,14 @@ struct SettingsForm: View {
 
     @State private var muted = PreferencesStore.shared.isMuted
     @State private var volume = PreferencesStore.shared.volume
+    @State private var audioReactive = PreferencesStore.shared.audioReactiveEnabled
 
     private var soundSection: some View {
         Section("声音") {
+            toggleRow("音频反应", "音频条/律动随系统音乐起伏(需采集系统音频)。CPU 偏高时可关,音频壁纸将不再随声音变化", $audioReactive) {
+                PreferencesStore.shared.audioReactiveEnabled = $0
+                actions.onAssetsPathChanged()   // 重载壁纸:开→重新采集,关→停采集(replayd/coreaudiod 闲置)
+            }
             toggleRow("静音视频壁纸", "视频壁纸不发出声音", $muted) { actions.onMuteChanged($0) }
             row("音量") {
                 HStack(spacing: 8) {
@@ -318,6 +343,12 @@ struct SettingsForm: View {
             row("Steam 账号",
                 steamAccount == nil ? "匿名只能下老壁纸;登录后可下新壁纸" : "已登录:\(steamAccount!)") {
                 Button(steamAccount == nil ? "登录" : "重新登录") { showSteamLogin = true }
+            }
+            row("我的 Steam 订阅", subscribedSummary) {
+                Button("查看…") {
+                    // 改为打开独立可缩放的 NSWindow(取代原 sheet,sheet 无法拖边改大小)。
+                    NotificationCenter.default.post(name: .showSubscriptions, object: nil)
+                }
             }
         }
     }

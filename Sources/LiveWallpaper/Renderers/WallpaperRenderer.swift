@@ -1,4 +1,5 @@
 import AppKit
+import simd
 
 /// 一个渲染器负责把某种类型的壁纸画到一个桌面窗口的内容视图里。
 /// 每块屏幕一个渲染器实例。
@@ -17,6 +18,11 @@ protocol WallpaperRenderer: AnyObject {
     func setFillMode(_ fill: Bool)
     /// 属性改动后就地重载(不重建视图,无黑屏);仅 scene 实现,其它忽略。
     func reloadInPlace()
+    /// 本次加载的渲染缺口(没能正确渲染的项,供 UI 弹窗指明)。仅 scene 实现;其它渲染器无缺口=空。
+    var renderGaps: [String] { get }
+    /// 互动 hit-test:屏幕归一化光标(mouseNorm [-1,1] y上)命中的可交互对象 pkg id(无→nil)。仅 scene 实现。
+    /// 供台前调度穿透(光标在交互对象上→窗口吃点击)+ 反应动画判定。
+    func interactiveHitTest(mouseNorm: SIMD2<Float>) -> Int?
 }
 
 extension WallpaperRenderer {
@@ -24,6 +30,8 @@ extension WallpaperRenderer {
     func setVolume(_ v: Double) {}
     func setFillMode(_ fill: Bool) {}
     func reloadInPlace() {}
+    var renderGaps: [String] { [] }   // 默认无缺口(视频/web 渲染器)
+    func interactiveHitTest(mouseNorm: SIMD2<Float>) -> Int? { nil }   // 默认无交互(视频/web)
 }
 
 /// 根据壁纸类型创建对应渲染器。

@@ -59,7 +59,7 @@ struct WallpaperSettingsPanel: View {
             Divider().opacity(0.4)
             ScrollView {
                 VStack(alignment: .leading, spacing: 14) {
-                    // WE「属性」通用区:每个壁纸固定的 7 个标准通用控件(与 project.json 无关)。
+                    // WE「属性」通用区:每个壁纸固定的 8 个标准通用控件(与 project.json 无关)。
                     GeneralPropertiesSection(item: item, accent: accent,
                                              schemeColorProp: schemeColorProp,
                                              onChange: { version += 1; onApply() })
@@ -184,9 +184,9 @@ struct WallpaperSettingsPanel: View {
     }
 }
 
-/// WE「属性」通用区:每个壁纸顶部固定的 7 个标准通用控件(与 project.json 自定义属性无关)。
-/// 顺序对齐 WE 实拍:音频监听 / 主题配色 / 音量 / 播放速度 / 翻转 / 图片筛选器 / 显示颜色选项。
-/// 持久化:通用区 6 项存 GeneralWallpaperSettings(per-wallpaper);主题配色复用 project.json 的
+/// WE「属性」通用区:每个壁纸顶部固定的 8 个标准通用控件(与 project.json 自定义属性无关)。
+/// 顺序对齐 WE 实拍:音频监听 / 主题配色 / 音量 / 播放速度 / 鼠标视差 / 翻转 / 图片筛选器 / 显示颜色选项。
+/// 持久化:通用区 7 项存 GeneralWallpaperSettings(per-wallpaper);主题配色复用 project.json 的
 /// schemecolor(若有,走 WallpaperPropertyStore),没有则提供本地默认色块占位。
 struct GeneralPropertiesSection: View {
     let item: WallpaperItem
@@ -225,19 +225,25 @@ struct GeneralPropertiesSection: View {
                                                      set: { g.setPlaybackSpeed($0, item.id); onChange() }),
                       range: 0...100, format: "%.0f")
 
-            // 鼠标视差(bool,WE 标准属性;所有壁纸可控)
-            Toggle(isOn: Binding(get: { g.mouseParallax(item.id) },
-                                 set: { g.setMouseParallax($0, item.id); onChange() })) {
-                Text("鼠标视差").font(.system(size: 12.5))
-            }.toggleStyle(.switch).tint(accent)
+            // 5) 鼠标视差(bool)— 真实 WE 通用区控件,**仅当该壁纸 pkg 确有视差时显示**:
+            //   判据 = scene.json general.cameraparallax==true(= 引擎 hasParallax；amount=0 时 shader
+            //   仍可能读取 g_ParallaxPosition，不能据此隐藏总闸)。
+            //   pkg 无视差(cameraparallax=false/缺失/amount=0)的壁纸 WE 本就不显示此控件 → 此处不渲染。
+            //   默认勾选状态 = pkg 的 cameraparallax(见 g.mouseParallax 默认回退 pkgCameraParallax),非无条件开。
+            if GeneralWallpaperSettings.hasParallax(item.id) {
+                Toggle(isOn: Binding(get: { g.mouseParallax(item.id) },
+                                     set: { g.setMouseParallax($0, item.id); onChange() })) {
+                    Text("鼠标视差").font(.system(size: 12.5))
+                }.toggleStyle(.switch).tint(accent)
+            }
 
-            // 5) 翻转(bool,默认关)
+            // 6) 翻转(bool,默认关)
             Toggle(isOn: Binding(get: { g.flip(item.id) },
                                  set: { g.setFlip($0, item.id); onChange() })) {
                 Text("翻转").font(.system(size: 12.5))
             }.toggleStyle(.switch).tint(accent)
 
-            // 6) 图片筛选器(combo,默认无)
+            // 7) 图片筛选器(combo,默认无)
             HStack {
                 Text("图片筛选器").font(.system(size: 12.5)).lineLimit(1)
                 Spacer()
@@ -249,7 +255,7 @@ struct GeneralPropertiesSection: View {
                 }.labelsHidden().fixedSize()
             }
 
-            // 7) 显示颜色选项(bool,默认关)
+            // 8) 显示颜色选项(bool,默认关)
             Toggle(isOn: Binding(get: { g.showColorOptions(item.id) },
                                  set: { g.setShowColorOptions($0, item.id); onChange() })) {
                 Text("显示颜色选项").font(.system(size: 12.5))

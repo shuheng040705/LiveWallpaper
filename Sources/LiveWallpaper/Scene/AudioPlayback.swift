@@ -102,6 +102,29 @@ final class AudioPlayback: NSObject, AVAudioPlayerDelegate, @unchecked Sendable 
         }
     }
 
+    /// 壁纸自带音频的 WE 媒体快照。系统没有 now-playing 会话时，场景脚本用它驱动
+    /// mediaPlaybackChanged/mediaTimelineChanged。
+    func mediaSnapshot() -> (state: Int, position: Double, duration: Double) {
+        lock.lock()
+        let gs = groups
+        let isPaused = paused
+        let isMuted = muted
+        lock.unlock()
+        guard !gs.isEmpty else { return (0, 0, 0) }
+        let players = gs.flatMap(\.players)
+        let active = players.first(where: { $0.isPlaying })
+            ?? gs.compactMap { group in
+                guard !group.players.isEmpty else { return nil }
+                return group.players[min(group.current, group.players.count - 1)]
+            }.first
+        let state: Int
+        if active?.isPlaying == true { state = 1 }
+        else if isPaused { state = 2 }
+        else if isMuted { state = 0 }
+        else { state = 0 }
+        return (state, max(0, active?.currentTime ?? 0), max(0, active?.duration ?? 0))
+    }
+
     // MARK: - 内部
 
     /// 最终音量 = muted ? 0 : globalVolume × desc.volume。

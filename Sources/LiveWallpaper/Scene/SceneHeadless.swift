@@ -10,6 +10,7 @@ enum SceneHeadless {
 
     static func runIfRequested() -> Bool {
         let args = CommandLine.arguments
+        if args.contains("--perf") { return runPerf(args: args) }
         if args.contains("--ropetest") { return runRopeTest(args: args) }
         if args.contains("--motion") { return runMotion(args: args) }
         if args.contains("--warmrender") { return runWarm(args: args) }
@@ -61,7 +62,7 @@ enum SceneHeadless {
         let simTime = (idx + 4 < args.count) ? Double(args[idx + 4]) : nil
         // 视差复现:WP_MOUSE_X/Y(屏幕归一化 [-1,1])让离屏帧能重现实时鼠标位置下的逐层视差分离。
         // 视差有平滑(delay),需多帧暖机让 displacement 收敛到目标。
-        let env = ProcessInfo.processInfo.environment
+        let env = WPEnv.vars
         let mx = Float(env["WP_MOUSE_X"] ?? "0") ?? 0
         let my = Float(env["WP_MOUSE_Y"] ?? "0") ?? 0
         let warm = Int(env["WP_WARMUP"] ?? "0") ?? 0
@@ -191,6 +192,41 @@ enum SceneHeadless {
                                                          UTType.png.identifier as CFString, 1, nil) else { return }
         CGImageDestinationAddImage(dest, cg, nil)
         CGImageDestinationFinalize(dest)
+    }
+
+    /// 性能 profile:--perf <id> [frames] [WxH] —— 跑 N 帧(默认 180)真实 update+encodeFrame+GPU 执行,
+    /// 配合 WP_PERF 分项计时(每 60 帧打印 skin/part/other/enc 均值)。渲染分辨率默认 3840×2160(模拟内屏);
+    /// 可传 WxH。模拟实时:复用同 inter/target 纹理跨帧。用于定位 scene 壁纸 CPU 大头。
+    private static func runPerf(args: [String]) -> Bool {
+        guard let idx = args.firstIndex(of: "--perf"), idx + 1 < args.count else {
+            err("usage: --perf <id> [frames] [WxH]  (设 WP_PERF=1;默认 180 帧 @ 3840x2160)"); exit(2)
+        }
+        let id = args[idx + 1]
+        let frames = (idx + 2 < args.count) ? (Int(args[idx + 2]) ?? 180) : 180
+        var outW = 3840, outH = 2160
+        if idx + 3 < args.count, args[idx + 3].contains("x") {
+            let p = args[idx + 3].split(separator: "x").compactMap { Int($0) }
+            if p.count == 2 { outW = p[0]; outH = p[1] }
+        }
+        let root = PreferencesStore.shared.libraryRoot
+        let folder = root.appendingPathComponent(id)
+        guard let project = try? Data(contentsOf: folder.appendingPathComponent("project.json")),
+              let json = try? JSONSerialization.jsonObject(with: project) as? [String: Any] else {
+            err("no project.json in \(folder.path)"); exit(1)
+        }
+        let item = WallpaperItem(id: id, folderURL: folder, title: json["title"] as? String ?? id,
+                                 type: WallpaperType(raw: json["type"] as? String),
+                                 fileName: json["file"] as? String,
+                                 previewName: json["preview"] as? String, tags: [])
+        guard let source = SceneSourceFactory.make(for: item),
+              let doc = SceneDocument.build(from: source, item: item),
+              let engine = SceneRenderEngine() else { err("cannot open scene"); exit(1) }
+        engine.load(document: doc, source: source)
+        err("PERF id=\(id) frames=\(frames) out=\(outW)x\(outH) WP_PERF=\(engine.perfOn ? "on" : "OFF(set WP_PERF=1)")")
+        let ok = engine.renderFramesToPNG(width: outW, height: outH, frames: frames, dt: 1.0/30.0,
+                                          outURL: URL(fileURLWithPath: "/tmp/perf_\(id).png"))
+        err(ok ? "PERF done → /tmp/perf_\(id).png" : "PERF render failed")
+        exit(ok ? 0 : 1)
     }
 
     /// rope 验证:--ropetest <id> <out.png> [frames] [longSide]

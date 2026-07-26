@@ -426,7 +426,7 @@ enum TexDecoder {
                 //    .r 当遮罩值,不走 ConvertTexture0Format → 必须保留 R 在 R 通道 → (R,R,R,R)。
                 //    WP_R8_OPAQUE / WP_NO_R8_ALPHA=1 退回旧 (R,R,R,255)(诊断)。
                 guard raw.count >= w * h else { return nil }
-                let env9 = ProcessInfo.processInfo.environment
+                let env9 = WPEnv.vars
                 let r8legacy = env9["WP_R8_OPAQUE"] != nil || env9["WP_NO_R8_ALPHA"] != nil
                 var out = [UInt8](repeating: 255, count: w * h * 4)
                 if dataTexture {

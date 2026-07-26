@@ -280,6 +280,13 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
         wkWebView.load(URLRequest(url: u))
     }
 
+    /// 加载指定 URL(首页工坊货架点卡片 → 在创意工坊 tab 打开该详情页)。
+    /// 标记已加载,避免之后 loadInitialIfNeeded 把它冲回首页。
+    func load(_ url: URL) {
+        didLoad = true
+        wkWebView.load(URLRequest(url: url))
+    }
+
     func goBack() { wkWebView.goBack() }
     func goForward() { wkWebView.goForward() }
     func reload() { wkWebView.reload() }

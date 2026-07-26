@@ -83,7 +83,7 @@ final class WEEffectChain {
     //   部分转译特效 uniformMeta.material 用大写(bloom 2822917890 的 "Threshold"),pkg constantshadervalues
     //   小写("threshold")→ 精确查找 miss → 回退 WE 注解默认(threshold 0.1)→ bright-pass 把整个角色纳入泛光。
     //   全库验证 0 例仅大小写不同的 key 碰撞,且仅精确 miss 时才走小写兜底=原本命中零变化。WP_NO_CASE_INSENSITIVE_PARAM 退。
-    private let caseInsensitiveParams = ProcessInfo.processInfo.environment["WP_NO_CASE_INSENSITIVE_PARAM"] == nil
+    private let caseInsensitiveParams = WPEnv.vars["WP_NO_CASE_INSENSITIVE_PARAM"] == nil
     private let sampler: MTLSamplerState          // clamp + linear(默认/兜底)
     private let samplerRepeat: MTLSamplerState    // repeat + linear:WE 默认 wrap(无 ClampUVs flag);平铺噪声等
     private let samplerNearest: MTLSamplerState        // clamp  + nearest(NoInterpolation + ClampUVs)
@@ -115,6 +115,18 @@ final class WEEffectChain {
     private var diagLogged: Set<String> = []                 // 诊断:无变体/无manifest 每组合只打一行
     private var comboKeyFallbackLogged: Set<String> = []     // 诊断:combo 感知 key 回退(副本缺 MASK 变体→通用)每次只打一行
     private var rtPool: [String: MTLTexture] = [:]            // 命名 FBO
+    // ⚡性能:无名「最终输出」纹理 + composelayer copy 目标纹理的**跨帧复用池**(key=调用点 poolKey + 用途 + 尺寸)。
+    //   此前每 pass 每帧都 device.makeTexture(全分辨率)→ 重壁纸(白泽夢 60、流萤 123 个特效层)每帧分配上百张
+    //   全分纹理 = runLayerEffects 编码耗时大头(profile 13-16ms/frame)。每帧 pass 都 .clear 重渲,故复用同一纹理
+    //   对象 = 逐字节同结果(零回归)。按调用点 poolKey 隔离 → 不同图层不共享、不互相覆盖(满足旧注释的隔离要求)。
+    //   poolKey 为空(未传)→ 退回每帧新建(旧行为,prewarm/--testeffect 等一次性路径)。
+    private var outPool: [String: MTLTexture] = [:]
+    private func pooledTarget(_ poolKey: String, _ tag: String, width: Int, height: Int, format: MTLPixelFormat = .bgra8Unorm) -> MTLTexture? {
+        guard !poolKey.isEmpty else { return makeTarget(width: width, height: height, format: format) }
+        let key = "\(poolKey)|\(tag)|\(width)x\(height)#\(format.rawValue)"
+        if let t = outPool[key] { return t }
+        let t = makeTarget(width: width, height: height, format: format); outPool[key] = t; return t
+    }
     private let quadBuf: MTLBuffer                            // 全屏 quad: pos.xyz + uv.xy
     private let whiteTex: MTLTexture                          // 1x1 白:兜底
     private var utilCache: [String: (tex: MTLTexture, flags: TexFlags?)] = [:]   // WE util/* 默认贴图(noise/white/black)+ 真实 flags
@@ -289,13 +301,13 @@ final class WEEffectChain {
         // 大小写不敏感取参(pkg "Threshold"/"Gamma"/"Tint" 等);缺则 WE shader 注解默认。
         func p(_ key: String, _ def: Float) -> Float {
             for (k, v) in pkgParams where k.lowercased() == key.lowercased() {
-                let f = Self.parseFloats(v); if let first = f.first { return first }
+                let f = parseFloats(v); if let first = f.first { return first }
             }
             return def
         }
         func tint() -> SIMD3<Float> {
             for (k, v) in pkgParams where k.lowercased() == "tint" {
-                let f = Self.parseFloats(v); if f.count >= 3 { return SIMD3(f[0], f[1], f[2]) }
+                let f = parseFloats(v); if f.count >= 3 { return SIMD3(f[0], f[1], f[2]) }
             }
             return SIMD3(1, 1, 1)
         }
@@ -405,7 +417,7 @@ final class WEEffectChain {
         // manifest:优先 app bundle,回退到开发目录 Tools/generated。
         // 诊断钩子 WP_MANIFEST_DIR=<dir>:强制从指定目录读 WEEffects.json + we_effects/(隔离 worktree 验证,
         // 绕过 Bundle.main 落到 /Applications 的部署版)。未设=正常行为。
-        let envDir = ProcessInfo.processInfo.environment["WP_MANIFEST_DIR"]
+        let envDir = WPEnv.vars["WP_MANIFEST_DIR"]
         let candidates = [
             envDir.map { URL(fileURLWithPath: $0).appendingPathComponent("WEEffects.json") },
             Bundle.main.resourceURL?.appendingPathComponent("WEEffects.json"),   // bundle: 与 we_effects/ 同级
@@ -451,7 +463,7 @@ final class WEEffectChain {
     /// 仅对 `workshop/<id>/<basename>` 形式回退;真自定义特效(basename 不在 manifest)仍判缺失。
     func resolvedKey(_ effect: String) -> String? {
         if manifest[effect] != nil { return effect }
-        if ProcessInfo.processInfo.environment["WP_NO_FX_FALLBACK"] != nil { return nil }   // A/B 诊断:关 basename 回退
+        if WPEnv.vars["WP_NO_FX_FALLBACK"] != nil { return nil }   // A/B 诊断:关 basename 回退
         // workshop 副本(含双层嵌套 wrapper)→ 按 basename 索引到已转译的同名特效。
         // 仅对带路径的(workshop/… 或 effects 子路径)回退;裸名已在上面查过 manifest[effect]。
         guard effect.contains("/") else { return nil }
@@ -477,7 +489,7 @@ final class WEEffectChain {
     func comboAwareKey(_ effect: String, combos: [String: Any]) -> String? {
         let base = resolvedKey(effect)
         guard let base, let edef = manifest[base] else { return base }
-        if ProcessInfo.processInfo.environment["WP_NO_COMBO_KEY_FALLBACK"] != nil { return base }
+        if WPEnv.vars["WP_NO_COMBO_KEY_FALLBACK"] != nil { return base }
         // 约束①:仅当请求的是 workshop 副本路径、且 resolvedKey 命中该副本本身(base == effect)。
         //   裸名(waterflow)或 resolvedKey 已回退到 basename 的情形不动 —— 那是 pkg 显式选定的 shader。
         guard effect.hasPrefix("workshop/"), base == effect else { return base }
@@ -503,6 +515,30 @@ final class WEEffectChain {
         return base
     }
     func has(_ effect: String) -> Bool { resolvedKey(effect) != nil }
+
+    // 加载期预热(修「刚选壁纸过两秒卡顿几下、几次后不卡」):render() 首次跑每个特效/材质 pass 时才同步
+    // makeLibrary(MSL→AIR)+ makeRenderPipelineState(含 AGX 后端编译)——这发生在 CVDisplayLink **渲染线程**
+    // 上,每条几十~上百 ms(冷缓存),分摊到首几帧 = 用户感知的「几次卡顿」。解法:load() 阶段(有 loading 态、
+    // 不在渲染线程)按场景真实请求的 effect+combos **提前**建好每个 pass 的管线缓存进 pipeCache;render() 时
+    // pipeline() 缓存命中、不再编译。预热严格走与 run()/encodeMaterialLayer 相同的 resolvedKey→selectVariant→
+    // pipeline 路径(同一 key),保证缓存命中、不白建、零渲染改变。WP_NO_FX_PREWARM=1 退回旧惰性编译。
+    /// 预热某 effect 在给定 combos 下选中变体的全部 pass 管线(与 run() 同路径,结果进 pipeCache)。
+    func prewarm(effect: String, combos: [String: Any]) {
+        if WPEnv.vars["WP_NO_FX_PREWARM"] != nil { return }
+        guard let key = resolvedKey(effect), let edef = manifest[key],
+              let def = selectVariant(edef, combos: combos) else { return }
+        for p in def.passes where p.vert != nil && p.frag != nil {
+            _ = pipeline(p)
+        }
+    }
+
+    /// 预热转译材质(genericimage2/3/4)某 combos 下的管线(与 encodeMaterialLayer 同变体选择)。
+    func prewarmMaterial(shader: String, combos: [String: String]) {
+        if WPEnv.vars["WP_NO_FX_PREWARM"] != nil { return }
+        guard let eff = manifest["material/\(shader)"], let v = bestMaterialVariant(eff, combos),
+              let p = v.passes.first, p.vert != nil, p.frag != nil else { return }
+        _ = pipeline(p)
+    }
 
     /// 该 effect 是否有采样器默认绑定 WE 渲染目标(_rt_*,如 frame_builder 的 _rt_FullFrameBuffer)。
     /// 命中则引擎需提供「该层之下已合成场景」底图喂 run(frameBuffer:),否则该槽退白 → 冲白。
@@ -558,7 +594,7 @@ final class WEEffectChain {
     /// 有材质 shader 的层都走此路径(供 base 变体自验证:base = tex×color,应与 scene_fragment 一致)。
     func materialNeedsTranspiledPath(shader: String?, combos: [String: String]) -> Bool {
         guard let sh = shader, manifest["material/\(sh)"] != nil else { return false }
-        if ProcessInfo.processInfo.environment["WP_MATERIAL_ALL"] != nil { return true }
+        if WPEnv.vars["WP_MATERIAL_ALL"] != nil { return true }
         return Self.meaningfulMaterialCombos.contains { (Int(combos[$0] ?? "0") ?? 0) != 0 }
     }
 
@@ -636,7 +672,7 @@ final class WEEffectChain {
                     // meta.material → 材质 constantshadervalues 真值,缺则退 WE shader 注解默认,再缺留 0。
                     if let mk = meta[u.name]?.material,
                        let cv = constants[mk] ?? (caseInsensitiveParams ? constants.first(where: { $0.key.lowercased() == mk.lowercased() })?.value : nil) { vals = cv }
-                    else if let def = meta[u.name]?.default?.value { vals = Self.parseFloats(def) }
+                    else if let def = meta[u.name]?.default?.value { vals = parseFloats(def) }
                     else { vals = [] }
                 }
                 if !vals.isEmpty { Self.write(vals, type: u.type, into: base, offset: u.offset) }
@@ -725,7 +761,7 @@ final class WEEffectChain {
         do {
             let _t0 = CFAbsoluteTimeGetCurrent()
             ps = try device.makeRenderPipelineState(descriptor: d)
-            if ProcessInfo.processInfo.environment["WP_PIPE_TIME"] != nil {
+            if WPEnv.vars["WP_PIPE_TIME"] != nil {
                 FileHandle.standardError.write("PIPE \(key) \(String(format: "%.1f", (CFAbsoluteTimeGetCurrent() - _t0) * 1000))ms\n".data(using: .utf8)!)
             }
         } catch {
@@ -745,7 +781,7 @@ final class WEEffectChain {
     /// WP_NO_FBO_FORMAT=1 → 全部退回 .bgra8Unorm(A/B 守门,回归排查)。
     private static func pixelFormat(for fmt: String?) -> MTLPixelFormat {
         guard let f = fmt?.lowercased(),
-              ProcessInfo.processInfo.environment["WP_NO_FBO_FORMAT"] == nil else { return .bgra8Unorm }
+              WPEnv.vars["WP_NO_FBO_FORMAT"] == nil else { return .bgra8Unorm }
         switch f {
         case "rg1616f":                          return .rg16Float
         case "r16f":                             return .r16Float
@@ -865,25 +901,36 @@ final class WEEffectChain {
         return t
     }
 
-    private static func parseFloats(_ any: Any?) -> [Float] {
+    // ⚡parseFloats 字符串解析记忆化:pkg 常量串("0.0, 1.0" 等)在加载后不变,但 buildUniforms 每 pass 每帧
+    //   重复 split+Float 解析(白泽夢/流萤每帧上千次)。结果纯由输入串决定 → 缓存逐字节同结果(零回归)。
+    //   缓存属于本 WEEffectChain 实例:单个渲染器内部由 renderLock 串行访问;多屏/后台预览各有实例,
+    //   不再并发读写同一个静态 Dictionary。WP_NO_PARSE_CACHE=1 退回(A/B)。
+    private var parseFloatsCache: [String: [Float]] = [:]
+    private let parseFloatsCacheOff = WPEnv.vars["WP_NO_PARSE_CACHE"] != nil
+    private func parseFloats(_ any: Any?) -> [Float] {
         if let n = any as? NSNumber { return [n.floatValue] }
         if let s = any as? String {
+            if !parseFloatsCacheOff, let c = parseFloatsCache[s] { return c }
             // WE 向量常量用「空格」或「逗号」分隔(如 u_BarBounds="0.0, 1.0"、u_AASmoothness="0.02, 0.02")。
             // 只按空格分会把 "0.0," 解析失败丢掉 → vec2 只剩一个分量、错位(实测:身体音频条 barHeight 反转)。
-            return s.split(whereSeparator: { $0 == " " || $0 == "," || $0 == "\t" }).compactMap { Float($0) }
+            let r = s.split(whereSeparator: { $0 == " " || $0 == "," || $0 == "\t" }).compactMap { Float($0) }
+            if !parseFloatsCacheOff { parseFloatsCache[s] = r }
+            return r
         }
         if let a = any as? [Any] { return a.compactMap { ($0 as? NSNumber)?.floatValue } }
         return []
     }
 
     /// 为某 stage 构造 _Globals 字节。pkgParams = pkg 的 constantshadervalues(material-key→值)。
-    /// cursor = 光标归一化位置 [0,1](y 向上);WE 交互特效(xray/depthparallax)的 pointer 量。
+    /// cursor = 原始光标归一化位置 [0,1](y 向上)，供 g_PointerPosition。
+    /// parallaxCursor = 按 camera delay/influence 平滑后的归一化位置，供 g_ParallaxPosition。
     /// audio16 = 16 段频谱 [0,1](AudioCapture.shared.spectrum16);喂 pulse 等音频特效的
     /// g_AudioSpectrum16Left/Right 数组。空数组 → 音频 uniform 退 0(无声)。
     /// texW/texH = 该 pass 实际绑定的主纹理尺寸(可能被 targetScale 降采样)→ g_TextureNResolution/g_Screen 用它。
     /// sceneW/sceneH = 全帧(场景)尺寸 → g_TexelSize/g_TexelSizeHalf 用它(对齐 lwe CPass.cpp:783,恒定全场景 texel)。
     private func buildUniforms(_ stage: StageDef, meta: [String: UniformMeta],
                                pkgParams: [String: Any], time: Float, cursor: SIMD2<Float>,
+                               parallaxCursor: SIMD2<Float>,
                                texW: Int, texH: Int, sceneW: Int, sceneH: Int,
                                audio: AudioSpectrum,
                                auxResolutions: [String: SIMD4<Float>] = [:],
@@ -923,7 +970,8 @@ final class WEEffectChain {
                     // 平面满画布层的正确值就是 identity(无投影倾斜/单位缩放),非兜底。
                     vals = [1,0,0,0, 0,1,0,0, 0,0,1,0, 0,0,0,1]
                 } else if u.name == "g_PointerPosition" || u.name == "g_ParallaxPosition" {
-                    // WE 交互 pointer / 视差位置,归一化 [0,1]。静止居中 = (0.5,0.5)(中性,无偏移)。
+                    // WE 把两者分开：Pointer 是原始交互光标；Parallax 是经过 camera delay/influence
+                    // 的位置（不乘 camera amount）。静止居中均为 (0.5,0.5)。
                     // ⚠ Y 轴约定:lwe(CScene.cpp:387 `mouseY = 1.0 - normalizedMouseY`)把 g_PointerPosition.y 存成
                     //   **y 向下**(屏幕顶=0);xray.vert 也假设 y 向下(自带 `pointer.y = 1.0 - pointer.y`)。本引擎
                     //   cursor.y 是 y 向上 → 这里翻 Y 对齐 lwe,否则揭示框竖直镜像(鼠标往上→揭示往下)。居中仍 0.5。
@@ -931,8 +979,9 @@ final class WEEffectChain {
                     //   origin 偏心时,effect 跑在缩放后的 quad 上(texcoord 0-1 = 缩放 quad ≠ 画布),不校正则
                     //   xray 揭示框/视差按未缩放定位 → 随距中心放大偏移(实测 3605892961 层 scale=1.3,揭示框偏 1.3×)。
                     //   引擎按层 origin/sizePx/canvas 算 xform;全画布层=(1,0,-1,1)→退回 [cursor.x,1-cursor.y] 零回归。
-                    vals = [pointerXform.x * cursor.x + pointerXform.y,
-                            pointerXform.z * cursor.y + pointerXform.w]
+                    let source = u.name == "g_ParallaxPosition" ? parallaxCursor : cursor
+                    vals = [pointerXform.x * source.x + pointerXform.y,
+                            pointerXform.z * source.y + pointerXform.w]
                 } else if u.name == "g_Time" {
                     vals = [time]
                 } else if u.name == "g_TexelSize" {
@@ -962,8 +1011,8 @@ final class WEEffectChain {
                     // (雾 offset "0 -50" → NDC y≈-51 飞出)。故把**像素量级**的 offset 归一化到 NDC:x=px/(sceneW/2)、
                     // y=-px/(sceneH/2)(Y 翻转:WE 场景 Y 向上 vs NDC)。启发:|分量|>2 视为像素(归一);≤2 视为已归一/UV
                     // (如 mirror 的 offset "1 0" 直接用)。WP_NO_OFFSET_NORM 退回原始像素值。
-                    let raw = Self.parseFloats(pv)
-                    if ProcessInfo.processInfo.environment["WP_NO_OFFSET_NORM"] != nil {
+                    let raw = parseFloats(pv)
+                    if WPEnv.vars["WP_NO_OFFSET_NORM"] != nil {
                         vals = raw
                     } else {
                         let ox = raw.count > 0 ? raw[0] : 0, oy = raw.count > 1 ? raw[1] : 0
@@ -972,9 +1021,9 @@ final class WEEffectChain {
                     }
                 } else if let mk = meta[u.name]?.material,
                           let pv = pkgParams[mk] ?? (caseInsensitiveParams ? pkgParams.first(where: { $0.key.lowercased() == mk.lowercased() })?.value : nil) {
-                    vals = Self.parseFloats(pv)                       // pkg 用户设的真实值(大小写不敏感兜底)
+                    vals = parseFloats(pv)                            // pkg 用户设的真实值(大小写不敏感兜底)
                 } else if let def = meta[u.name]?.default?.value {
-                    vals = Self.parseFloats(def)                      // WE 默认值
+                    vals = parseFloats(def)                           // WE 默认值
                 } else if u.name == "g_Brightness" || u.name == "g_Alpha" || u.name == "g_UserAlpha" {
                     vals = [1]   // 引擎提供的亮度/透明,默认全开;留 0 会让引用它的 workshop shader 全黑/全透明
                 } else if u.name == "g_Color" || u.name == "g_CompositeColor" {
@@ -1013,7 +1062,7 @@ final class WEEffectChain {
         // SHAPE=1/TRANSPARENCY=4/无ANTIALIAS,而所有 TRANSPARENCY=4 变体都带 ANTIALIAS=1 → 精确不命中),
         // 不如选「满足请求的 combo 数 − 违反的 combo 数」最高的变体:多余的次要 combo(ANTIALIAS)被忽略,
         // 但关键 combo(TRANSPARENCY/BLENDMODE)保住 → 透明合成,白方块消失。WP_NO_PARTIAL_VARIANT=1 退回。
-        if bestScore <= 0, ProcessInfo.processInfo.environment["WP_NO_PARTIAL_VARIANT"] == nil {
+        if bestScore <= 0, WPEnv.vars["WP_NO_PARTIAL_VARIANT"] == nil {
             var partial: Variant? = nil; var ps = 0
             for v in def.variants where !v.combos.isEmpty {
                 let sat = v.combos.filter { want[$0.key] == $0.value }.count
@@ -1023,6 +1072,28 @@ final class WEEffectChain {
             if let p = partial { return p }
         }
         return best ?? def.variants.first
+    }
+
+    /// 渲染缺口检测(2026-06-19,用户政策弹窗):返回**请求了非默认值(≠0)但 manifest 无任何变体提供该
+    /// key=value** 的 combo 列表(= we_build_effects 漏生成的变体 → 引擎静默回退默认 → 渲染不准)。
+    /// 典型:音频可视化(workshop 2846660316)请求 `A_SMOOTH_CURVE:1`(平滑波形)但只转译了 -0 变体(柱状)
+    /// → 回退柱状(用户报「WE 是海浪、我们是柱状」)。combo 值默认多为 0,缺省即正确,故只报 ≠0 的;
+    /// 该 combo key 必须**真被本特效消费**(其它变体声明过该 key,或它出现在请求里且本特效有多变体=combo 系统活跃)。
+    /// 返回空 = 该特效请求的 combo 都有对应变体(渲染准确)。
+    func unsupportedCombos(_ effect: String, combos: [String: Any]) -> [String] {
+        guard !combos.isEmpty, let key = resolvedKey(effect), let def = manifest[key], def.variants.count > 1 else { return [] }
+        let want = combos.mapValues { v -> String in
+            if let n = v as? NSNumber { return n.intValue == Int(n.doubleValue) ? "\(n.intValue)" : "\(n.floatValue)" }
+            return "\(v)"
+        }
+        var gaps: [String] = []
+        for (ck, cv) in want where cv != "0" && cv != "0.0" {
+            // 任一变体提供了请求的 key=value?(精确)。无 → 该渲染模式没被转译,回退默认 → 缺口。
+            if !def.variants.contains(where: { $0.combos[ck] == cv }) {
+                gaps.append("\(ck)=\(cv)")
+            }
+        }
+        return gaps.sorted()
     }
 
     // 审计修复 #2:把 run() 的 combos([String:Any])归一成「combo名→整数值」,供 bind.conditions 判定。
@@ -1072,10 +1143,12 @@ final class WEEffectChain {
              texFlags: [String: TexFlags] = [:],
              paramsPerPass: [[String: Any]] = [], time: Float,
              cursor: SIMD2<Float> = SIMD2(0.5, 0.5),
+             parallaxCursor: SIMD2<Float>? = nil,
              audio: AudioSpectrum = AudioSpectrum(),
              frameBuffer: MTLTexture? = nil,
              sceneFootprint: (mvp: simd_float4x4, outW: Int, outH: Int)? = nil,
              pointerXform: SIMD4<Float> = SIMD4(1, 0, -1, 1),
+             poolKey: String = "",
              commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
         guard let key = comboAwareKey(effect, combos: combos), let edef = manifest[key], let def = selectVariant(edef, combos: combos) else {
             // 一次性诊断:manifest 缺失或变体不命中(静默失败的头号嫌疑),打出请求 combos vs 可用变体。
@@ -1097,7 +1170,7 @@ final class WEEffectChain {
         // 故先记下场景原始尺寸供 buildUniforms 的 sceneW/sceneH。footprint=nil 时 = input 尺寸(行为不变)。
         let sceneW = input.width, sceneH = input.height
         if let fp = sceneFootprint, let cp = copyPipeline,
-           let layerTex = makeTarget(width: max(1, fp.outW), height: max(1, fp.outH)) {
+           let layerTex = pooledTarget(poolKey, "copy", width: max(1, fp.outW), height: max(1, fp.outH)) {
             let verts = makeFootprintVerts(mvp: fp.mvp)
             let vbuf = device.makeBuffer(bytes: verts, length: MemoryLayout<Float>.stride * verts.count, options: [])
             let cpass = MTLRenderPassDescriptor()
@@ -1119,7 +1192,7 @@ final class WEEffectChain {
         // 开 bloom 把亮皮肤冲白。改跑 runFaithfulBloom(逐行对齐 pkg shader,见上方 bloomShaderSrc 注释),
         // 用合并版 pkgParams 取真值参数(threshold/gamma/strength/radius/Tint/opacity)。WP_NO_BLOOM_FIX=1 退回原链。
         if key == "workshop/2822917890/bloom",
-           ProcessInfo.processInfo.environment["WP_NO_BLOOM_FIX"] == nil,
+           WPEnv.vars["WP_NO_BLOOM_FIX"] == nil,
            let out = runFaithfulBloom(input: input, pkgParams: pkgParams, commandBuffer: cmd) {
             return out
         }
@@ -1162,6 +1235,7 @@ final class WEEffectChain {
             if let t = rtPool[rtKey(tname, sz, fmtFor(tname))] { named[tname] = t }
         }
         var lastOut: MTLTexture = input
+        var unnamedOutSeq = 0   // ⚡复用池:同一 run 内多个「无名最终输出」pass 各取独立池槽(乒乓不互相覆盖)
 
         for (pi, p) in def.passes.enumerated() {
             // 命令 pass(无 vert/frag):copy = 把累积结果拷进持久缓冲供下一帧(motionblur pass1)。
@@ -1226,7 +1300,9 @@ final class WEEffectChain {
                 out = t
                 if nameUnique.contains(target), named[target] != nil { loadAction = .load }
             } else {
-                guard let t = makeTarget(width: w, height: h) else { continue }   // 最终输出恒全分辨率
+                // ⚡最终输出(全分辨率):按调用点 poolKey + 本 run 内无名输出序号复用纹理(每帧 .clear 重渲 → 同结果)。
+                guard let t = pooledTarget(poolKey, "out\(unnamedOutSeq)", width: w, height: h) else { continue }
+                unnamedOutSeq += 1
                 out = t
             }
 
@@ -1247,8 +1323,15 @@ final class WEEffectChain {
 
             // 逐 pass 参数优先(bloom 各 pass strength 可不同);否则合并版。
             let params: [String: Any] = (pi < paramsPerPass.count) ? paramsPerPass[pi] : pkgParams
-            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio, auxResolutions: auxResolutions, pointerXform: pointerXform)
-            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time, cursor: cursor, texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH, audio: audio, auxResolutions: auxResolutions, pointerXform: pointerXform)
+            let effectiveParallaxCursor = parallaxCursor ?? cursor
+            var vu = buildUniforms(vstage, meta: p.uniformMeta, pkgParams: params, time: time,
+                                   cursor: cursor, parallaxCursor: effectiveParallaxCursor,
+                                   texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH,
+                                   audio: audio, auxResolutions: auxResolutions, pointerXform: pointerXform)
+            var fu = buildUniforms(fstage, meta: p.uniformMeta, pkgParams: params, time: time,
+                                   cursor: cursor, parallaxCursor: effectiveParallaxCursor,
+                                   texW: resW, texH: resH, sceneW: sceneW, sceneH: sceneH,
+                                   audio: audio, auxResolutions: auxResolutions, pointerXform: pointerXform)
             // 大 UBO 走 MTLBuffer:setVertex/FragmentBytes 适合小块常量数据,实测本机对 ~3.6KB 的 UBO 上传会丢数据
             //   (audio_base 的 g_AudioSpectrum16/32/64 Left/Right 全段 → frag UBO 3664 字节,用 setFragmentBytes 后
             //    shader 读到的频谱恒 0、音频线完全不动;改 makeBuffer+setBuffer 后正常响应)。audioline(2112 字节)
@@ -1287,7 +1370,7 @@ final class WEEffectChain {
                     tex = fb
                 }
                 else if s.name == "g_Texture2", comboInts["RENDERING"] == 1,
-                        ProcessInfo.processInfo.environment["WP_NO_LIGHTSHAFT_COLOR"] == nil,
+                        WPEnv.vars["WP_NO_LIGHTSHAFT_COLOR"] == nil,
                         !p.bind.contains(where: { "g_Texture\($0.index)" == s.name }),
                         let ceStr = params["colorend"] as? String {
                     // ⭐lightshafts RENDERING=1(gradient 模式)颜色取自 g_Texture2 渐变图。真 WE 编辑器把作者设的
@@ -1296,8 +1379,8 @@ final class WEEffectChain {
                     //   仅当作者**显式设了 colorend**(params 含)时,合成 colorastart→colorend 的 1D 渐变图喂 g_Texture2
                     //   (作用域:g_Texture2 + RENDERING=1 + 无自定义绑定 → 不影响其他特效/未自定义颜色的 lightshafts)。
                     //   WP_NO_LIGHTSHAFT_COLOR=1 退回静态彩虹图(A/B)。
-                    let cs = Self.parseFloats((params["colorastart"] as? String) ?? "1 1 1")
-                    let ce = Self.parseFloats(ceStr)
+                    let cs = parseFloats((params["colorastart"] as? String) ?? "1 1 1")
+                    let ce = parseFloats(ceStr)
                     tex = lightshaftRamp(start: cs, end: ce) ?? whiteTex
                     flags = nil
                 }

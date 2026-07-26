@@ -184,7 +184,7 @@ final class PreferencesStore {
     /// 壁纸是背景,缩放画质损失基本不可察,但用户要求不降画质 → **默认 1.0=原生全画质**;想省 WindowServer 自行拖滑块。
     var presentScale: Double {
         get {
-            if let e = ProcessInfo.processInfo.environment["WP_PRESENT_SCALE"], let v = Double(e) { return min(1.0, max(0.5, v)) }
+            if let e = WPEnv.vars["WP_PRESENT_SCALE"], let v = Double(e) { return min(1.0, max(0.5, v)) }
             let v = d.object(forKey: "presentScale") == nil ? 1.0 : d.double(forKey: "presentScale")
             return min(1.0, max(0.5, v))
         }
@@ -206,9 +206,9 @@ final class PreferencesStore {
     /// 比例接近屏幕<6%→拉伸填满、形变可忽略;追求人物比例永远正常、无黑边)。默认 0。
     var wallpaperScaleMode: Int {
         get {
-            if ProcessInfo.processInfo.environment["WP_FIT"] == "1" { return 1 }
-            if ProcessInfo.processInfo.environment["WP_STRETCH"] == "1" { return 2 }
-            if ProcessInfo.processInfo.environment["WP_BALANCED"] == "1" { return 3 }
+            if WPEnv.vars["WP_FIT"] == "1" { return 1 }
+            if WPEnv.vars["WP_STRETCH"] == "1" { return 2 }
+            if WPEnv.vars["WP_BALANCED"] == "1" { return 3 }
             return d.integer(forKey: "wallpaperScaleMode")
         }
         set { d.set(newValue, forKey: "wallpaperScaleMode") }

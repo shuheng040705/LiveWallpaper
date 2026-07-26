@@ -13,6 +13,9 @@ enum TextLayerKind {
     case date       // 日期(近似回退)
     case dayOfWeek  // 星期(SAT)
     case greeting   // 按时段问候(GOOD MORNING/AFTERNOON/EVENING)
+    // WE 时钟 format scriptproperty 驱动(如 "HH:mm" / "MM/dd" / ":ss" / "[W]"):脚本无 update() 跑不起来时,
+    // 直接按 pkg 的 format 串渲染(比按图层名瞎猜的 .clock/.seconds/.date 忠实——修白影"21掉下方/FRI非Friday/日期带空格")。
+    case clockFormat(String)
     case staticText(String)
 }
 
@@ -61,7 +64,7 @@ enum TextLayerRenderer {
         let str = currentString(desc, simTime: simTime)
         guard !str.isEmpty else { return nil }
 
-        let noStroke = ProcessInfo.processInfo.environment["WP_NO_TEXT_STROKE"] != nil
+        let noStroke = WPEnv.vars["WP_NO_TEXT_STROKE"] != nil
         let nsColor = NSColor(srgbRed: CGFloat(desc.color.x), green: CGFloat(desc.color.y),
                               blue: CGFloat(desc.color.z), alpha: 1)
         // 字重/斜体(R15):resolveFont 取到的体若与字体名暗示的粗/斜不符(取不到带 weight 变体、落了 regular),
@@ -104,7 +107,7 @@ enum TextLayerRenderer {
         //   (Arial Unicode MS,Arial 家族、macOS 自带、月牙更粗亮),并加细描边补偿小字号 AA 发暗
         //   —— 让 ☽/☾ 接近 WE 的亮实月牙。普通拉丁字(基础字体能渲)不受影响 → 不动其它壁纸时钟/日期外观。
         // WP_NO_MOONFIX=1 退回旧的「单一字体 + CoreText 自动回退」(A/B 诊断符号字形改动)。
-        let attr = (ProcessInfo.processInfo.environment["WP_NO_MOONFIX"] != nil)
+        let attr = (WPEnv.vars["WP_NO_MOONFIX"] != nil)
             ? NSAttributedString(string: str, attributes: attrs)
             : Self.makeAttributed(str, baseAttrs: attrs, baseFont: font, pointSize: desc.pointSize)
 
@@ -156,6 +159,42 @@ enum TextLayerRenderer {
                 px[i+2] = UInt8(min(255, Int(px[i+2]) * 255 / Int(a)))
             }
         }
+        // ⭐裁切到墨迹包围盒(去掉 pointSize×0.3 的对称防裁边距)。该边距加在**宽文本**上会把
+        //   texAspect=texW/texH 压小(对称 pad 缩纵横比)→ 下游 quadW=box.y×texAspect 渲得偏窄,
+        //   且锚点定位 -quadW/2 内缩 → 时分文字渲窄 + 与秒之间留空隙。WE 文本透明背景**无边距**
+        //   (203 recenter 脚本注释「透明背景时无边距」明说)→ 时分:秒紧贴、字宽足。裁到 alpha>0
+        //   包围盒 + extraPad(保 castshadow 投影不被裁)后 texW/texH=真实墨迹纵横比 → quadW/recenter
+        //   /锚点全用紧致宽,自动对齐 WE。WP_NO_TEXT_INKTRIM=1 退回旧全边距纹理(A/B)。
+        if WPEnv.vars["WP_NO_TEXT_INKTRIM"] == nil {
+            // **水平**裁到墨迹包围盒(去左右防裁边距 → 锚点定位用真实墨迹右/左缘、消除与秒的间隙)。
+            var minX = w, maxX = -1
+            for y in 0..<h {
+                let row = y * w * 4
+                for x in 0..<w where px[row + x * 4 + 3] > 0 {
+                    if x < minX { minX = x }; if x > maxX { maxX = x }
+                }
+            }
+            // **垂直**只去 AA 边距(pointSize×0.3)、**保留整行高**:纵横比 texW/texH 的分母必须是**行高**
+            //   (bounds.height)而非墨迹高。数字「14:37」无降部 → 墨迹高≈0.7×行高 → 若用墨迹高当分母,
+            //   quadW=box.y×inkW/inkH 会偏宽 ~70%(=用户「时分太大」)。垂直裁到行盒 [pad, h-pad](=bounds.height)
+            //   令分母=行高 → 字宽正确。保留 extraPad(castshadow)余量不裁投影。
+            let aaPad = Int((desc.pointSize * 0.3).rounded())      // pad - extraPad = 纯 AA 防裁边距
+            let hMargin = Int(ceil(extraPad)) + 1                  // 水平保阴影 + 1px AA
+            if maxX >= minX {
+                let x0 = max(0, minX - hMargin), x1 = min(w - 1, maxX + hMargin)
+                let y0 = max(0, aaPad), y1 = min(h - 1, h - 1 - aaPad)
+                let nw = x1 - x0 + 1, nh = y1 - y0 + 1
+                if nw > 0, nh > 0, nh <= h, nw < w || nh < h {
+                    var out = [UInt8](repeating: 0, count: nw * nh * 4)
+                    for y in 0..<nh {
+                        let src = ((y0 + y) * w + x0) * 4
+                        let dst = y * nw * 4
+                        for b in 0..<(nw * 4) { out[dst + b] = px[src + b] }
+                    }
+                    return (out, nw, nh)
+                }
+            }
+        }
         return (px, w, h)
     }
 
@@ -193,7 +232,40 @@ enum TextLayerRenderer {
             // 脚本能跑时 kind=.script 走真脚本;跑不了就不该凭空造 "GOOD MORNING"(英文、固定阈值=伪造)。
             // 退回空串(宁可不显示也不造假);要正确显示需实现该层 WE 脚本(见 ENGINE_PORT_TODO 脚本写回)。
             return ""
+        case .clockFormat(let fmt):
+            return formatClock(fmt, date: Date())
         }
+    }
+
+    /// WE 时钟 format 串解释器:扫描 format,按 token 替换为当前时间分量(其余字符=字面量原样输出)。
+    /// token(对齐 pkg 脚本 getFormated*,均补零2位):HH=24时 hh=12时 mm=分 ss=秒 MM=月 dd=日;[W]=英文全称星期(混合大小写)。
+    /// 例:"HH:mm"→"15:08"、":ss"→":21"、"MM/dd"→"06/19"、"[W]"→"Friday"。
+    static func formatClock(_ fmt: String, date: Date) -> String {
+        var cal = Calendar(identifier: .gregorian)
+        cal.locale = Locale(identifier: "en_US")
+        let c = cal.dateComponents([.hour, .minute, .second, .month, .day, .weekday], from: date)
+        func p2(_ n: Int?) -> String { String(format: "%02d", n ?? 0) }
+        let weekdays = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"]
+        let chars = Array(fmt)
+        var out = ""; var i = 0
+        while i < chars.count {
+            if i + 2 < chars.count, chars[i] == "[", chars[i + 1] == "W", chars[i + 2] == "]" {
+                out += weekdays[max(0, min(6, (c.weekday ?? 1) - 1))]; i += 3; continue
+            }
+            if i + 1 < chars.count {
+                switch String(chars[i...i + 1]) {
+                case "HH": out += p2(c.hour); i += 2; continue
+                case "hh": let h = (c.hour ?? 0) % 12; out += p2(h == 0 ? 12 : h); i += 2; continue
+                case "mm": out += p2(c.minute); i += 2; continue
+                case "ss": out += p2(c.second); i += 2; continue
+                case "MM": out += p2(c.month); i += 2; continue
+                case "dd": out += p2(c.day); i += 2; continue
+                default: break
+                }
+            }
+            out.append(chars[i]); i += 1
+        }
+        return out
     }
 
     private static func fallbackClock(_ desc: TextLayerDesc) -> String {
