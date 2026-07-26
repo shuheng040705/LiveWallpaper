@@ -244,6 +244,14 @@ final class PreferencesStore {
         set { d.set(newValue, forKey: "occlusionThreshold") }
     }
 
+    /// 「遮挡时自动暂停」总开关。默认开(省电)。
+    /// 原来 PowerManager 里是硬编码 `enabled = true`、设置面板里是硬编码 `@State = true`,
+    /// 三处都不落盘 → 用户关掉后重启 app 又自动打开,同一会话里重开设置窗也显示成「开」(与实际不符)。
+    var occlusionPauseEnabled: Bool {
+        get { d.object(forKey: "occlusionPauseEnabled") == nil ? true : d.bool(forKey: "occlusionPauseEnabled") }
+        set { d.set(newValue, forKey: "occlusionPauseEnabled") }
+    }
+
     /// 内容分级(年龄段)全局筛选:勾选的档(raw:everyone/questionable/mature)。默认全选(显示全部)。
     /// 影响整个库(全部/收藏/各类型的数量与内容都只算勾选档),与 WE 一致。
     var selectedRatings: Set<String> {

@@ -103,11 +103,15 @@ struct SettingsForm: View {
     private var playbackSection: some View {
         Section("播放控制") {
             HStack(spacing: 10) {
+                // 标题读的是引擎实时状态 actions.isPaused(),但那不是 SwiftUI 可观察的来源 —— 点击
+                // 只改引擎状态、不触发任何视图失效 → 按钮文字/图标纹丝不动(点了像没反应)。
+                // 用一个 @State 镜像状态,点击后同步过来,视图才会重画。
                 Button {
                     actions.onTogglePause()
+                    isPausedMirror = actions.isPaused()
                 } label: {
-                    Label(actions.isPaused() ? "继续" : "暂停",
-                          systemImage: actions.isPaused() ? "play.fill" : "pause.fill")
+                    Label(isPausedMirror ? "继续" : "暂停",
+                          systemImage: isPausedMirror ? "play.fill" : "pause.fill")
                         .frame(maxWidth: .infinity)
                 }
                 Button { actions.onNext() } label: {
@@ -188,11 +192,16 @@ struct SettingsForm: View {
             }
             row("呈现分辨率", "唯一能降 WindowServer(系统合成器)占用的项:越低越省 GPU;100% = 原生") {
                 HStack(spacing: 8) {
-                    Slider(value: $presentScale, in: 0.5...1.0, step: 0.05)
+                    // ⚠ onChange 每挪一格(0.05)就触发一次 onAssetsPathChanged = **整张壁纸全量重载**
+                    //   (主线程同步解析 pkg + 解码全部贴图,重场景秒级;多屏还要 ×屏数)。从 50% 拖到
+                    //   100% 就是 10 次全量重载,期间 UI 完全冻结。
+                    //   → 拖动过程只写偏好并更新数字,松手(onEditingChanged 结束)才真正重载一次。
+                    Slider(value: $presentScale, in: 0.5...1.0, step: 0.05) { editing in
+                        if !editing { actions.onAssetsPathChanged() }   // 松手才重载
+                    }
                         .frame(width: 170)
                         .onChange(of: presentScale) { v in
                             PreferencesStore.shared.presentScale = v
-                            actions.onAssetsPathChanged()
                         }
                     Text(String(format: "%.0f%%", presentScale * 100))
                         .font(.callout.monospacedDigit()).foregroundStyle(.secondary)
@@ -240,7 +249,9 @@ struct SettingsForm: View {
     // MARK: - 通用
 
     @State private var loginEnabled = LoginItem.isEnabled
-    @State private var powerEnabled = true
+    /// 「暂停/继续」按钮标题的可观察镜像(引擎状态本身不是 SwiftUI 数据源)。
+    @State private var isPausedMirror = false
+    @State private var powerEnabled = PreferencesStore.shared.occlusionPauseEnabled
     @State private var occlusionThreshold = PreferencesStore.shared.occlusionThreshold
     @State private var reportGaps = PreferencesStore.shared.reportRenderGaps
 
@@ -267,7 +278,11 @@ struct SettingsForm: View {
                 .onChange(of: occlusionThreshold) { v in PreferencesStore.shared.occlusionThreshold = v }
             }
         }
-        .onAppear { loginEnabled = LoginItem.isEnabled }
+        .onAppear {
+            loginEnabled = LoginItem.isEnabled
+            powerEnabled = PreferencesStore.shared.occlusionPauseEnabled   // 重开设置窗时反映真实状态
+            isPausedMirror = actions.isPaused()
+        }
     }
 
     // MARK: - 声音

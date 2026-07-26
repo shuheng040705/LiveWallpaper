@@ -5,7 +5,8 @@ import AppKit
 /// 基本重合(位置+尺寸)即视为该屏被全屏遮挡(审计修复 #6:支持多显示器,不再只看主屏/裸尺寸)。
 final class PowerManager {
     private weak var desktop: DesktopController?
-    private var enabled = true
+    /// 从偏好读初值(原来硬编码 true → 用户关掉后重启又自动打开)。
+    private var enabled = PreferencesStore.shared.occlusionPauseEnabled
     private var pausedByPower = false
     private var pollTimer: Timer?   // 定时轮询遮挡覆盖率(窗口移动/缩放/台前调度无激活事件,需主动查)
     /// 暂停确认延迟用的 pending work item。台前调度「显示桌面/窗口收回」那一刻会先发 activeSpace 变化通知,
@@ -52,6 +53,7 @@ final class PowerManager {
         get { enabled }
         set {
             enabled = newValue
+            PreferencesStore.shared.occlusionPauseEnabled = newValue   // 落盘,重启后保持
             if !enabled {
                 cancelPendingPause()
                 if pausedByPower { desktop?.resume(); pausedByPower = false }
