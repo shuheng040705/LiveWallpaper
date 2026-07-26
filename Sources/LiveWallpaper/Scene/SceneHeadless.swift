@@ -58,6 +58,14 @@ enum SceneHeadless {
         guard let engine = SceneRenderEngine() else { err("no Metal device"); exit(1) }
         engine.load(document: doc, source: source)
         print("gpu layers: \(engine.layerCount), parallax: \(engine.hasParallax)")
+        // 渲染缺口直接打到 stdout。引擎内部只经 Log.write 记录,而 Log 是**异步队列写文件**,
+        // headless 渲完立刻 exit → 日志往往还没落盘就丢了(且 Log.reset 还会清掉正在运行的 app 的日志),
+        // 所以做全库渲染审计时拿不到。这里同步打印一份,便于批量收割「引擎自报渲不出的项」。
+        if !engine.renderGaps.isEmpty {
+            print("ENGINEGAPS(\(engine.renderGaps.count)): " + engine.renderGaps.joined(separator: " | "))
+        } else {
+            print("ENGINEGAPS(0)")
+        }
         // 可选第 4 参 = 模拟时间(秒)。推进:应用视差 + 步进/上传粒子实例。否则离屏帧不含粒子/视差。
         let simTime = (idx + 4 < args.count) ? Double(args[idx + 4]) : nil
         // 视差复现:WP_MOUSE_X/Y(屏幕归一化 [-1,1])让离屏帧能重现实时鼠标位置下的逐层视差分离。

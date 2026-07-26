@@ -3200,8 +3200,16 @@ struct SceneDocument {
             // 静态文字:渲染真实内容(如 ☾ 月相符号、固定标签)。
             // 跳过:空、脚本源码、以及算不出的脚本占位(歌名/艺术家的 "Text Layer"、"<Date>" 等)。
             let lower = rawText.lowercased()
+            // `<...>` 占位判据只对**非用户绑定**的文本生效。
+            //   text 写成 {"user": "customtex1", "value": "<Body,3>"} 时,这是 WE 的用户属性绑定 ——
+            //   用户可以在属性栏里把它改成任意内容,其 value 是**字面默认文本**而非脚本占位
+            //   (脚本填充的层走的是 text.script 分支,永远不会带 user 绑定)。
+            //   实测:全库 105 张里被该判据命中的层**只有 1 个**(3509243656 的「<Body,3>」),
+            //   且正是这种用户绑定形式 → 该规则此前是零正确命中、一次误伤,把整层丢掉不渲染。
+            let userBoundText = (obj["text"] as? [String: Any])?["user"] != nil
             let isPlaceholder = lower == "text layer" || lower == "day"
-                || (lower.hasPrefix("<") && lower.hasSuffix(">")) || lower.contains("12:34:56")
+                || (!userBoundText && lower.hasPrefix("<") && lower.hasSuffix(">"))
+                || lower.contains("12:34:56")
                 || lower == "undefined" || lower == "null"
             // 合法长字幕(如土星 707/720「November 1980 / Humanity's first visitor to saturn」99/147 字符)曾被
             //   `count <= 40` 误丢。改**按内容判**占位/脚本垃圾(含 `{`/`undefined`/脚本源码/已知占位串)而非纯长度——
