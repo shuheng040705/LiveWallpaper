@@ -134,9 +134,19 @@ final class SceneRenderer: WallpaperRenderer {
     //   值在 layer 建好后按真实 maximumDrawableCount 设(默认 3,同步呈现路径 2)。
     //   ⚠ 不用 DispatchSemaphore:它的 signal 在 addPresentedHandler 异步触发,切壁纸析构时若仍有 drawable 在途
     //   (wait 已减、present 回调未触发)→ 计数<初始 → `_dispatch_semaphore_dispose` SIGTRAP 崩溃(实测)。
-    //   改用 NSLock+Int 计数器:满则立即跳帧(非阻塞),Int 无析构约束;在途 handler 用 weak self,析构后空跑。
+    //   改用 NSLock + 普通容器:满则立即跳帧(非阻塞),无析构约束;在途 handler 用 weak self,析构后空跑。
+    //   2026-07-26 审计 R7 再改进:由 Int 计数器换成 token 字典,以支持「超时未归还则兜底回收」——
+    //   见 acquireDrawable(纯计数器无法区分迟到回调与丢失回调,回收会造成二次递减)。
     private let drawableLock = NSLock()
-    private var drawableInflight = 0
+    /// 在途槽:token → 占用时刻。用字典而非计数器,才能让「兜底回收」与「迟到的 present 回调」
+    /// 互不干扰(见 acquireDrawable)。在途数 = drawableSlots.count。
+    private var drawableSlots: [Int: CFTimeInterval] = [:]
+    private var nextDrawableToken = 0
+    /// 超过这个时长仍未归还的槽,认定 present 回调已丢失并强制回收。取 2s:远大于任何正常呈现延迟
+    /// (30fps 一帧 33ms),也大于台前调度过场时 present 停滞的量级(~1s)——那期间本就该跳帧,
+    /// 不会误触发;只有真正丢失的回调才会被回收。
+    private static let drawableStaleTimeout: CFTimeInterval = 2.0
+    private var lastStaleReclaimLog: CFTimeInterval = 0
     private var drawableMax = 3
     private var lastDrawableFailureLog: CFTimeInterval = 0
 
@@ -482,12 +492,12 @@ final class SceneRenderer: WallpaperRenderer {
         // 按需渲染:无连续动画内容、视差已收敛且鼠标未动 → 画面与上帧一致,跳过渲染(空闲 CPU/GPU 趋近 0)。
         guard engine.frameDidChange else { renderLock.unlock(); return }
         // 在途门:槽满(台前调度过场,WindowServer 暂停合成)→ 立即跳帧(不阻塞在 nextDrawable ~1s)。
-        guard let drawable = acquireDrawable(layer) else { renderLock.unlock(); return }
+        guard let acq = acquireDrawable(layer) else { renderLock.unlock(); return }
         let _tD = _flog ? CACurrentMediaTime() : 0
-        let submitted = engine.render(to: drawable, viewportSize: layer.drawableSize)
+        let submitted = engine.render(to: acq.drawable, viewportSize: layer.drawableSize)
         if !submitted {
             // acquireDrawable 已占一个名额；未提交 present 时不会收到 addPresentedHandler，必须在这里归还。
-            releaseDrawableSlot()
+            releaseDrawableSlot(acq.token)
             let now = CACurrentMediaTime()
             if now - lastDrawableFailureLog > 2 {
                 Log.write("SceneRenderer: 本帧未提交，已归还 drawable 槽（保留上一帧，避免黑屏/永久停帧）")
@@ -513,21 +523,40 @@ final class SceneRenderer: WallpaperRenderer {
     /// 取 drawable 前先过在途门(见 drawableInflight 注释):空槽→nextDrawable(不会阻塞,因有空槽);
     /// 槽满(台前调度过场,present 回调停滞)→ 立即返回 nil(调用方跳帧,不阻塞 ~1s)。drawable present 后
     /// addPresentedHandler 还槽。nextDrawable 罕见返 nil(拆除中)时立刻还槽。handler 用 weak self,析构后空跑。
-    private func acquireDrawable(_ layer: CAMetalLayer) -> CAMetalDrawable? {
+    private func acquireDrawable(_ layer: CAMetalLayer) -> (drawable: CAMetalDrawable, token: Int)? {
         drawableLock.lock()
-        if drawableInflight >= drawableMax { drawableLock.unlock(); return nil }  // 槽满 → 跳帧
-        drawableInflight += 1
+        let now = CACurrentMediaTime()
+        // 兜底回收:present 回调理应在一两帧内到达。若某个在途槽超过 drawableStaleTimeout 仍未归还,
+        //   认定该回调**永久丢失**(拆除中/WindowServer 异常),强制回收。没有这层兜底时,一次丢失的
+        //   回调就让槽位永久少一个,累计到 drawableMax 后 acquireDrawable 恒返回 nil →
+        //   该 renderer 所有后续帧被跳过 = 画面永久定格且无自愈,只能切壁纸重建(审计 R7)。
+        // ⚠ 必须用 token 而不是「按时间减计数」:被判定丢失的回调**可能迟到**(台前调度过场时
+        //   present 会停滞约 1s),若那时再减一次就成了二次递减 → 计数低于真实在途数 → 门形同虚设 →
+        //   退回 nextDrawable 阻塞。token 从字典移除后,迟到回调找不到自己的槽,自然空跑。
+        var staleCount = 0
+        for (tok, at) in drawableSlots where now - at > Self.drawableStaleTimeout {
+            drawableSlots.removeValue(forKey: tok); staleCount += 1
+        }
+        if staleCount > 0, now - lastStaleReclaimLog > 5 {
+            lastStaleReclaimLog = now
+            Log.write("SceneRenderer: 回收 \(staleCount) 个超时未归还的 drawable 槽(present 回调丢失,已自愈)")
+        }
+        if drawableSlots.count >= drawableMax { drawableLock.unlock(); return nil }  // 槽满 → 跳帧
+        let token = nextDrawableToken
+        nextDrawableToken &+= 1
+        drawableSlots[token] = now
         drawableLock.unlock()
         guard let d = layer.nextDrawable() else {
-            drawableLock.lock(); drawableInflight -= 1; drawableLock.unlock(); return nil
+            releaseDrawableSlot(token); return nil
         }
-        d.addPresentedHandler { [weak self] _ in self?.releaseDrawableSlot() }
-        return d
+        d.addPresentedHandler { [weak self] _ in self?.releaseDrawableSlot(token) }
+        return (d, token)
     }
 
-    private func releaseDrawableSlot() {
+    /// 归还槽位。按 token 移除:重复归还(兜底回收后迟到的 present 回调)自然是空操作。
+    private func releaseDrawableSlot(_ token: Int) {
         drawableLock.lock()
-        drawableInflight = max(0, drawableInflight - 1)
+        drawableSlots.removeValue(forKey: token)
         drawableLock.unlock()
     }
 
@@ -537,9 +566,9 @@ final class SceneRenderer: WallpaperRenderer {
         // 审计修复 #1:与 frameTick 共用 engine,持锁防竞争。
         renderLock.lock()
         engine.update(time: 0, mouseNorm: SIMD2(0, 0))
-        guard let drawable = acquireDrawable(layer) else { renderLock.unlock(); return }
-        let submitted = engine.render(to: drawable, viewportSize: layer.drawableSize)
-        if !submitted { releaseDrawableSlot() }
+        guard let acq = acquireDrawable(layer) else { renderLock.unlock(); return }
+        let submitted = engine.render(to: acq.drawable, viewportSize: layer.drawableSize)
+        if !submitted { releaseDrawableSlot(acq.token) }
         renderLock.unlock()
     }
 
