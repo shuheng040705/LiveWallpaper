@@ -3152,6 +3152,14 @@ struct SceneDocument {
         //   未调(pt==designPt)或裸 pointsize → 比例 1 = 零回归。WP_NO_CLOCK_SIZE_SCALE=1 退回旧(滑块无效)。
         let ptRatio: Float = (designPt > 0 && WPEnv.vars["WP_NO_CLOCK_SIZE_SCALE"] == nil)
             ? Float(pt / designPt) : 1
+        // WE 文本框的宽度/行数限制(2026-07-27 补,此前完全没解析 → 折行宽度写死 = 永不折行)。
+        // 默认取自 WE:limitwidth=false / maxwidth=500 / limitrows=false / maxrows=1 / limituseellipsis=false。
+        // 各字段都可能带 {user,value} 绑定,故一律经 VecParse.unwrap。
+        let limitWidth = (VecParse.unwrap(obj["limitwidth"]) as? NSNumber)?.boolValue ?? false
+        let maxWidthPx = CGFloat((VecParse.unwrap(obj["maxwidth"]) as? NSNumber)?.floatValue ?? 500)
+        let limitRows = (VecParse.unwrap(obj["limitrows"]) as? NSNumber)?.boolValue ?? false
+        let maxRows = (VecParse.unwrap(obj["maxrows"]) as? NSNumber)?.intValue ?? 1
+        let useEllipsis = (VecParse.unwrap(obj["limituseellipsis"]) as? NSNumber)?.boolValue ?? false
         let sizeArr = VecParse.floats(obj["size"])
         let boxSize: SIMD2<Float>? = sizeArr.count >= 2 ? SIMD2(sizeArr[0] * ptRatio, sizeArr[1] * ptRatio) : nil
 
@@ -3266,6 +3274,11 @@ struct SceneDocument {
         text.fontName = fontName
         text.boxSizePx = isAnchor ? nil : boxSize
         text.useScreenPointSize = isAnchor
+        text.limitWidth = limitWidth
+        text.maxWidth = maxWidthPx
+        text.limitRows = limitRows
+        text.maxRows = maxRows
+        text.useEllipsis = useEllipsis
 
         // ── 描边/阴影/字重(R15)── 严格按 pkg(实据见 TextLayerDesc 注释)──────────────
         // 描边走特效链(textoutline7x7,下方 tl.effects 解析,已支持);粗斜体由字体文件承载(FontRegistry)。

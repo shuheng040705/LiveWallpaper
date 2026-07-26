@@ -34,6 +34,17 @@ struct TextLayerDesc {
     // 多余空间按 align 放置。nil = autosize(取文本纹理自然像素,旧行为;无显式 size 的静态文本/问候)。
     var boxSizePx: SIMD2<Float>? = nil
 
+    // ── WE 文本框的宽度/行数限制(2026-07-27 补:此前完全没解析,折行宽度写死 100000 = 永不折行)──
+    // WE 语义(ITextLayer):limitwidth 开时按 maxwidth(像素)自动折行;limitrows 开时只保留前
+    // maxrows 行,limituseellipsis 则在截断处加省略号。默认 false/500/1/false。
+    // 影响:开了 limitwidth 的层原来被渲成一条超宽单行 —— 白影轻扬的公告段落(WE 里 2 行)冲出面板;
+    // 媒体信息层(maxrows=1)的长歌名不截断,横向拖出画面。全库 32 个对象 / 9 张壁纸受影响。
+    var limitWidth = false
+    var maxWidth: CGFloat = 500
+    var limitRows = false
+    var maxRows = 1
+    var useEllipsis = false
+
     // ── 描边/阴影/字重(R15)──────────────────────────────────────────────────────
     // 关键实据(扒全库 157 张 pkg、331 个文本对象 + lwe 源码核对,2026-06-14):
     //   • WE 文本对象**没有** strokecolor/strokesize/shadowcolor/shadowoffset/bold/italic 字段
@@ -107,7 +118,7 @@ enum TextLayerRenderer {
         //   (Arial Unicode MS,Arial 家族、macOS 自带、月牙更粗亮),并加细描边补偿小字号 AA 发暗
         //   —— 让 ☽/☾ 接近 WE 的亮实月牙。普通拉丁字(基础字体能渲)不受影响 → 不动其它壁纸时钟/日期外观。
         // WP_NO_MOONFIX=1 退回旧的「单一字体 + CoreText 自动回退」(A/B 诊断符号字形改动)。
-        let attr = (WPEnv.vars["WP_NO_MOONFIX"] != nil)
+        var attr = (WPEnv.vars["WP_NO_MOONFIX"] != nil)
             ? NSAttributedString(string: str, attributes: attrs)
             : Self.makeAttributed(str, baseAttrs: attrs, baseFont: font, pointSize: desc.pointSize)
 
@@ -120,8 +131,17 @@ enum TextLayerRenderer {
         //   对齐/参考,limitwidth 没开时长文本溢出而非换行)。之前按 box.x 折行是我方自创,且 box.x 是画布单位、
         //   纹理是 renderPt 字号像素,单位错配 → 把本该一行的日期(框 1679 但 128 字号下宽 ~2000px)折成两行。
         //   `\n` 字面换行仍保留(byWordWrapping 不影响显式换行)。极宽单行不会让 boundingRect 膨胀(单行无指数爆炸)。
-        //   TODO:WE 对象 limitwidth=true 时才按 maxwidth 折行 + maxrows 限行——补字段后在此据其折行。
-        let maxWidth: CGFloat = 100000
+        //   ⭐2026-07-27 补齐:WE 的 limitwidth=true 时按 maxwidth 折行、limitrows=true 时截到 maxrows
+        //   (limituseellipsis 则加省略号)。这三个字段此前根本没解析,折行宽度写死 100000 = 永不折行。
+        //   单位说明:maxwidth 与 pointsize 同在 WE 的文本栅格化像素空间(实测吻合:白影轻扬 id 4385
+        //   maxwidth 1242.6 / size.x 1238),而本函数正是按 desc.pointSize 的自然像素绘制 → 可直接用。
+        //   但我们为求清晰会把字号放大到 renderPt(desc.pointSize),故 maxwidth 要按同一比例放大,
+        //   否则折行点会偏早(字变大了、可用宽度没变)。
+        let ptScale = desc.srcPointSize > 0 ? desc.pointSize / desc.srcPointSize : 1
+        let maxWidth: CGFloat = desc.limitWidth ? max(1, desc.maxWidth * ptScale) : 100000
+        if desc.limitRows, desc.maxRows > 0 {
+            attr = Self.truncate(attr, toRows: desc.maxRows, width: maxWidth, ellipsis: desc.useEllipsis)
+        }
         let bounds = attr.boundingRect(with: CGSize(width: maxWidth, height: 100000),
                                        options: [.usesLineFragmentOrigin, .usesFontLeading])
         // 留点边距,避免抗锯齿边缘被裁;有投影(castshadow)时再加 extraPad 容下偏移+模糊(R15)。
@@ -196,6 +216,33 @@ enum TextLayerRenderer {
             }
         }
         return (px, w, h)
+    }
+
+    /// 按 WE 的 limitrows/maxrows/limituseellipsis 语义把文本截断到前 N 行。
+    /// 用 CoreText 的排版结果找第 N 行的字符边界(与实际绘制同一套换行规则),而不是数 "\n" ——
+    /// limitwidth 折出来的软换行同样计入行数,WE 也是按视觉行算。
+    private static func truncate(_ attr: NSAttributedString, toRows rows: Int,
+                                 width: CGFloat, ellipsis: Bool) -> NSAttributedString {
+        guard rows > 0, attr.length > 0 else { return attr }
+        let path = CGPath(rect: CGRect(x: 0, y: 0, width: width, height: 1_000_000), transform: nil)
+        let framesetter = CTFramesetterCreateWithAttributedString(attr)
+        let frame = CTFramesetterCreateFrame(framesetter, CFRangeMake(0, 0), path, nil)
+        guard let lines = CTFrameGetLines(frame) as? [CTLine], lines.count > rows else { return attr }
+        let lastRange = CTLineGetStringRange(lines[rows - 1])
+        var cut = lastRange.location + lastRange.length
+        cut = max(0, min(cut, attr.length))
+        guard cut < attr.length else { return attr }
+        let out = NSMutableAttributedString(
+            attributedString: attr.attributedSubstring(from: NSRange(location: 0, length: cut)))
+        // 去掉截断处遗留的换行/空白,免得末尾多出一个空行。
+        while out.length > 0, let last = out.string.last, last.isWhitespace || last.isNewline {
+            out.deleteCharacters(in: NSRange(location: out.length - 1, length: 1))
+        }
+        if ellipsis, out.length > 0 {
+            let attrs = out.attributes(at: out.length - 1, effectiveRange: nil)
+            out.append(NSAttributedString(string: "\u{2026}", attributes: attrs))
+        }
+        return out
     }
 
     /// 当前应显示的字符串。脚本层跑真 JS;跑不出来回退到对应近似类型。
