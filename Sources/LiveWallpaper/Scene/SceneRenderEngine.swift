@@ -71,6 +71,11 @@ private func matLookAt(eye: SIMD3<Float>, center: SIMD3<Float>, up: SIMD3<Float>
 
 /// 世界法线矩阵:world 上 3×3 的逆转置(非均匀缩放下法线不被拉歪),封装进 float4x4 的左上 3×3,
 /// 其余行/列零(w=1),供 frag 取 (normalMat*float4(n,0)).xyz。退化(不可逆)时回退原 3×3。
+///
+/// ⚠ **目前没有调用方**(2026-07-26 审计确认)。这不是残留脚手架,而是一个已写好但尚未接上的
+/// 修正:3D 管线现在直接用 world 的 3×3 变换法线,模型带非均匀缩放时法线方向会被拉歪、光照发暗
+/// 或偏色。接上需要给 3D 顶点/片元 uniform 增加一个矩阵槽位并改 shader,属于会动 3D 渲染输出的
+/// 改动(土星/太阳系需逐像素 A/B),故保留实现待接,不删。
 private func normalMatrix(_ world: simd_float4x4) -> simd_float4x4 {
     let m3 = simd_float3x3(columns: (
         SIMD3(world.columns.0.x, world.columns.0.y, world.columns.0.z),
@@ -2017,7 +2022,6 @@ final class SceneRenderEngine {
                       ci != i, layers[ci].frameBufferInput else { continue }
                 layers[ci].childImageLayerIndices.append(i)
                 layers[i].renderedIntoComposeFBO = true
-                hasComposeChildFBO = true
             }
         }
         // 3D 场景:per-layer 2D 脚本各自独立 context、没有 shared(读 shared.sun_D_real/dock 坐标会抛错→文字空/位置堆原点)。
@@ -2371,7 +2375,6 @@ final class SceneRenderEngine {
                       let L = layers.firstIndex(where: { $0.id == pid && $0.frameBufferInput }) else { continue }
                 g.parentComposeLayerIndex = L
                 layers[L].childParticleGroupIndices.append(gi)
-                hasComposeChildFBO = true
                 // 矩阵渲进 1322 的 child FBO,**只用 opacity 的 MASK 把它裁到龙翅区(限制范围),不应用 tint**:
                 // 1322 的 tint(青 0.584/0.921/1.0 加法)在真 WE 里作用于「下方场景」产生青色辉光,**不染矩阵**;
                 // 误把 tint 加在矩阵上 → 绿矩阵被染青(被用户指出「没达到 WE 效果」,WE 矩阵是纯绿)。故剔除该层
@@ -2733,7 +2736,6 @@ final class SceneRenderEngine {
     // WP_NO_COMPOSE_CHILD_FBO=1 退回旧:粒子当独立世界粒子全屏画 + composelayer 把下方场景染色。
     private let useComposeChildFBO: Bool = WPEnv.vars["WP_NO_COMPOSE_CHILD_FBO"] == nil
     // 仅当确实建立了 parent→child 关联(load() 设)才启用 child FBO 路径,其他 composelayer 壁纸完全不受影响。
-    private var hasComposeChildFBO = false
     // child FBO(透明全画布,放父 composelayer 的子粒子组);按场景分辨率(=sceneFBO 尺寸)建,复用。
     private var composeChildTex: MTLTexture?
     private func composeChildTarget(width: Int, height: Int) -> MTLTexture? {
@@ -5935,7 +5937,6 @@ final class SceneRenderEngine {
     // max(1,…):WP_CAP_STEP=0 会让下面的 `liveFrameCount % captureStep` 触发**除零崩溃**。
     private lazy var captureStep: Int = max(1, Int(WPEnv.vars["WP_CAP_STEP"] ?? "") ?? 120)
     private lazy var captureMax: Int = Int(WPEnv.vars["WP_CAP_MAX"] ?? "") ?? 720
-    private var presentTex: MTLTexture?
     private var drawStaging: MTLTexture?
     private var aspectTex: MTLTexture?       // 画布长宽比编码/呈现纹理(场景渲它,ndcScale=1 不分带)
     private var aspectAuxTex: MTLTexture?     // 屏幕适配下 FXAA 输出(画布长宽比)
@@ -6068,15 +6069,6 @@ final class SceneRenderEngine {
         return aspectAuxTex
     }
 
-    /// 实时呈现纹理(与离屏 renderToPNG 同款可读纹理;也作 MetalFX 升采样输出 → 需 shaderWrite)。
-    private func ensurePresentTex(_ w: Int, _ h: Int) -> MTLTexture? {
-        if let t = presentTex, t.width == w, t.height == h { return t }
-        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: w, height: h, mipmapped: false)
-        d.usage = [.renderTarget, .shaderRead, .shaderWrite]   // shaderWrite:MetalFX scaler 输出
-        d.storageMode = captureEnabled ? .shared : .private   // 捕获时需 CPU 可读
-        presentTex = device.makeTexture(descriptor: d)
-        return presentTex
-    }
 
     /// render-scale 的低分辨率编码目标(场景先渲到它,再双线性/MetalFX 升采样到全分辨率)。
     private func ensureRenderScaleTex(_ w: Int, _ h: Int) -> MTLTexture? {
@@ -6088,55 +6080,6 @@ final class SceneRenderEngine {
         return renderScaleTex
     }
 
-    /// puppet 层的 size×size 离屏 FBO(.renderTarget+.shaderRead)。
-    private func makePuppetFBO(width: Int, height: Int) -> MTLTexture? {
-        let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm,
-                                                         width: max(1, width), height: max(1, height), mipmapped: false)
-        d.usage = [.renderTarget, .shaderRead]; d.storageMode = .private
-        return device.makeTexture(descriptor: d)
-    }
-
-    /// 一次性把 puppet mesh 渲进该层 FBO:局部 ortho(0,size)、顶点已是 [0,size] 像素、UV 直取、采样图层源贴图。
-    /// 复用 scene_vertex/scene_fragment(translucent)。局部 ortho 会裁掉 mesh 出界(偏心)的顶点 —— 正解关键。
-    /// 静止 bind pose,只需渲一次(不实现骨骼动画)。
-    private func renderPuppetIntoFBO(target: MTLTexture, vb: MTLBuffer, ib: MTLBuffer,
-                                     indexCount: Int, sourceTex: MTLTexture,
-                                     size: SIMD2<Float>, srcFlags: TexFlags?) {
-        guard let cmd = queue.makeCommandBuffer() else { return }
-        let pass = MTLRenderPassDescriptor()
-        pass.colorAttachments[0].texture = target
-        pass.colorAttachments[0].loadAction = .clear
-        pass.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 0)  // lwe 清透明
-        pass.colorAttachments[0].storeAction = .store
-        guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return }
-        enc.setRenderPipelineState(pipelineTranslucent)
-        enc.setVertexBuffer(vb, offset: 0, index: 0)
-        enc.setVertexBuffer(dummyAlphaVB, offset: 0, index: 2)  // 逐顶点 alpha@2:静态 bind-pose=全 1.0(dummy 65536 覆盖任意顶点数)
-        // ⚠ Y 翻转 ortho:lwe 的 puppet 顶点公式(posY=size/2−rawY)假设 OpenGL FBO 朝向(v 向上、左下原点),
-        // 但 Metal 渲染目标纹理是 v 向下、左上原点 → 直接套用会使 FBO 内容垂直翻转(角色身体倒置)。
-        // 故 FBO 渲染用 y 向下的 ortho(py=0→NDC+1 顶、py=size→NDC−1 底),抵消 Metal/OpenGL 的 V 朝向差,
-        // 让 FBO 当普通贴图被场景 quad(v=0=顶)采样时正立。非 puppet 层用普通贴图不受影响。
-        let orthoYDown = simd_float4x4(columns: (
-            SIMD4<Float>(2 / size.x, 0, 0, 0),
-            SIMD4<Float>(0, -2 / size.y, 0, 0),
-            SIMD4<Float>(0, 0, 1, 0),
-            SIMD4<Float>(-1, 1, 0, 1)
-        ))
-        var u = VertexUniforms(mvp: orthoYDown, color: SIMD4<Float>(1, 1, 1, 1))
-        enc.setVertexBytes(&u, length: MemoryLayout<VertexUniforms>.stride, index: 1)
-        var ndc1 = SIMD2<Float>(1, 1)
-        enc.setVertexBytes(&ndc1, length: MemoryLayout<SIMD2<Float>>.stride, index: 3)
-        enc.setFragmentSamplerState(samplerFor(srcFlags), index: 0)
-        enc.setFragmentTexture(sourceTex, index: 0)
-        var fx = makeEffectUniforms(hasMask: false, cursorRipple: false)
-        enc.setFragmentBytes(&fx, length: MemoryLayout<EffectUniforms>.stride, index: 0)
-        enc.setFragmentTexture(sourceTex, index: 1)   // 槽1/2 占位(不采)
-        enc.setFragmentTexture(sourceTex, index: 2)
-        enc.drawIndexedPrimitives(type: .triangle, indexCount: indexCount,
-                                  indexType: .uint16, indexBuffer: ib, indexBufferOffset: 0)
-        enc.endEncoding()
-        cmd.commit()
-    }
 
     /// MetalFX 空间放大器(输入 inW×inH → 输出 outW×outH)。尺寸变化时重建,否则复用。
     private func ensureScaler(inW: Int, inH: Int, outW: Int, outH: Int) -> (any MTLFXSpatialScaler)? {
