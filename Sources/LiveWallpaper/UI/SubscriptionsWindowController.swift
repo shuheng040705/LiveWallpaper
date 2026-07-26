@@ -17,7 +17,6 @@ final class SubscriptionsWindowController: NSObject, NSWindowDelegate {
 
     func show() {
         // 兜底:保证有常规激活(通常主窗口已是 .regular)。
-        NSApp.setActivationPolicy(.regular)
 
         if let window {
             window.makeKeyAndOrderFront(nil)
@@ -36,6 +35,7 @@ final class SubscriptionsWindowController: NSObject, NSWindowDelegate {
         w.isReleasedWhenClosed = false
         w.appearance = NSAppearance(named: .darkAqua)
         w.delegate = self
+        AppActivationPolicy.windowOpened(w)   // 统一管理 Dock/Cmd-Tab 可见性
         // 合理的最小尺寸,避免拖到太小内容塌掉(与 SubscriptionsSheet 内容 frame 的下限一致)。
         w.minSize = NSSize(width: 420, height: 400)
         // 首开默认尺寸(沿用原 sheet 的 idealWidth/idealHeight 460×560),之后由 frameAutosave 恢复。
@@ -56,6 +56,12 @@ final class SubscriptionsWindowController: NSObject, NSWindowDelegate {
         // 用 [weak self] 避免根视图闭包强引用控制器形成环。
         SubscriptionsWindowRoot(onClose: { [weak self] in self?.close() })
     }
+
+    /// 窗口关闭:交由 AppActivationPolicy 决定是否降回菜单栏代理(仍有兄弟窗口时不降)。
+    func windowWillClose(_ notification: Notification) {
+        if let w = notification.object as? NSWindow { AppActivationPolicy.windowClosed(w) }
+        window = nil
+    }
 }
 
 /// 订阅窗口的根视图:复用 SubscriptionsSheet,并补上之前 sheet 容器提供的深色玻璃外观
@@ -70,4 +76,5 @@ struct SubscriptionsWindowRoot: View {
             .background(WaifuTheme.background.ignoresSafeArea())
             .preferredColorScheme(.dark)
     }
+
 }

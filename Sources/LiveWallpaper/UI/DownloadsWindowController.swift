@@ -14,7 +14,6 @@ final class DownloadsWindowController: NSObject, NSWindowDelegate {
 
     func show() {
         // 保证有 Dock/常规激活(通常主窗口已是 .regular,这里兜底)。
-        NSApp.setActivationPolicy(.regular)
 
         if let window {
             window.makeKeyAndOrderFront(nil)
@@ -31,6 +30,7 @@ final class DownloadsWindowController: NSObject, NSWindowDelegate {
         w.isMovableByWindowBackground = true
         w.isReleasedWhenClosed = false
         w.delegate = self
+        AppActivationPolicy.windowOpened(w)   // 统一管理 Dock/Cmd-Tab 可见性
         w.setContentSize(NSSize(width: 520, height: 480))
         w.center()
         window = w
@@ -40,4 +40,11 @@ final class DownloadsWindowController: NSObject, NSWindowDelegate {
     }
 
     var isVisible: Bool { window?.isVisible ?? false }
+
+
+    /// 窗口关闭:交由 AppActivationPolicy 决定是否降回菜单栏代理(仍有兄弟窗口时不降)。
+    func windowWillClose(_ notification: Notification) {
+        if let w = notification.object as? NSWindow { AppActivationPolicy.windowClosed(w) }
+        window = nil
+    }
 }

@@ -29,7 +29,6 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
         RenderedPreviewCache.shared.setWindowVisible(true)
 
         // 升为常规 app,使窗口受台前调度/常规激活管理。
-        NSApp.setActivationPolicy(.regular)
 
         if let window {
             rebuildContent()
@@ -51,6 +50,7 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
         w.isRestorable = false               // 不做窗口/状态恢复(避免重启残留旧 tab/面板状态)
         w.appearance = NSAppearance(named: .darkAqua)   // 仿 WaifuX:整窗深色玻璃
         w.delegate = self
+        AppActivationPolicy.windowOpened(w)   // 统一管理 Dock/Cmd-Tab 可见性
         // 首次打开用默认大小并居中;有保存值时由 frameAutosave 立即覆盖恢复。
         w.setContentSize(NSSize(width: 1000, height: 660))
         w.center()
@@ -83,7 +83,8 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
     /// 窗口关闭:降回菜单栏代理(不占 Dock、不在台前调度里逗留),并停掉壁纸预览渲染。
     func windowWillClose(_ notification: Notification) {
         RenderedPreviewCache.shared.setWindowVisible(false)
-        NSApp.setActivationPolicy(.accessory)
+        // 仅当再无其它常规窗口(设置/下载/订阅)时才降回菜单栏代理,见 AppActivationPolicy。
+        if let w = notification.object as? NSWindow { AppActivationPolicy.windowClosed(w) }
     }
 
     /// 最小化:库不可见 → 停壁纸预览渲染(还原时再开)。

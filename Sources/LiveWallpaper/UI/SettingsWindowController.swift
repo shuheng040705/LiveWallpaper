@@ -24,9 +24,6 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     }
 
     func show() {
-        // 兜底:保证有常规激活(通常主窗口已是 .regular)。
-        NSApp.setActivationPolicy(.regular)
-
         if let window {
             // 已存在则刷新内容(当前壁纸可能已变)并前置。
             rebuildContent()
@@ -46,6 +43,7 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
         w.isReleasedWhenClosed = false
         w.appearance = NSAppearance(named: .darkAqua)
         w.delegate = self
+        AppActivationPolicy.windowOpened(w)   // 统一管理 Dock/Cmd-Tab 可见性
         // 合理的最小尺寸,避免拖到太小内容塌掉(与 SettingsForm 内容 frame 的下限一致)。
         w.minSize = NSSize(width: 480, height: 420)
         // 首开默认尺寸(沿用原 sheet 的 720×620),之后由 frameAutosave 恢复。
@@ -67,6 +65,12 @@ final class SettingsWindowController: NSObject, NSWindowDelegate {
     private func makeRootView() -> SettingsWindowRoot {
         SettingsWindowRoot(actions: actions, currentItem: currentItem())
     }
+
+    /// 窗口关闭:交由 AppActivationPolicy 决定是否降回菜单栏代理(仍有兄弟窗口时不降)。
+    func windowWillClose(_ notification: Notification) {
+        if let w = notification.object as? NSWindow { AppActivationPolicy.windowClosed(w) }
+        window = nil
+    }
 }
 
 /// 设置窗口的根视图:复用 SettingsForm,并补上之前 sheet 容器提供的深色玻璃外观
@@ -81,4 +85,5 @@ struct SettingsWindowRoot: View {
             .background(WaifuTheme.background.ignoresSafeArea())
             .preferredColorScheme(.dark)
     }
+
 }

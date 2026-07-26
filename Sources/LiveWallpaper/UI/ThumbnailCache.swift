@@ -63,7 +63,42 @@ final class ThumbnailCache {
         return remoteDiskDir.appendingPathComponent(String(h, radix: 16) + ".img")
     }
 
+    /// 远程缩略图磁盘缓存上限。工坊货架每日轮换 → 缓存目录只写不清会无限增长(审计发现)。
+    private static let remoteDiskBudget: Int64 = 200 * 1024 * 1024   // 200MB
+    private var didPruneRemoteDisk = false
+
+    /// 按「最近访问时间」保留、超预算的删掉。每次进程只跑一次,放后台低优先级。
+    private func pruneRemoteDiskIfNeeded() {
+        guard !didPruneRemoteDisk else { return }
+        didPruneRemoteDisk = true
+        let dir = remoteDiskDir
+        DispatchQueue.global(qos: .utility).async {
+            let fm = FileManager.default
+            let keys: [URLResourceKey] = [.contentAccessDateKey, .fileSizeKey]
+            guard let files = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: keys) else { return }
+            var entries: [(url: URL, accessed: Date, size: Int64)] = []
+            var total: Int64 = 0
+            for f in files {
+                let v = try? f.resourceValues(forKeys: Set(keys))
+                let size = Int64(v?.fileSize ?? 0)
+                entries.append((f, v?.contentAccessDate ?? .distantPast, size))
+                total += size
+            }
+            guard total > Self.remoteDiskBudget else { return }
+            // 最久未访问的先删,删到预算的 80% 留出余量,避免每次启动都刚好卡在阈值上反复删。
+            let target = Int64(Double(Self.remoteDiskBudget) * 0.8)
+            var freed: Int64 = 0
+            for e in entries.sorted(by: { $0.accessed < $1.accessed }) {
+                if total - freed <= target { break }
+                try? fm.removeItem(at: e.url)
+                freed += e.size
+            }
+            Log.write("ThumbnailCache: 远程缩略图缓存 \(total / 1024 / 1024)MB 超预算,清理 \(freed / 1024 / 1024)MB")
+        }
+    }
+
     func remoteThumbnail(for url: URL, completion: @escaping (NSImage?) -> Void) {
+        pruneRemoteDiskIfNeeded()   // 每进程一次,后台清理超预算的旧缓存
         if let cached = cache.object(forKey: url as NSURL) { completion(cached); return }
         // 磁盘缓存:重启后内存缓存空,从磁盘读(快),不再每次重新下载。
         let diskFile = remoteDiskFile(for: url)
