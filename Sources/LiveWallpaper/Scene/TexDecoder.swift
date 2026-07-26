@@ -108,6 +108,11 @@ extension TexDecoder {
 /// format 0 是内嵌 PNG/JPG(可能再被 LZ4 压一层)。详见 WE_SCENE_SPEC.md 与 memory we-scene-format。
 enum TexDecoder {
 
+    /// mip 宽高硬上界。工坊 pkg 是不可信输入,而下游多处形如 `raw.count >= w*h*4` 的守卫会
+    /// **先算乘积再比较**,w=h=0x7FFFFFFF 时乘积溢出 Int64 → Swift 算术溢出 trap → 整个 app 崩。
+    /// 16384 与 TEXB0004 的 extra-header 探测分支一致,也与 Metal 单张纹理上限同量级。
+    static let maxDimension = 16384
+
     // 审计修复(HIGH):移除 findImageSignature ——原 format 0 兜底用它从 blob 偏移 0
     // 全局扫描签名,会把容器中段字节误判为图片起点。改为只信任 mip0 数据本身的签名判定后,
     // 此函数已无调用方,删除以免留下危险的「乱扫」入口与死代码警告。
@@ -322,10 +327,19 @@ enum TexDecoder {
                 compression = c; szU = u
             }
             let szCopt = readI32()
-            guard let szC = szCopt, szC > 0, p + szC <= bytes.count, w > 0, h > 0 else {
+            // ⚠ w/h 必须有**上界**。原来只有下界(w>0,h>0),而 16384 的上界只存在于 TEXB0004 的
+            //   extra-header 探测分支 → TEXB0002/0003 完全绕过。工坊 pkg 是不可信输入,mip 头写
+            //   w=h=0x7FFFFFFF 时,下游多处 `raw.count >= w*h*4`(以及 px*3 / px*6 / px*8)会**先算乘积
+            //   再比较** → 乘积溢出 Int64 → Swift 算术溢出 trap → 整个 app 直接崩(DoS)。
+            //   上界取 16384(与 TEXB0004 分支、也与 Metal 单张纹理上限同量级),超限即判为损坏。
+            guard let szC = szCopt, szC > 0, p + szC <= bytes.count,
+                  w > 0, h > 0, w <= Self.maxDimension, h <= Self.maxDimension else {
                 Log.write("  readMip GUARD-FAIL: w=\(w) h=\(h) comp=\(compression) szU=\(szU) szC=\(String(describing: szCopt)) p=\(p) total=\(bytes.count)")
                 return nil
             }
+            // szU 同样要有上界:它只是文件里声明的「解压后大小」,恶意值(如 0x7FFFFFFF)会让
+            // decodeBlock 的 reserveCapacity 直接预分配 ~2GB。按 w×h×16(每像素最多 RGBA32F)封顶。
+            if szU > w * h * 16 { szU = w * h * 16 }
             // 未压缩时 compressedSize 即字节长度(reference 注释:此变量实为 mip 字节数)。
             if compression == 0 { szU = szC }
             let mip = Array(bytes[p..<(p + szC)])
@@ -468,8 +482,16 @@ enum TexDecoder {
 
 /// LZ4 block 格式解码(无 frame 头)。
 enum LZ4 {
+    /// - Parameter expectedSize: 文件声明的解压后大小。既用于预留容量,**也作为硬上限**。
+    ///
+    /// ⚠ 原来 expectedSize 只用于 reserveCapacity,循环里对 `out` 的增长完全不设限,而 LZ4 的
+    ///   matchLen 扩展是「每个 0xFF 输入字节 → +255 输出字节」→ 放大比可趋近 255×。工坊 pkg 是不可信
+    ///   输入,一个构造过的 50MB 压缩块能展开到约 12GB,在调用方校验 szU 之前就把内存耗光
+    ///   → 触发 jetsam / 整机卡死(解压炸弹)。这里在追加前逐步检查上限,超限即判损坏返回 nil。
     static func decodeBlock(_ src: [UInt8], expectedSize: Int) -> [UInt8]? {
-        var out = [UInt8](); out.reserveCapacity(expectedSize)
+        guard expectedSize > 0 else { return nil }
+        let limit = expectedSize
+        var out = [UInt8](); out.reserveCapacity(min(expectedSize, 64 << 20))
         var i = 0
         let n = src.count
         while i < n {
@@ -478,7 +500,11 @@ enum LZ4 {
             if litLen == 15 {
                 while i < n { let b = Int(src[i]); i += 1; litLen += b; if b != 255 { break } }
             }
-            guard i + litLen <= n else { out.append(contentsOf: src[i..<n]); break }
+            guard i + litLen <= n else {
+                guard out.count + (n - i) <= limit else { return nil }
+                out.append(contentsOf: src[i..<n]); break
+            }
+            guard out.count + litLen <= limit else { return nil }
             out.append(contentsOf: src[i..<(i + litLen)]); i += litLen
             if i >= n { break }
             guard i + 2 <= n else { break }
@@ -491,6 +517,7 @@ enum LZ4 {
             matchLen += 4
             var start = out.count - offset
             if start < 0 { return nil }
+            guard out.count + matchLen <= limit else { return nil }   // 解压炸弹上限(见函数注释)
             for _ in 0..<matchLen { out.append(out[start]); start += 1 }
         }
         return out
