@@ -89,10 +89,44 @@ final class WorkshopDownloader: ObservableObject {
         jobs.filter { switch $0.state { case .queued, .connecting, .downloading: return true; default: return false } }.count
     }
 
+    /// steamcmd 连续多久毫无输出即判定挂死。取 10 分钟:下载期间 steamcmd 会周期性打进度行,
+    /// 正常慢速下载也不会静默这么久;而挂死(CDN 连接半开)是永久静默。
+    private static let steamcmdSilenceTimeout: TimeInterval = 600
+
+    /// 终止 steamcmd。⚠ `Process.terminate()` 只把 SIGTERM 发给**直接子进程**,而 Homebrew 的
+    /// `/opt/homebrew/bin/steamcmd` 是 shell wrapper,`steamcmd.sh` 末行用 `$DEBUGGER "$STEAMEXE" "$@"`
+    /// (**没有 exec**)把真正的 steamcmd 当孙进程跑 → SIGTERM 只到脚本,真正在下载的进程既不退出也不
+    /// 放开管道写端。这里先 SIGTERM 给进程组(子进程默认与我们同组时 kill(-pid) 会误伤自己,故只在
+    /// 确认它自成一组时才用),再对直接子进程升级 SIGKILL 兜底。
+    private static func killProcessTree(_ p: Process) {
+        let pid = p.processIdentifier
+        guard pid > 0 else { return }
+        // 若子进程自成进程组(pgid == pid),可以安全地整组终止,覆盖孙进程。
+        let pgid = getpgid(pid)
+        if pgid == pid { kill(-pid, SIGTERM) } else { p.terminate() }
+        // 宽限 3s 后升级 SIGKILL(整组优先)。
+        Thread.sleep(forTimeInterval: 3)
+        if p.isRunning {
+            if pgid == pid { kill(-pid, SIGKILL) } else { kill(pid, SIGKILL) }
+        }
+    }
+
     /// 加入下载队列。title 仅用于显示,sizeBytes 来自网页(估算进度)。
     func enqueue(id: String, title: String, sizeBytes: Int64 = 0) {
         DispatchQueue.main.async {
-            guard !self.jobs.contains(where: { $0.id == id }) else { return }
+            // 已有同 id 任务时不重复排队 —— 但**失败/取消的任务是刻意保留在列表里的**(见 finish),
+            // 旧代码在这里一律 return,导致首页 hero 的「重试」、工坊卡片点击、详情页「下载」按钮
+            // 对失败任务全部**点了没反应也无提示**(只有下载管理窗口的重试图标走 retry(id:) 才有效)。
+            // → 同 id 若处于可重来的终态(失败/取消),直接转交 retry 复用该条目重新排队。
+            if let i = self.jobs.firstIndex(where: { $0.id == id }) {
+                switch self.jobs[i].state {
+                case .failed, .cancelled:
+                    self.retryLocked(index: i)
+                default:
+                    break   // 排队中/下载中/已完成待移除:忽略重复请求(现状行为)
+                }
+                return
+            }
             self.jobs.append(Job(id: id, title: title, totalBytes: sizeBytes))
             self.pump()
         }
@@ -185,10 +219,42 @@ final class WorkshopDownloader: ObservableObject {
                 p.standardOutput = pipe; p.standardError = pipe
                 do { try p.run() } catch { finish(id, .failed("启动失败: \(error.localizedDescription)")); return }
                 setProcess(id, p)
-                let data = pipe.fileHandleForReading.readDataToEndOfFile()
+                // ⚠ 原来是 `readDataToEndOfFile() + waitUntilExit()`,两者都**无限阻塞**:steamcmd 因
+                //   Steam CDN 连接半开而既不退出也无输出时(网络切换后常见),该 Job 永远停在「下载中」、
+                //   一个 utility 线程永久卡住、并发槽不释放;3 个这样的任务就让下载功能整体假死。
+                //   判据用「长时间**毫无输出**」而不是总时长——250MB 的壁纸正常也要下很久,按总时长会误杀。
+                //   steamcmd 下载期间会周期性打进度行,连续 10 分钟一个字节都没有基本只可能是挂死。
+                let outLock = NSLock()
+                var outData = Data()
+                var lastOutputAt = Date()
+                let fh = pipe.fileHandleForReading
+                fh.readabilityHandler = { h in
+                    let chunk = h.availableData
+                    guard !chunk.isEmpty else { return }
+                    outLock.lock(); outData.append(chunk); lastOutputAt = Date(); outLock.unlock()
+                }
+                var timedOut = false
+                while p.isRunning {
+                    outLock.lock(); let quiet = Date().timeIntervalSince(lastOutputAt); outLock.unlock()
+                    if quiet > Self.steamcmdSilenceTimeout {
+                        timedOut = true
+                        Log.write("WorkshopDownloader \(id): steamcmd 连续 \(Int(quiet))s 无输出,判定挂死 → 终止")
+                        Self.killProcessTree(p)
+                        break
+                    }
+                    if isCancelled(id) { break }
+                    Thread.sleep(forTimeInterval: 0.25)
+                }
                 p.waitUntilExit()
+                fh.readabilityHandler = nil
+                // 收尾:handler 停掉后可能还有残留数据没读完。
+                if let rest = try? fh.readToEnd(), !rest.isEmpty { outLock.lock(); outData.append(rest); outLock.unlock() }
                 setProcess(id, nil)
-                lastOut = String(data: data, encoding: .utf8) ?? ""
+                outLock.lock(); lastOut = String(data: outData, encoding: .utf8) ?? ""; outLock.unlock()
+                if timedOut {
+                    lastOut += "\n[LiveWallpaper] steamcmd 无响应已终止"
+                    continue   // 走重试逻辑(下一次 retry / 下一种登录)
+                }
 
                 if isCancelled(id) { break outer }   // 取消:保留临时目录,交给 UI 询问保留/删除
                 if lastOut.contains("Success") && FileManager.default.fileExists(atPath: downloaded) {
@@ -234,15 +300,28 @@ final class WorkshopDownloader: ObservableObject {
 
         // 移动到壁纸库目录。
         let dest = PreferencesStore.shared.libraryRoot.appendingPathComponent(id)
+        // ⚠ 不能「先删旧再移动」:removeItem 成功而 moveItem 失败(磁盘满 / 目标卷是用户自选的外置盘
+        //   且已卸载或无权限)时,旧壁纸已被**直接删除**(非废纸篓)且新的没落地 → 两头皆空、不可恢复。
+        //   改成「旧的先改名让位 → 移入新的 → 成功才删旧;任何一步失败就把旧的改回来」。
+        let fm = FileManager.default
+        var parked: URL?          // 旧壁纸的临时让位路径
         do {
-            if FileManager.default.fileExists(atPath: dest.path) {
-                try FileManager.default.removeItem(at: dest)
+            if fm.fileExists(atPath: dest.path) {
+                let p = dest.deletingLastPathComponent()
+                    .appendingPathComponent(".\(id).replacing-\(UUID().uuidString.prefix(8))")
+                try fm.moveItem(at: dest, to: p)
+                parked = p
             }
-            try FileManager.default.moveItem(atPath: downloaded, toPath: dest.path)
-            try? FileManager.default.removeItem(atPath: tmp)
+            try fm.moveItem(atPath: downloaded, toPath: dest.path)
+            if let p = parked { try? fm.removeItem(at: p) }   // 新的已就位,旧的可以删了
+            try? fm.removeItem(atPath: tmp)
             Log.write("WorkshopDownloader \(id): done → \(dest.path)")
             finish(id, .done, bytes: Self.parseBytes(lastOut), elapsed: Date().timeIntervalSince(t0))
         } catch {
+            // 回滚:把让位的旧壁纸放回原处,保证失败后用户仍有原来那份可用。
+            if let p = parked, !fm.fileExists(atPath: dest.path) {
+                try? fm.moveItem(at: p, to: dest)
+            }
             finish(id, .failed("移动文件失败: \(error.localizedDescription)"))
         }
     }
@@ -353,16 +432,22 @@ final class WorkshopDownloader: ObservableObject {
     func retry(id: String) {
         DispatchQueue.main.async {
             guard let i = self.jobs.firstIndex(where: { $0.id == id }) else { return }
-            var j = self.jobs[i]
-            j.state = .queued; j.startTime = nil; j.elapsed = 0
-            j.committedChunks = 0; j.totalChunks = 0
-            j.downloadedBytes = 0; j.logTotal = 0
-            j.liveSpeedMBps = 0; j.lastSpeedBytes = -1; j.lastSpeedTime = nil
-            j.lastSampleBytes = nil; j.lastSampleTime = nil
-            self.jobs[i] = j
-            self.lock.lock(); self.cancelledSet.remove(id); self.lock.unlock()
-            self.pump()
+            self.retryLocked(index: i)
         }
+    }
+
+    /// retry 的实现体。**必须在主线程调用**(jobs 只在主线程读写)。
+    /// 抽出来是为了让 enqueue 对「同 id 的失败/取消任务」也能走重下,而不是被去重直接丢弃。
+    private func retryLocked(index i: Int) {
+        var j = jobs[i]
+        j.state = .queued; j.startTime = nil; j.elapsed = 0
+        j.committedChunks = 0; j.totalChunks = 0
+        j.downloadedBytes = 0; j.logTotal = 0
+        j.liveSpeedMBps = 0; j.lastSpeedBytes = -1; j.lastSpeedTime = nil
+        j.lastSampleBytes = nil; j.lastSampleTime = nil
+        jobs[i] = j
+        lock.lock(); cancelledSet.remove(j.id); lock.unlock()
+        pump()
     }
 
     /// 从列表移除一个任务(失败/取消/完成的;若正在下则先杀进程)+ 清临时目录。
