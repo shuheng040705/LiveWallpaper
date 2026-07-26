@@ -5,15 +5,62 @@ final class PreferencesStore {
     static let shared = PreferencesStore()
     private let d = UserDefaults.standard
 
-    /// 默认指向用户经 CrossOver 运行的 Wallpaper Engine 工坊目录。
-    private let defaultRoot = "/Users/a55555/Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/workshop/content/431960"
+    /// 默认工坊目录候选。路径必须从当前用户 home 派生,不能绑定开发机用户名。
+    static func defaultLibraryCandidates(homeDirectory: URL) -> [URL] {
+        [
+            homeDirectory.appendingPathComponent(
+                "Library/Application Support/CrossOver/Bottles/Steam/drive_c/Program Files (x86)/Steam/steamapps/workshop/content/431960",
+                isDirectory: true
+            ),
+            homeDirectory.appendingPathComponent(
+                "Library/Application Support/Steam/steamapps/workshop/content/431960",
+                isDirectory: true
+            ),
+        ]
+    }
+
+    /// 优先沿用名为 Steam 的 CrossOver bottle;其次探测其它 bottle;再退原生 Steam。
+    /// 都不存在时返回 CrossOver 标准候选,让设置页仍有明确默认值并允许用户手选。
+    static func detectedDefaultLibraryRoot(
+        homeDirectory: URL = FileManager.default.homeDirectoryForCurrentUser,
+        fileManager: FileManager = .default
+    ) -> URL {
+        let candidates = defaultLibraryCandidates(homeDirectory: homeDirectory)
+        if fileManager.fileExists(atPath: candidates[0].path) {
+            return candidates[0]
+        }
+
+        let bottles = homeDirectory.appendingPathComponent(
+            "Library/Application Support/CrossOver/Bottles", isDirectory: true
+        )
+        if let bottleURLs = try? fileManager.contentsOfDirectory(
+            at: bottles, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]
+        ) {
+            for bottle in bottleURLs.sorted(by: { $0.lastPathComponent < $1.lastPathComponent }) {
+                let root = bottle.appendingPathComponent(
+                    "drive_c/Program Files (x86)/Steam/steamapps/workshop/content/431960",
+                    isDirectory: true
+                )
+                if fileManager.fileExists(atPath: root.path) {
+                    return root
+                }
+            }
+        }
+
+        if fileManager.fileExists(atPath: candidates[1].path) {
+            return candidates[1]
+        }
+        return candidates[0]
+    }
+
+    private let defaultRoot = PreferencesStore.detectedDefaultLibraryRoot()
 
     var libraryRoot: URL {
         get {
             if let s = d.string(forKey: "libraryRoot"), !s.isEmpty {
                 return URL(fileURLWithPath: s)
             }
-            return URL(fileURLWithPath: defaultRoot)
+            return defaultRoot
         }
         set { d.set(newValue.path, forKey: "libraryRoot") }
     }
@@ -46,6 +93,12 @@ final class PreferencesStore {
     var steamAccount: String? {
         get { let s = d.string(forKey: "steamAccount"); return (s?.isEmpty == false) ? s : nil }
         set { d.set(newValue, forKey: "steamAccount") }
+    }
+
+    /// 用户手选的 Steam 数据目录(覆盖自动检测;自动检测失败时兜底)。供 SteamSubscriptions 定位 subscriptions.vdf。
+    var steamDataPath: String? {
+        get { let s = d.string(forKey: "steamDataPath"); return (s?.isEmpty == false) ? s : nil }
+        set { d.set(newValue, forKey: "steamDataPath") }
     }
 
     // MARK: - 壁纸库排序
@@ -100,6 +153,14 @@ final class PreferencesStore {
         set { d.set(newValue, forKey: "frameRateCap") }
     }
 
+    /// 音频反应(音频条/pulse 随系统音乐律动)。开=用 ScreenCaptureKit 采集系统音频做频谱;
+    /// 关=不采集 → 系统守护(replayd/coreaudiod)CPU 归零,音频条/pulse 不再随声音变化(但零开销)。
+    /// 默认开(保持现状)。关闭后切换/重载壁纸即生效(SceneRenderEngine 不再 acquire 采集)。
+    var audioReactiveEnabled: Bool {
+        get { d.object(forKey: "audioReactiveEnabled") == nil ? true : d.bool(forKey: "audioReactiveEnabled") }
+        set { d.set(newValue, forKey: "audioReactiveEnabled") }
+    }
+
     // MARK: - 画质 / 性能(渲染管线)
 
     /// MetalFX 空间放大:场景按 renderScale 渲到低分辨率,再用 MetalFX 升采样到全分辨率(省 GPU、画质优于双线性)。
@@ -109,14 +170,36 @@ final class PreferencesStore {
         set { d.set(newValue, forKey: "metalFXEnabled") }
     }
     /// 渲染分辨率比例 [0.5,1.0]:1=原生,0.75=渲 75% 再升采样(省 GPU)。默认 1。
+    /// 注意:renderScale 渲到低分纹理后**升采样回全分辨率 drawable** → 只省「我们的渲染像素」,
+    /// drawable 仍是全分辨率 → WindowServer 合成成本不降。要降 WindowServer 用 presentScale。
     var renderScale: Double {
         get { let v = d.object(forKey: "renderScale") == nil ? 1.0 : d.double(forKey: "renderScale"); return min(1.0, max(0.5, v)) }
         set { d.set(min(1.0, max(0.5, newValue)), forKey: "renderScale") }
+    }
+    /// 呈现分辨率比例 [0.5,1.0]:把桌面壁纸 CAMetalLayer 的 drawableSize 缩成「屏幕像素×presentScale」,
+    /// layer.frame 仍铺满屏 → WindowServer 把这张更小的 surface 缩放填满屏。
+    /// 这是**唯一能同时降三处**的杠杆:①我们渲染像素(render 链按 drawable 尺寸驱动,自动变小)
+    /// ②present surface 大小 ③WindowServer 每帧合成成本(它缩放比合成全分辨率便宜很多)。
+    /// 与 renderScale/MetalFX 不同——后两者升采样回全分辨率 drawable,WindowServer 仍合成全分辨率=不降。
+    /// 壁纸是背景,缩放画质损失基本不可察,但用户要求不降画质 → **默认 1.0=原生全画质**;想省 WindowServer 自行拖滑块。
+    var presentScale: Double {
+        get {
+            if let e = ProcessInfo.processInfo.environment["WP_PRESENT_SCALE"], let v = Double(e) { return min(1.0, max(0.5, v)) }
+            let v = d.object(forKey: "presentScale") == nil ? 1.0 : d.double(forKey: "presentScale")
+            return min(1.0, max(0.5, v))
+        }
+        set { d.set(min(1.0, max(0.5, newValue)), forKey: "presentScale") }
     }
     /// FXAA 抗锯齿:呈现时做一次快速近似抗锯齿(低开销,边缘更平滑)。默认关。
     var fxaaEnabled: Bool {
         get { d.bool(forKey: "fxaaEnabled") }
         set { d.set(newValue, forKey: "fxaaEnabled") }
+    }
+    /// 渲染缺口报错(开发/纠错用):开启后,**每次切换壁纸**都弹窗列出该壁纸没能正确渲染的项
+    /// (未转译特效/combo变体缺失/贴图解码失败/composelayer问题/puppet解析失败等)。默认关(普通使用不打扰)。
+    var reportRenderGaps: Bool {
+        get { d.bool(forKey: "reportRenderGaps") }
+        set { d.set(newValue, forKey: "reportRenderGaps") }
     }
     /// 壁纸缩放模式(屏幕长宽比 ≠ 壁纸时):0=cover 填满+裁切(WE 默认)、1=fit 适应+黑边(全可见有黑边)、
     /// 2=stretch 拉伸填满(全屏无黑边全可见,但画面被拉伸变形)、3=自适应(比例差大如 16:9→cover 零变形裁空边;
