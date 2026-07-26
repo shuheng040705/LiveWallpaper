@@ -104,10 +104,19 @@ final class SceneRenderer: WallpaperRenderer {
     private var lastLinkTick: CFTimeInterval = 0      // 仅 CVDisplayLink 回调更新(区别于 lastTickWall=任一驱动)
     private var stallTimer: DispatchSourceTimer?       // 备用渲染驱动:显示链被系统节流时接管
     /// CVDisplayLink 回调是 CoreVideo 的实时小栈线程，不适合直接跑 JavaScriptCore/Metal/AppKit。
-    /// 所有帧工作投递到大栈串行线程；tickGate 在投递前非阻塞抢占，上一帧尚未结束时直接丢帧，
+    /// 所有帧工作投递到大栈串行线程；帧门(tickLock+tickInFlight)在投递前非阻塞抢占，上一帧尚未结束时直接丢帧，
     /// 避免显示链 120Hz 把队列堆成长尾。
     private let frameQueue = LargeStackSerialExecutor(label: "com.a55555.livewallpaper.scene-frame")
-    private let tickGate = DispatchSemaphore(value: 1)
+    // ⚠ 不用 DispatchSemaphore(与下面 drawableInflight 同一条铁律,2026-07-26 审计发现这里漏了一处)。
+    //   闭包里强捕获 gate 只保护了「任务已在执行」的情况;真正的洞是任务**被 shutdown() 丢弃**:
+    //   scheduleFrameTick 已经 wait 减到 0,而 LargeStackSerialExecutor.shutdown() 的 jobs.removeAll()
+    //   把任务连同 defer{gate.signal()} 一起丢掉 → signal 永不发生,同时丢弃闭包又释放了对信号量的最后
+    //   一个强引用 → 计数 0 < 初始 1 → `_dispatch_semaphore_dispose` SIGTRAP（切壁纸偶发闪退）。
+    //   切壁纸路径 `renderers.forEach { $0.stop() }; renderers.removeAll()` 每次都会走到 deinit。
+    //   改 NSLock+Bool:Bool 无析构约束;任务被丢弃最坏只是旗标滞留(stop() 后本实例不再复用，且
+    //   stop() 末尾显式复位),不会崩。
+    private let tickLock = NSLock()
+    private var tickInFlight = false
     // 台前调度切换卡顿真正的阻塞点:`nextDrawable()`。过场时 WindowServer 暂停合成我们(桌面层)窗口 →
     //   已 present 的 drawable 不被消费释放 → maximumDrawableCount 个槽全占满 → 下一次 nextDrawable 阻塞 ~1s
     //   (FRAMEGAP 1s 真因;engine 的在途信号量在 nextDrawable 之后,管不到)。修:nextDrawable 前先过此「在途门」
@@ -345,7 +354,7 @@ final class SceneRenderer: WallpaperRenderer {
     /// 备用渲染驱动:桥过台前调度切换时系统节流 CVDisplayLink 回调造成的卡顿(见 lastLinkTick 注释)。
     /// 正常播放时显示链按时回调 → lastLinkTick 持续刷新 → 本计时器什么都不做(零额外渲染);
     /// 仅当显示链回调停滞 >50ms 且未被 PowerManager 暂停(壁纸仍可见、只是切换过场)时,以 ~33Hz 调
-    /// frameTick 接管;显示链恢复后 lastLinkTick 变新 → 自动让位。frameTick 内有 tickGate 串行 + 帧率上限,
+    /// frameTick 接管;显示链恢复后 lastLinkTick 变新 → 自动让位。frameTick 内有帧门串行 + 帧率上限,
     /// 故两个驱动并发不会重复渲染或竞争。暂停时(被全屏 App 完全遮挡)不接管 → 不浪费 CPU 渲不可见画面。
     private func startStallBridge() {
         stallTimer?.cancel()
@@ -363,13 +372,22 @@ final class SceneRenderer: WallpaperRenderer {
     /// 从 CVDisplayLink/备用计时器请求一帧。调用方线程只做一次非阻塞 gate + enqueue；
     /// JavaScriptCore、鼠标/AppKit 查询、Metal 编码全部在大栈 frameQueue 上执行。
     private func scheduleFrameTick() {
-        guard tickGate.wait(timeout: .now()) == .success else { return }
-        let gate = tickGate
+        // 非阻塞抢门:上一帧还没结束就直接丢帧(不让显示链 120Hz 把队列堆成长尾)。
+        tickLock.lock()
+        if tickInFlight { tickLock.unlock(); return }
+        tickInFlight = true
+        tickLock.unlock()
         let accepted = frameQueue.async { [weak self] in
-            defer { gate.signal() }
+            defer { self?.releaseTickGate() }
             self?.frameTick()
         }
-        if !accepted { gate.signal() }
+        if !accepted { releaseTickGate() }
+    }
+
+    private func releaseTickGate() {
+        tickLock.lock()
+        tickInFlight = false
+        tickLock.unlock()
     }
 
     /// 大栈串行工作线程上的一帧。Metal 命令缓冲区线程安全;鼠标位置用全局函数获取。
@@ -510,6 +528,9 @@ final class SceneRenderer: WallpaperRenderer {
         fallbackImageView = nil
         hostView = nil
         frameQueue.shutdown()
+        // shutdown() 会丢弃已入队但未执行的帧任务(它们的 defer 不会跑)→ 显式复位帧门,
+        // 使旗标不会滞留在 true。旧实现这里是 DispatchSemaphore,丢任务=计数不还=析构 SIGTRAP。
+        releaseTickGate()
     }
 
     /// 互动 hit-test:转发引擎(持锁,与渲染线程同步,interactiveHitAt 只读 layers 很快)。光标命中可交互对象→返回 id。
