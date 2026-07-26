@@ -565,7 +565,31 @@ struct PuppetMesh {
                 //   保留作闭眼弧。丢后露出后方淡肤色(Direction-A 实证)=WE 干净深弧无蓝。半闭(<0.5)保留虹膜(渐压自然)。
                 let hasBright = eyeBrightMask.count == rawPos.count
                 var occluded = Set<Int>()
+                // ⭐2026-07-27 眉毛/睫毛误裁门(GBC SUBARU 安和昴 眼皮 puppet):暖棕睫毛/眉弧的反锯齿边被
+                //   irisColorMask 误判「虹膜色」(实测 avgR≈150/avgB≈85 高饱和暖棕,raw hit 16-24 → 1 环扩展到
+                //   82/105 顶点=整条睫毛线),close>0.5 时闭眼睫毛线被 discard 成碎块、眉弧被吃掉(实渲铁证:
+                //   WP_NO_EYE_OCCLUDE=1 纯蒙皮闭眼完美——该 pkg 自带真眼皮数据+眼球独立层原生 clipping,根本
+                //   不需要本兜底)。判别实据:**真·卡住的虹膜不随眨眼动**(白泽夢虹膜骨 b27-32/思衡托虹膜骨全程
+                //   静止,眼睑降~10px 时虹膜位移≈0——这正是当初做 clip 兜底的原因);而眼皮自身画艺(睫毛/眉/
+                //   卧蚕高光)**随眼睑一起下降**(位移≈眼睑位移)。故:被判「虹膜」的顶点中位下降 >3px 且
+                //   >0.35×眼睑中位下降 = 眼皮画艺非卡住虹膜 → 跳过 discard(纯蒙皮已是 WE 正确闭眼)。
+                //   白泽夢/思衡托虹膜不动 → 门不触发,discard 照旧(金标准零回归)。
+                var lashLikeIris = false
                 if close > 0.5 {
+                    var irisDs = irisIdx.map { rawPos[$0].y - skinned[$0].y }   // 下降为正(y 减小=下降,同 lidPts 判据)
+                    irisDs.sort()
+                    let irisDesc = irisDs[irisDs.count / 2]                     // irisIdx 非空(上方 guard)
+                    var lidDs: [Float] = []
+                    for j in 0..<rawPos.count where !isIrisVert(j) {
+                        let d = rawPos[j].y - skinned[j].y
+                        if d > 1.5 { lidDs.append(d) }                          // 只统计真在下降的眼睑顶点
+                    }
+                    lidDs.sort()
+                    let lidDesc = lidDs.isEmpty ? 0 : lidDs[lidDs.count / 2]
+                    lashLikeIris = irisDesc > 3 && irisDesc > 0.35 * lidDesc
+                    if occDbgClip { Log.write("OCCLUDE(gate) irisDesc=\(String(format:"%.1f",irisDesc)) lidDesc=\(String(format:"%.1f",lidDesc)) lashLikeIris=\(lashLikeIris)") }
+                }
+                if close > 0.5, !lashLikeIris {
                     let pad: Float = 2
                     for i in 0..<rawPos.count {
                         if isIrisVert(i) { occluded.insert(i); continue }
