@@ -2062,6 +2062,9 @@ final class SceneRenderEngine {
         hasAngleScript = result.contains { $0.angleScript != nil }
         hasAudioBars = result.contains { $0.audioBars != nil }
         hasInstancedBars = result.contains { $0.instancedBarsScript != nil }
+        // puppet 蒙皮动画(MDLA 关键帧/眨眼 single-shot/sway):puppetMesh 只在层带 animationlayer 时
+        // 非 nil(静态 puppet 为 nil,见 load 的 skin=anim…/static 日志),所以它就是「puppet 在动」的判据。
+        hasPuppetAnim = result.contains { $0.puppetMesh != nil }
         // 关键帧时间线动画(开场动画黑层 alpha 1→0 淡出 / 对象 origin/angle 摆动):是「持续动画内容」,
         // 否则纯关键帧场景被当静态图 → drawOnce 只画 t=0 一帧 → 开场永远卡 frame0(黑层不淡出)。
         // + ancestorOriginAnim/script:无 image 的动态容器下放后也是持续动画，否则会卡在 t=0。
@@ -2521,7 +2524,17 @@ final class SceneRenderEngine {
     }
 
     /// 是否需要持续动画(有视差、粒子、视频纹理、effect、文本时钟、scale 脚本、音频条或鼠标水波)。
-    var isAnimated: Bool { hasParallax || !particleGroups.isEmpty || hasVideo || hasEffects || hasText || hasScaleScript || hasOriginScript || hasAngleScript || hasAudioBars || hasInstancedBars || hasCursorRipple || has3DScene || hasKeyframeAnim || hasCameraAnim }
+    /// 连续动画内容(帧帧在变)。⚠ 唯一判据:isAnimated(要不要起显示链)与 update() 的按需渲染门
+    /// (frameDidChange)都必须用它 —— 2026-07-26 审计发现两处各自手抄清单已漂移:按需门漏了
+    /// hasInstancedBars / has3DScene(音频条、太阳系轨道在鼠标静止时冻结),而 puppet 蒙皮动画
+    /// (眨眼/摆动/MDLA)两份清单都漏(纯 puppet 壁纸连显示链都不起)。共用一份后不可能再漂移。
+    var hasContinuousAnimation: Bool {
+        !particleGroups.isEmpty || hasVideo || hasEffects || hasText
+            || hasScaleScript || hasOriginScript || hasAngleScript || hasAudioBars
+            || hasInstancedBars || hasCursorRipple || has3DScene || hasKeyframeAnim || hasCameraAnim
+            || hasPuppetAnim
+    }
+    var isAnimated: Bool { hasParallax || hasContinuousAnimation }
     private var hasScaleScript = false
     /// 是否含 origin 脚本图层(鼠标指针等动态 origin → 需每帧重算)。容器/时钟的 origin 脚本虽静态,
     /// 设此标志也无妨:每帧重算得同值,baseModel 不变,代价极小。
@@ -2814,6 +2827,9 @@ final class SceneRenderEngine {
     private var hasAudioBars = false
     /// 是否含运行时动态建层脚本(音频条 bar 模板:每帧 runDynamicBars 重算 N 根 bar → 需持续动画)。
     private var hasInstancedBars = false
+    /// 是否含 puppet 蒙皮动画(MDLA 关键帧 / 眨眼 single-shot / sway 摇摆)。puppetMesh 只在该层带
+    /// animationlayer 时非 nil(静态 puppet 为 nil),故它就是「puppet 在动」的判据。见 hasContinuousAnimation。
+    private var hasPuppetAnim = false
     /// 是否含关键帧时间线动画(开场 alpha 淡出 / origin/angle 摆动)→ 需起动画循环并逐帧重绘。
     private var hasKeyframeAnim = false
     private var hasAudioReactiveFX = false   // 任一图层/后处理特效请求 AUDIOPROCESSING(pulse 等)
@@ -3718,10 +3734,10 @@ final class SceneRenderEngine {
 
         // 按需渲染判定:连续动画内容(粒子/视频/特效/文本/各脚本/音频条/水波)→ 帧帧在变,必画;
         // 否则仅视差驱动 → 仅当视差位移本帧移动了 或 鼠标移动了 才需重画。两者皆无 → 画面与上帧一致,跳过渲染。
-        let alwaysAnimating = !particleGroups.isEmpty || hasVideo || hasEffects || hasText
-            || hasScaleScript || hasOriginScript || hasAngleScript || hasAudioBars || hasCursorRipple
-            || hasKeyframeAnim
-            || hasCameraAnim   // 相机运镜:proj 每帧在变 → 必须帧帧重渲(否则只画首帧静止)
+        // ⚠ 必须与 isAnimated 共用同一份判据(hasContinuousAnimation),不能各自手抄一份清单——
+        //   原来这里的清单相对 isAnimated 漏了 hasInstancedBars / has3DScene(音频条、太阳系轨道在
+        //   鼠标静止时冻结),两份清单都漏了 hasPuppetAnim(眨眼/摆动)。共用后不可能再漂移。
+        let alwaysAnimating = hasContinuousAnimation
         let parallaxMoved = cameraParallax
             && (simd_distance(parallaxDisplacement, dispBefore) > 1e-5 || mouseNorm != lastMouseForChange)
         frameDidChange = alwaysAnimating || parallaxMoved
