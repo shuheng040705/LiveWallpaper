@@ -4964,8 +4964,16 @@ final class SceneRenderEngine {
         pass.depthAttachment.loadAction = .clear
         pass.depthAttachment.clearDepth = 1.0
         pass.depthAttachment.storeAction = .dontCare
-        guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass),
-              let opaque = pipeline3DOpaque, let blend = pipeline3DBlend else { return }
+        // ⚠ 不能把「建 encoder」和「取管线」写在同一个 guard 里:若 encoder 建成功而管线为 nil,
+        //   直接 return 会留下一个**未 endEncoding 的 encoder**。Metal 要求同一 command buffer 上
+        //   必须先结束当前 encoder 才能再建下一个或 commit,否则直接 assert 崩溃。
+        //   (3D 管线为 nil 是真实可能:makeRenderPipelineState 在 AGX 上有过 XPC 失败的前科。)
+        guard let enc = cmd.makeRenderCommandEncoder(descriptor: pass) else { return }
+        guard let opaque = pipeline3DOpaque, let blend = pipeline3DBlend else {
+            enc.endEncoding()
+            Log.write("SceneRenderEngine.render3D: 3D 管线缺失,跳过本帧 3D(已收尾 encoder)")
+            return
+        }
         enc.label = "scene3d"
         var ndc = ndcScale
         let shadowTex = scene3DHasShadow ? shadowMapTex : nil
@@ -5348,6 +5356,13 @@ final class SceneRenderEngine {
         let lweLayerRange: Range<Int>? = {
             guard earlyGraded != nil else { return belowPostRange }
             let hi = belowPostRange?.upperBound ?? layers.count
+            // ⚠ Range 的 lower > upper 会直接 fatalError。belowPostRange 的上界与 earlyPostCutoff
+            //   来自两条独立的图层分段计算,不保证有序(某些 postChain/composelayer 组合下 hi 可能
+            //   小于 cutoff)→ 必须显式判序,越界时退回「不做早段优化」而不是崩。
+            guard earlyPostCutoff <= hi else {
+                Log.write("SceneRenderEngine: lweLayerRange 越界(cutoff=\(earlyPostCutoff) > hi=\(hi)),退回全量合成")
+                return belowPostRange
+            }
             return earlyPostCutoff..<hi
         }()
 
@@ -5917,7 +5932,8 @@ final class SceneRenderEngine {
     private lazy var captureEnabled: Bool = WPEnv.vars["WP_CAPTURE"] != nil
         || FileManager.default.fileExists(atPath: "/tmp/wp_capture_force")   // 兜底:显式 _force 文件(不会误留)
     // 诊断抓帧步进/上限(默认 120/720;WP_CAP_STEP/WP_CAP_MAX 可改,用于密集采样动画相位峰值)。
-    private lazy var captureStep: Int = Int(WPEnv.vars["WP_CAP_STEP"] ?? "") ?? 120
+    // max(1,…):WP_CAP_STEP=0 会让下面的 `liveFrameCount % captureStep` 触发**除零崩溃**。
+    private lazy var captureStep: Int = max(1, Int(WPEnv.vars["WP_CAP_STEP"] ?? "") ?? 120)
     private lazy var captureMax: Int = Int(WPEnv.vars["WP_CAP_MAX"] ?? "") ?? 720
     private var presentTex: MTLTexture?
     private var drawStaging: MTLTexture?
