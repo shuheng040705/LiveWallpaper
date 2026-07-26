@@ -334,13 +334,22 @@ final class WorkshopDownloader: ObservableObject {
         loginQueue.async {
             let p = Process()
             p.executableURL = URL(fileURLWithPath: steamcmd)
-            var args = ["+login", account, password]
-            if let g = guardCode, !g.isEmpty { args.append(g) }
-            args.append("+quit")
-            p.arguments = args
-            p.standardInput = FileHandle.nullDevice
+            // ⚠ 安全(审计):密码/Steam Guard 验证码**不能**放进 argv。macOS 上同一 uid 的任何进程
+            //   都能用 `ps -ef` / KERN_PROCARGS2 读到完整命令行,登录过程可达数十秒(含等验证码),
+            //   期间账号+密码+验证码三者明文可见。而且 /opt/homebrew/bin/steamcmd 是 shell wrapper、
+            //   steamcmd.sh 又不 exec,同一份 argv 会同时出现在两个进程里。
+            //   改走 stdin:argv 只留账号,密码与验证码经管道喂进去。
+            //   已实测(用不存在的账号验证机制):steamcmd 在 stdin 是管道时仍会打印 "password: "
+            //   并从管道读取,随后正常走登录流程 → 该方式可用。
+            p.arguments = ["+login", account, "+quit"]
+            let inPipe = Pipe()
+            p.standardInput = inPipe
             let pipe = Pipe(); p.standardOutput = pipe; p.standardError = pipe
             do { try p.run() } catch { DispatchQueue.main.async { completion(false, false, "启动失败") }; return }
+            var feed = password + "\n"
+            if let g = guardCode, !g.isEmpty { feed += g + "\n" }   // 令牌提示紧随密码之后
+            if let d = feed.data(using: .utf8) { inPipe.fileHandleForWriting.write(d) }
+            try? inPipe.fileHandleForWriting.close()   // 必须关,否则 steamcmd 会一直等输入
             let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
             p.waitUntilExit()
             let success = out.contains("Waiting for user info...OK") || out.contains("Logged in OK")
