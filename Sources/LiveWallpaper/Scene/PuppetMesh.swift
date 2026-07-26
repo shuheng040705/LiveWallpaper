@@ -565,43 +565,48 @@ struct PuppetMesh {
                 //   保留作闭眼弧。丢后露出后方淡肤色(Direction-A 实证)=WE 干净深弧无蓝。半闭(<0.5)保留虹膜(渐压自然)。
                 let hasBright = eyeBrightMask.count == rawPos.count
                 var occluded = Set<Int>()
-                // ⭐2026-07-27 眉毛/睫毛误裁门(GBC SUBARU 安和昴 眼皮 puppet):暖棕睫毛/眉弧的反锯齿边被
-                //   irisColorMask 误判「虹膜色」(实测 avgR≈150/avgB≈85 高饱和暖棕,raw hit 16-24 → 1 环扩展到
-                //   82/105 顶点=整条睫毛线),close>0.5 时闭眼睫毛线被 discard 成碎块、眉弧被吃掉(实渲铁证:
-                //   WP_NO_EYE_OCCLUDE=1 纯蒙皮闭眼完美——该 pkg 自带真眼皮数据+眼球独立层原生 clipping,根本
-                //   不需要本兜底)。判别实据:**真·卡住的虹膜不随眨眼动**(白泽夢虹膜骨 b27-32/思衡托虹膜骨全程
-                //   静止,眼睑降~10px 时虹膜位移≈0——这正是当初做 clip 兜底的原因);而眼皮自身画艺(睫毛/眉/
-                //   卧蚕高光)**随眼睑一起下降**(位移≈眼睑位移)。故:被判「虹膜」的顶点中位下降 >3px 且
-                //   >0.35×眼睑中位下降 = 眼皮画艺非卡住虹膜 → 跳过 discard(纯蒙皮已是 WE 正确闭眼)。
-                //   白泽夢/思衡托虹膜不动 → 门不触发,discard 照旧(金标准零回归)。
-                var lashLikeIris = false
-                if close > 0.5 {
-                    var irisDs = irisIdx.map { rawPos[$0].y - skinned[$0].y }   // 下降为正(y 减小=下降,同 lidPts 判据)
-                    irisDs.sort()
-                    let irisDesc = irisDs[irisDs.count / 2]                     // irisIdx 非空(上方 guard)
-                    var lidDs: [Float] = []
-                    for j in 0..<rawPos.count where !isIrisVert(j) {
-                        let d = rawPos[j].y - skinned[j].y
-                        if d > 1.5 { lidDs.append(d) }                          // 只统计真在下降的眼睑顶点
-                    }
-                    lidDs.sort()
-                    let lidDesc = lidDs.isEmpty ? 0 : lidDs[lidDs.count / 2]
-                    lashLikeIris = irisDesc > 3 && irisDesc > 0.35 * lidDesc
-                    if occDbgClip { Log.write("OCCLUDE(gate) irisDesc=\(String(format:"%.1f",irisDesc)) lidDesc=\(String(format:"%.1f",lidDesc)) lashLikeIris=\(lashLikeIris)") }
+                // ⭐2026-07-27 连续裁线 + 逐顶点运动豁免(WE 录屏铁证,白泽夢 3742497499):
+                //   旧实现是二值 close>0.5 全裁/否则全不裁 + 「全体中位数」运动门,两个都与 WE 实渲矛盾——
+                //   ① WE 录屏(用户 2026-07-27 提供)睁眼段虹膜青色像素 ~1-3.5s **连续爬升**(眼睑抬到哪虹膜露到哪),
+                //     二值分支让 close 1.0→0.5 的整个慢睁段(实测 ~4.3s)虹膜整体缺失、跨过 0.5 一帧内全弹出;
+                //   ② WE 闭眼有**红棕色弧形闭眼线**(眼睛 mesh 里随眼睑下降的睫毛画艺,暖红高饱和被 irisColorMask
+                //     假阳性标为「虹膜」),旧全裁把它一并裁掉 = 闭眼期整脸空白 ~5s;中位数门(irisDesc=0.0 被静止
+                //     teal 虹膜主导)救不了这部分顶点(安和昴的门是整条睫毛线全动才触发)。
+                //   新机制(单一、连续、逐顶点):
+                //   - 裁线 clipY 随 close 从虹膜跨度上沿(睁)连续扫到下沿之下(全闭)=「眨多少盖多少」;
+                //     闭眼时与旧全裁等价(teal 残留照样清零),睁眼过程虹膜从下往上连续露出(对齐 WE)。
+                //   - 逐顶点运动豁免:顶点自身下降量 > max(1.5, 0.35×眼睑中位下降) = 随眼睑动的眼皮画艺
+                //     (白泽夢红棕闭眼线/安和昴睫毛线眉弧,位移≈眼睑位移)→ 不裁(闭眼线保留=WE);
+                //     真·卡住的虹膜(白泽夢 teal/思衡托,位移≈0)→ 照裁。安和昴整条睫毛线每个顶点都在动 →
+                //     全体豁免,与旧中位数门同结果(回归锚不变)。
+                var lidDs: [Float] = []
+                for j in 0..<rawPos.count where !isIrisVert(j) {
+                    let d = rawPos[j].y - skinned[j].y
+                    if d > 1.5 { lidDs.append(d) }                          // 只统计真在下降的眼睑顶点
                 }
-                if close > 0.5, !lashLikeIris {
-                    let pad: Float = 2
-                    for i in 0..<rawPos.count {
-                        if isIrisVert(i) { occluded.insert(i); continue }
-                        // 跨度内的**亮**顶点(虹膜填充/青蓝高光/眼白)→ 丢;深睫毛(不亮)→ 保留作弧线。
-                        guard hasBright, eyeBrightMask[i] else { continue }
-                        let x = skinned[i].x
-                        guard x >= xmin, x <= xmax else { continue }
-                        let bn = binOf(x)
-                        if skinned[i].y >= bot[bn] - pad, skinned[i].y <= top[bn] + pad { occluded.insert(i) }
+                lidDs.sort()
+                let lidDesc = lidDs.isEmpty ? 0 : lidDs[lidDs.count / 2]
+                let exemptThresh = max(1.5, 0.35 * lidDesc)
+                let pad: Float = 2
+                var exempted = 0
+                for i in 0..<rawPos.count {
+                    // 只考虑被判虹膜色/亮色的顶点(肤色眼睑/深睫毛不裁,和旧行为一致)。
+                    let flagged = isIrisVert(i) || (hasBright && eyeBrightMask[i])
+                    guard flagged else { continue }
+                    // 逐顶点运动豁免:随眼睑下降的画艺(闭眼线/睫毛/眉弧)保留。
+                    if rawPos[i].y - skinned[i].y > exemptThresh { exempted += 1; continue }
+                    let x = skinned[i].x
+                    guard x >= xmin - pad, x <= xmax + pad else { continue }
+                    let bn = binOf(x)
+                    let span = top[bn] - bot[bn]
+                    guard span.isFinite, span > 0.5 else { continue }
+                    // 连续裁线:close 0→1 把裁线从上沿上方扫到下沿下方(上眼睑先盖上半,虹膜从下往上藏)。
+                    let clipY = top[bn] + pad - close * (span + 2 * pad)
+                    if skinned[i].y > clipY, skinned[i].y >= bot[bn] - pad, skinned[i].y <= top[bn] + pad {
+                        occluded.insert(i)
                     }
                 }
-                if occDbgClip { Log.write("OCCLUDE(discard) close=\(String(format:"%.2f",close)) irisHidden=\(occluded.count)") }
+                if occDbgClip { Log.write("OCCLUDE(discard) close=\(String(format:"%.2f",close)) irisHidden=\(occluded.count) exempt=\(exempted) lidDesc=\(String(format:"%.1f",lidDesc))") }
                 return unitVertsOccluded(skinned, occluded: occluded)
             }
         }
