@@ -6,8 +6,11 @@ import simd
 protocol WallpaperRenderer: AnyObject {
     /// 把自己的视图/图层挂到宿主内容视图(填满)。
     func attach(to host: NSView)
-    /// 加载壁纸数据。
+    /// 加载壁纸数据(同步)。
     func load(_ item: WallpaperItem)
+    /// 异步加载:把重活挪出主线程,完成后**在主线程**回调,调用方在回调里 start()。
+    /// 默认实现退化为同步 load(视频/web 渲染器加载很轻,没必要异步)。
+    func loadAsync(_ item: WallpaperItem, completion: @escaping () -> Void)
     func start()
     func stop()
     func pause()
@@ -26,6 +29,9 @@ protocol WallpaperRenderer: AnyObject {
 }
 
 extension WallpaperRenderer {
+    func loadAsync(_ item: WallpaperItem, completion: @escaping () -> Void) {
+        load(item); completion()
+    }
     func setMuted(_ muted: Bool) {}   // 默认空实现
     func setVolume(_ v: Double) {}
     func setFillMode(_ fill: Bool) {}

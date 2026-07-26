@@ -149,6 +149,8 @@ final class SceneRenderer: WallpaperRenderer {
     private var lastStaleReclaimLog: CFTimeInterval = 0
     private var drawableMax = 3
     private var lastDrawableFailureLog: CFTimeInterval = 0
+    /// stop() 已调用。用于挡住异步加载完成后迟到的 start()(切壁纸期间实例已被拆除)。
+    private var isStopped = false
 
     // WE「属性」通用区·播放速度:按倍率累积 sim 时间,中途改速度也连续(直接缩放墙钟会跳变)。
     private var scaledSimTime: CFTimeInterval = 0
@@ -274,13 +276,46 @@ final class SceneRenderer: WallpaperRenderer {
 
     func load(_ item: WallpaperItem) {
         loadedItem = item
-        guard let engine else { Log.write("SceneRenderer: no Metal device"); showFallback(item); return }
+        if !performLoad(item) { showFallback(item) }
+    }
+
+    /// 异步加载(审计):把重活挪出主线程。
+    ///
+    /// 实测(真机日志 apply → "N gpu layers"):白泽夢 87 层耗时 **1.88s**,这段时间主线程完全
+    /// 冻结(菜单栏/设置窗/轮换弹窗全无响应),多屏还要 ×屏数。
+    ///
+    /// 放到本渲染器**自己的大栈串行线程**(frameQueue)而不是随便一个后台队列,有三个理由:
+    ///   ① 它就是 update/render 跑的线程 —— JSContext 与 AppKit 文字绘制(makeTextTexture)本来
+    ///      就在这个线程上被使用;原来 load 在主线程创建、frameQueue 使用,反而是跨线程的。
+    ///      改后创建与使用同线程,一致性**变好**而非变差。
+    ///   ② 串行 → load 与 frameTick 天然互斥(强于原来的 renderLock)。
+    ///   ③ 8MB 大栈 —— JS 调用链需要,普通 GCD 线程的 512KB 不够。
+    /// 完成后回主线程调 completion,调用方在那里 start()(CVDisplayLink/AppKit 必须主线程)。
+    func loadAsync(_ item: WallpaperItem, completion: @escaping () -> Void) {
+        loadedItem = item
+        let accepted = frameQueue.async { [weak self] in
+            guard let self else { DispatchQueue.main.async { completion() }; return }
+            let ok = self.performLoad(item)
+            DispatchQueue.main.async {
+                if !ok { self.showFallback(item) }   // showFallback 用 AppKit,必须主线程
+                completion()
+            }
+        }
+        // 队列已 shutdown(渲染器已被 stop)→ 不会有任何回调,这里直接收尾避免调用方永远等。
+        if !accepted { DispatchQueue.main.async { completion() } }
+    }
+
+    /// load 的实际工作体。**不碰 AppKit**,可在主线程或 frameQueue 上跑。
+    /// - Returns: 是否加载成功(false → 调用方在主线程走 showFallback)。
+    private func performLoad(_ item: WallpaperItem) -> Bool {
+        guard let engine else { Log.write("SceneRenderer: no Metal device"); return false }
         guard let source = SceneSourceFactory.make(for: item),
               let doc = SceneDocument.build(from: source, item: item) else {
             Log.write("SceneRenderer: cannot open/parse scene for \(item.id)")
-            showFallback(item); return
+            return false
         }
         // 审计修复 #1:engine.load 会重建 layers/particleGroups,与后台 frameTick 竞争 → 持锁。
+        //（在 frameQueue 上跑时本就互斥,持锁仍保留:同步 load 路径仍可能来自主线程。)
         renderLock.lock()
         engine.load(document: doc, source: source)
         renderLock.unlock()
@@ -288,11 +323,12 @@ final class SceneRenderer: WallpaperRenderer {
         // 有 3D 模型即成功。漏掉 has3DScene 会把 3D 场景误判为空、回退到静态预览图(土星显示成 2D 照片的真因)。
         if engine.layerCount == 0 && !engine.has3DScene {
             Log.write("SceneRenderer: 0 layers decoded for \(item.id) → preview fallback")
-            showFallback(item); return
+            return false
         }
         loaded = true
         applyGeneralProps()
         Log.write("SceneRenderer: \(item.title) → \(engine.layerCount) gpu layers, 3D=\(engine.has3DScene), animated=\(engine.isAnimated)")
+        return true
     }
 
     /// 把 WE「属性」通用区(音频监听/翻转/图片筛选器/音量)推入引擎。load/reloadInPlace 与属性改动后调用。
@@ -342,7 +378,10 @@ final class SceneRenderer: WallpaperRenderer {
     }
 
     func start() {
-        guard loaded, let engine else { return }
+        // ⚠ 异步加载期间用户可能又切了壁纸 → 本实例已被 stop()/即将析构。此时迟到的
+        //   loadAsync 回调若照常 start(),会给一个已拆除的渲染器重新建 CVDisplayLink
+        //   (显示链持有回调上下文、还会往已 shutdown 的 frameQueue 投任务)。必须挡住。
+        guard !isStopped, loaded, let engine else { return }
         if engine.isAnimated {
             startTime = CACurrentMediaTime()
             scaledSimTime = 0; lastWallTime = 0   // 播放速度累积器复位(避免跨次启动残留)
@@ -577,6 +616,7 @@ final class SceneRenderer: WallpaperRenderer {
     }
 
     func stop() {
+        isStopped = true
         engine?.releaseAudio()
         stallTimer?.cancel(); stallTimer = nil
         // 审计修复 #1:先停显示链,再持锁拆除 —— CVDisplayLinkStop 后持锁可确保正在执行的

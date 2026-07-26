@@ -12,6 +12,8 @@ final class DesktopController {
     /// 审计修复(#6):屏幕参数变更防抖用的 pending work item。插拔屏/分辨率切换瞬间系统会连发多条
     ///   didChangeScreenParameters 通知,逐条全量 rebuild 既浪费又会黑闪多次;这里合并到 0.3s 后跑一次。
     private var screenChangeWork: DispatchWorkItem?
+    /// 每次 apply/rebuild 递增。异步加载完成后据此判断本轮是否已被后续切换取代(过期回调不 start)。
+    private var applyGeneration = 0
 
     func start() {
         rebuildWindows()
@@ -36,6 +38,7 @@ final class DesktopController {
     }
 
     private func rebuildWindows() {
+        applyGeneration &+= 1
         renderers.forEach { $0.r.stop() }
         renderers.removeAll()
         windows.forEach { $0.orderOut(nil) }
@@ -55,7 +58,10 @@ final class DesktopController {
     }
 
     /// 应用一张壁纸到所有屏幕。
-    func apply(_ item: WallpaperItem) {
+    /// - Parameter onLoaded: 全部渲染器**加载完成并已 start** 后在主线程回调一次。
+    ///   加载改异步后,调用方不能再假定 apply 返回时场景已就绪(渲染缺口弹窗就依赖这个时序)。
+    func apply(_ item: WallpaperItem, onLoaded: (() -> Void)? = nil) {
+        applyGeneration &+= 1
         renderers.forEach { $0.r.stop() }
         renderers.removeAll()
         current = item
@@ -63,6 +69,7 @@ final class DesktopController {
         isPaused = false
 
         Log.write("apply: \(item.title) [\(item.type.rawValue)] file=\(item.fileURL?.path ?? "nil") on \(windows.count) window(s)")
+        var pending = 0   // 待加载渲染器数(闭包按引用捕获;全部回调都在主线程,无需加锁)
         for window in windows {
             guard let host = window.contentView else { continue }
             host.subviews.forEach { $0.removeFromSuperview() }
@@ -71,11 +78,26 @@ final class DesktopController {
                 continue
             }
             renderer.attach(to: host)
-            renderer.load(item)
-            renderer.start()
             renderers.append((renderer, window.screen?.frame ?? .zero))
+            // 异步加载(审计):原来 attach→load→start 全在主线程同步跑,而 load 要解析 pkg + 解码
+            //   全部贴图 —— 实测白泽夢 87 层 **1.88s**,期间主线程完全冻结(菜单栏/设置窗/轮换弹窗
+            //   全无响应),多屏还要 ×屏数。改成重活挪到渲染器自己的串行线程,完成后回主线程 start()。
+            // ⚠ 用 generation 挡住过期回调:加载期间用户又切了壁纸的话,本轮 renderer 已被 stop(),
+            //   此时不能再 start()(SceneRenderer.start 内也有 isStopped 守卫,这里是第二道)。
+            let gen = applyGeneration
+            pending += 1
+            renderer.loadAsync(item) { [weak self, weak renderer] in
+                guard let self, self.applyGeneration == gen else { return }
+                renderer?.start()
+                pending -= 1
+                if pending == 0 {
+                    Log.write("apply: 全部 \(self.renderers.count) 个渲染器加载完成")
+                    onLoaded?()
+                }
+            }
         }
-        Log.write("apply: \(renderers.count) renderer(s) active")
+        if pending == 0 { onLoaded?() }   // 一个渲染器都没建起来(类型不支持)
+        Log.write("apply: \(renderers.count) renderer(s) 已挂载,加载中…")
     }
 
     /// 当前有几块屏在渲染(PowerManager 据此决定走按屏暂停还是整体暂停)。
@@ -85,6 +107,7 @@ final class DesktopController {
     func currentRenderGaps() -> [String] { renderers.first?.r.renderGaps ?? [] }
 
     func clear() {
+        applyGeneration &+= 1
         renderers.forEach { $0.r.stop() }
         renderers.removeAll()
         windows.forEach { $0.contentView?.subviews.forEach { $0.removeFromSuperview() } }

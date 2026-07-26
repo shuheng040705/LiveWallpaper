@@ -244,11 +244,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Actions
 
     private func apply(_ item: WallpaperItem, interactive: Bool = false) {
-        desktop.apply(item)
-        libraryWindow.updateCurrent(item.id)
         // ⭐用户政策(2026-06-19):渲染壁纸时,pkg 能渲的全渲、**不能渲的弹窗指明**,方便纠错。
         //   受「设置 → 渲染缺口报错」开关控制(默认关,普通使用不打扰);**开启后每次交互切壁纸都弹**。
-        if interactive && PreferencesStore.shared.reportRenderGaps { showRenderGapsIfAny(item) }
+        // ⚠ 加载已改异步 → 必须等 onLoaded 回调再读缺口,否则 apply 返回时引擎还没加载完,
+        //   currentRenderGaps() 恒为空 = 弹窗永远不出现(功能被静默废掉)。
+        desktop.apply(item) { [weak self] in
+            guard let self else { return }
+            if interactive && PreferencesStore.shared.reportRenderGaps { self.showRenderGapsIfAny(item) }
+        }
+        libraryWindow.updateCurrent(item.id)
     }
 
     /// 加载后若有渲染缺口(没渲成功的项),弹窗列出。空=全渲成功,不弹。
