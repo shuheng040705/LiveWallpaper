@@ -113,13 +113,18 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
     }
 
     /// 申请使用(引用计数)。第一个使用者触发启动。
+    /// ⚠ 不变式:**每个场景/引擎实例最多 acquire 一次**(release 只按 usesAudio 布尔减一次)。
+    ///   引擎侧唯一入口是 SceneRenderEngine.acquireAudioOnce;这里记 refCount 便于发现失衡
+    ///   ——正常切壁纸应看到 1 →(切走)0;若 refCount 越切越大即为泄漏(2026-07-26 修复过一次)。
     func acquire() {
-        lock.lock(); refCount += 1; let first = refCount == 1; lock.unlock()
+        lock.lock(); refCount += 1; let n = refCount; let first = refCount == 1; lock.unlock()
+        Log.write("AudioCapture: acquire → refCount=\(n)")
         if first { start() }
     }
     /// 释放使用。归零则停止捕获。
     func release() {
-        lock.lock(); refCount = max(0, refCount - 1); let last = refCount == 0; lock.unlock()
+        lock.lock(); refCount = max(0, refCount - 1); let n = refCount; let last = refCount == 0; lock.unlock()
+        Log.write("AudioCapture: release → refCount=\(n)\(last ? "(归零,停止捕获)" : "")")
         if last { stop() }
     }
 

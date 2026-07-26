@@ -1135,7 +1135,12 @@ final class SceneRenderEngine {
                 // 把条贴到场景梯形。底纹理分辨率决定条的采样精度(512×256,与旧 CPU 条一致)。需音频捕获。
                 guard let t = transparentTexture(width: 512, height: 256) else { continue }
                 tex = t
-                if audioReactiveEnabled { AudioCapture.shared.acquire(); usesAudio = true }
+                // ⚠ 必须带 !usesAudio 守卫。WE 语义:音频采集是「一个 recorder、按需求布尔建一次」
+                //   (lwe WallpaperApplication::setupAudio 用 any_of 得到单个布尔,不按图层计数)。
+                //   AudioCapture.acquire() 是真实计数,而 release 只按 usesAudio 这个**布尔**减 1 次
+                //   → 含 N 个音频层的壁纸会 acquire N 次、只 release 1 次,refCount 永不归零,
+                //   系统音频采集(Core Audio tap + FFT + 看门狗)永远关不掉。
+                acquireAudioOnce(enabled: audioReactiveEnabled)
             } else if layer.selfDrawFullscreen {
                 // 自绘满画布特效层(lightshafts 阳光/光束):shape="quad" + 无 image + DIRECTDRAW 自绘特效。
                 //   用**透明全画布底**作 g_Texture0(DIRECTDRAW 分支 `albedo=CAST4(0)` 忽略它),真 WE
@@ -1212,7 +1217,9 @@ final class SceneRenderEngine {
                 let ah = min(2048, max(768, Int(asz.y.rounded())))
                 guard let t = transparentTexture(width: aw, height: ah) else { continue }
                 tex = t
-                if audioReactiveEnabled { AudioCapture.shared.acquire(); usesAudio = true }
+                // !usesAudio 守卫理由同上(WE=单布尔一次 acquire;audioline/audio_base 双 solidlayer
+                // 是本库常见形态,少了守卫每次 load 就净漏一个计数)。
+                acquireAudioOnce(enabled: audioReactiveEnabled)
                 audioVizSelfAlpha = true   // 合成保留 effectedTexture 逐像素 alpha,不乘对象 alpha(常=0,会抹没曲线)
             } else if layer.isSolid,
                       WPEnv.vars["WP_NO_SOLIDFX"] == nil,   // 退回旧 1×1 白(A/B 诊断)
@@ -1941,7 +1948,8 @@ final class SceneRenderEngine {
                 let last = result.count - 1
                 result[last].instancedBarsScript = ibs
                 result[last].instancedBarBaseSize = layer.instancedBarBaseSize
-                if ibs.usesAudio, audioReactiveEnabled { AudioCapture.shared.acquire(); usesAudio = true }
+                // !usesAudio 守卫理由同上(WE=单布尔一次 acquire,不按图层计数)。
+                if ibs.usesAudio { acquireAudioOnce(enabled: audioReactiveEnabled) }
             }
             // origin 脚本(挂件容器/时钟/鼠标指针):记下脚本 + 父链变换,供 update 每帧重算绝对 origin。
             // 重算时叠加 layers[i].textCenterOffset(盒子对齐量,文本层每秒刷新时更新;图层恒为 0)。
@@ -2192,9 +2200,10 @@ final class SceneRenderEngine {
             || ($0.visibleScript?.usesAudio ?? false) || ($0.alphaScript?.usesAudio ?? false) || ($0.colorScript?.usesAudio ?? false)
             || ($0.instancedBarsScript?.usesAudio ?? false)   // 音频条 bar 模板脚本读 __audio
         }
-        if (hasAudioReactiveFX || hasAudioReactiveScript), !usesAudio, audioReactiveEnabled {
-            AudioCapture.shared.acquire(); usesAudio = true
-            Log.write("scene: audio-reactive FX/脚本 present → acquired audio capture")
+        if hasAudioReactiveFX || hasAudioReactiveScript {
+            let before = usesAudio
+            acquireAudioOnce(enabled: audioReactiveEnabled)
+            if !before, usesAudio { Log.write("scene: audio-reactive FX/脚本 present → acquired audio capture") }
         }
         // 相机级 bloom(general.bloom):WE 相机内建,无 effects/bloom 文件夹故进不了 manifest/postChain。
         // 用 PostProcess 跑 lwe 真 bloom 4-pass(downsample¼→⅛模糊→combine,真 WE shader)。
@@ -2847,7 +2856,28 @@ final class SceneRenderEngine {
     func setAudioVolume(_ v: Double) { audioPlayback.setVolume(v) }
     func setAudioMuted(_ m: Bool) { audioPlayback.setMuted(m) }
 
+    /// 取系统音频捕获 —— **唯一的 acquire 入口,幂等**。
+    ///
+    /// WE 语义(lwe `WallpaperApplication::setupAudio`):音频采集是「整个应用一个 recorder,按需求
+    /// **布尔**建一次」——`any_of(backgrounds, supportsAudioProcessing)` 得到单个 bool,不需要时就建
+    /// 空实现的 PlaybackRecorder;**从不按图层/特效数量做引用计数**。
+    ///
+    /// 我们的 `AudioCapture.acquire()` 是真实计数,而 `releaseAudio()`/`deinit` 只按 `usesAudio` 这个
+    /// 布尔各 release 一次。所以「acquire 必须整场景只发生一次」是硬不变式:2026-07-26 审计发现三处
+    /// 图层级 acquire 缺守卫(audioBars / audioViz·audioline / instancedBars),含 N 个音频层的壁纸
+    /// (黑猫 3299228616 有 102 个带 audio* 特效的对象)一次 load 就把 refCount 抬到几十上百,切走只
+    /// 减 1 → 永不归零 → Core Audio tap + FFT + 3s 看门狗常驻,切到静态壁纸也停不掉。
+    /// 把守卫收进本函数,使该不变式是结构性的、新增调用点不会再漏。
+    /// - Parameter enabled: 用户设置「音频监听」开关(= lwe 的 `settings.audio.audioprocessing`,
+    ///   与项目需求做 AND;load() 里已取好,按参数传入避免每次重读 UserDefaults)。
+    private func acquireAudioOnce(enabled: Bool) {
+        guard !usesAudio, enabled else { return }
+        AudioCapture.shared.acquire()
+        usesAudio = true
+    }
+
     /// 释放音频捕获 + 停壁纸音频(场景停止/切换时调用,避免泄漏/串声)。
+    /// 与 acquireAudioOnce 严格对称:一次 acquire ↔ 一次 release。
     func releaseAudio() { if usesAudio { AudioCapture.shared.release(); usesAudio = false }; audioPlayback.stop() }
 
     deinit { if usesAudio { AudioCapture.shared.release() }; audioPlayback.stop() }
