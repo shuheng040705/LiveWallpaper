@@ -394,6 +394,10 @@ final class SceneRenderer: WallpaperRenderer {
         t.schedule(deadline: .now() + 0.03, repeating: 0.03, leeway: .milliseconds(5))
         t.setEventHandler { [weak self] in
             guard let self, !self.paused, self.loaded else { return }
+            // 兜底(审计 R5):显示器休眠时 CVDisplayLink 自然停回调 → lastLinkTick 恒旧 → 本计时器
+            //   会误判成「被节流」而以 33Hz 一直渲染到黑屏上,纯耗电。PowerManager 现已监听显示器
+            //   休眠/锁屏并暂停;这里再直查一次显示器状态,万一通知漏了也不会空转。
+            if CGDisplayIsAsleep(CGMainDisplayID()) != 0 { return }
             if CACurrentMediaTime() - self.lastLinkTick > 0.05 { self.scheduleFrameTick() }
         }
         t.resume()

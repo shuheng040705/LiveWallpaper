@@ -34,6 +34,19 @@ final class PowerManager {
                        name: NSWorkspace.willSleepNotification, object: nil)
         nc.addObserver(self, selector: #selector(didWake),
                        name: NSWorkspace.didWakeNotification, object: nil)
+        // ⭐显示器睡眠 / 锁屏(审计 R5):原来只处理**系统**睡眠。显示器单独休眠或锁屏时系统仍醒着 →
+        //   PowerManager 不暂停 → 壁纸不可见,但 SceneRenderer 的「备用计时器」(显示链停回调时接管)
+        //   会一直以 ~33Hz 渲染到黑掉的屏幕上,纯烧 CPU/GPU 和电。这两类事件与系统睡眠同等对待。
+        nc.addObserver(self, selector: #selector(displaysDidSleep),
+                       name: NSWorkspace.screensDidSleepNotification, object: nil)
+        nc.addObserver(self, selector: #selector(displaysDidWake),
+                       name: NSWorkspace.screensDidWakeNotification, object: nil)
+        // 锁屏没有 NSWorkspace 通知,只能听 distributed notification。
+        let dnc = DistributedNotificationCenter.default()
+        dnc.addObserver(self, selector: #selector(displaysDidSleep),
+                        name: NSNotification.Name("com.apple.screenIsLocked"), object: nil)
+        dnc.addObserver(self, selector: #selector(displaysDidWake),
+                        name: NSNotification.Name("com.apple.screenIsUnlocked"), object: nil)
         // 遮挡覆盖率轮询(2.5s):窗口拖动/缩放不发激活通知,靠它捕捉「遮挡达阈值」的变化。开销很低
         //(一次 CGWindowList + 网格采样)。仅 enabled 时真正 evaluate。
         // ⭐自适应轮询(2026-06-26 修台前调度「显示桌面」恢复仍卡):**暂停期间每 0.5s 复查**(uncovered 即即时恢复,
@@ -82,6 +95,25 @@ final class PowerManager {
         guard let desktop, !desktop.isPaused else { return }
         desktop.pause(); pausedByPower = true
         Log.write("power: paused (will sleep)")
+    }
+
+    /// 显示器休眠 / 锁屏:壁纸不可见,与系统睡眠同等处理(否则备用计时器会一直渲染黑屏)。
+    /// ⚠ 这里**不看 isEnabled**:那个开关的语义是「被窗口遮挡时是否自动暂停」,而屏幕黑着/锁着时
+    /// 渲染毫无意义,任何设置下都该停。
+    @objc private func displaysDidSleep() {
+        cancelPendingPause()
+        guard let desktop, !desktop.isPaused else { return }
+        desktop.pause(); pausedByPower = true
+        Log.write("power: paused (显示器休眠 / 锁屏)")
+    }
+
+    @objc private func displaysDidWake() {
+        cancelPendingPause()
+        guard pausedByPower else { return }
+        pausedByPower = false
+        desktop?.resume()
+        evaluate()   // 醒来后若仍被全屏遮挡,由 evaluate 重新暂停
+        Log.write("power: resumed (显示器唤醒 / 解锁)")
     }
 
     // 审计修复 #5:谁暂停谁恢复 —— 只有当暂停是 PowerManager 造成的(pausedByPower)才恢复。
