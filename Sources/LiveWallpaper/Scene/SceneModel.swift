@@ -3260,10 +3260,15 @@ struct SceneDocument {
         } else if isAnchor {
             // 锚点/media:屏上字高 = srcPt×scale.y。supersample 2.5× 覆盖 Retina 2×+余量。
             renderPt = min(512, max(64, pt * scaleY * 2.5))
-        } else if let bs = boxSize {
-            // 盒子文本(时钟/日期):屏上字高 = box.y×scale.y。supersample 2.5×。floor 128 保底。
-            // 上限 512pt(=旧 128 的 4×,任意现实显示都锐利)防极大盒子(整屏标题)的纹理爆显存/超 8192 宽限。
-            renderPt = min(512, max(128, CGFloat(bs.y) * scaleY * 2.5))
+        } else if boxSize != nil, WPEnv.vars["WP_NO_TEXT_PTSIZE"] != nil {
+            // 旧盒子公式(WP_NO_TEXT_PTSIZE 退路):屏上字高 = box.y×scale.y。
+            renderPt = min(512, max(128, CGFloat(boxSize!.y) * scaleY * 2.5))
+        } else if boxSize != nil {
+            // 盒子文本(时钟/日期):屏上**行高** = pointsize×4×scale.y(WE 真义,定标见
+            // SceneRenderEngine.kWETextPtToPx:size 字段只是编辑器上次自动排版记录、可陈旧,不定字号)。
+            // 旧公式用 box.y×scale 定分辨率,size 陈旧时纹理分辨率与真实屏上字号脱钩(过大/过小)。
+            // supersample 2.5× 覆盖 Retina 2×+余量;floor 128 保底、上限 512 防爆显存(同旧)。
+            renderPt = min(512, max(128, pt * 4 * scaleY * 2.5))
         } else {
             renderPt = max(64, pt * 2)        // autosize:屏上字号 ∝ renderPt,保持旧义不动(零回归)
         }
@@ -3275,7 +3280,13 @@ struct SceneDocument {
         text.boxSizePx = isAnchor ? nil : boxSize
         text.useScreenPointSize = isAnchor
         text.limitWidth = limitWidth
-        text.maxWidth = maxWidthPx
+        // ⭐maxwidth 单位是**画布像素**(与 size 同空间,= pointsize×4 的栅格化空间;实据:白影 4385
+        //   pt=9 折行文本 size.x 1238 ≈ maxwidth 1242.6,而其自然 advance 在 pt 空间只有 ~481 →
+        //   maxwidth 是 pt×4 空间宽)。TextLayerRenderer 里折行宽度按 desc.pointSize/srcPointSize 的
+        //   **pt 空间**比例放大,故这里先 ÷4 换算到 pt 空间,否则折行点偏晚 4×(= e83afdf 后白影公告仍不折行)。
+        //   锚点/media 路径(useScreenPointSize)屏上字号按 pt×1 渲,维持原单位不动(其折行相对字号才一致)。
+        text.maxWidth = (isAnchor || WPEnv.vars["WP_NO_TEXT_PTSIZE"] != nil)
+            ? maxWidthPx : maxWidthPx / CGFloat(kWETextPtToPx)
         text.limitRows = limitRows
         text.maxRows = maxRows
         text.useEllipsis = useEllipsis

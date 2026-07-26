@@ -122,20 +122,42 @@ private func zAngle(_ m: simd_float4x4) -> Float {
     return atan2(m.columns.0.y, m.columns.0.x)
 }
 
-/// 文本图层盒子适配:WE 文本层有显式 size(画布单位),屏上尺寸 = box = size×scale。
-/// 文本纹理(texW×texH 像素)按其字形纵横比适配进 box(以高度为主,过宽则改以宽度为主,不拉伸),
-/// 得到屏上 quad 尺寸 (quadW×quadH);quad 可能小于 box,据 horizontalalign/verticalalign 在 box 内放置,
-/// 返回相对 origin(box 中心)的中心偏移。WE 场景空间 y 向上:vertical top = box 上半(+y)。
+/// WE 文本栅格化常数:**1 pointsize = 4 画布像素**(与画布分辨率无关)。
+/// 定标实据(2026-07-27,全库 scale=None 即「未拖过手柄、size=编辑器按当前文本自动排版」的单行文本层,
+/// 用 pkg 自带字体实测自然 advance/行高 vs size 字段):
+///   · 白影轻扬 504 ":34" pt=15:advance 26×4=104 = size.x **精确相等**;203 "12:34" pt=32:96×4=384 vs 395;
+///     259 "12/34" pt=15:45×4=180 vs 182;行高同理(203:43×4=172 vs size.y 174)。
+///   · 跨画布恒定:2560×1440(3737365345 "12:34" pt32 → K=4.17)、3840×2160(白影)、5120×2880
+///     (3505410236 pt38 → K=4.23)——K 不随画布变,是常数 4(小超出=首末字距/边距)。
+///   · 多行同验:3448290956 id214 pt=26 CJK 2 行,行高 41×4×2=328 ≈ size.y 332。
+/// 即 WE 以 pointsize×4 画布像素栅格化文本,屏上字号 = pointsize×4×scale;size 字段只是编辑器
+/// **上次自动排版的包围盒记录**——拖过手柄(scale≠1)的层 size 常是陈旧值(GBC SUBARU 3448290956
+/// "D a y":size=139×104,而实文本 "M O N D A Y" pt=8 的真包围盒 ≈ 247×50),不参与字号。
+let kWETextPtToPx: Float = 4
+
+/// 文本图层屏上尺寸与对齐。
+/// ⭐字号 = pointsize×4×scale(WE 真义,定标见 kWETextPtToPx):quad = 纹理像素 × glyphScale
+/// (glyphScale = 画布px/纹理px,含 scale;由调用方按 srcPt×4/renderPt×scale 算)。旧「quadH=box.y、
+/// 宽按纹理纵横比」在 size 新鲜自动排版时与本式等值(size.y=行高×4),但 size 陈旧时把字撑到错误高度:
+/// 3448290956 的 "D a y" 被撑到行高 118 画布px(真值 ~50)→ MONDAY 压进时间数字 = 用户报的重叠。
+/// 对齐(锚点语义)不变;quad 相对 origin 的中心偏移按 horizontalalign/verticalalign。
+/// WE 场景空间 y 向上:vertical top = box 上半(+y)。WP_NO_TEXT_PTSIZE=1 退回旧盒子适配(A/B)。
 private func textQuad(texW: Float, texH: Float, box: SIMD2<Float>,
-                      hAlign: String, vAlign: String)
+                      hAlign: String, vAlign: String,
+                      glyphScale: SIMD2<Float>? = nil)
     -> (size: SIMD2<Float>, centerOffset: SIMD2<Float>) {
     guard texW > 0, texH > 0, box.x > 0, box.y > 0 else { return (box, .zero) }
     let texAspect = texW / texH
-    // 按**高度**适配(quadH = box.y),宽度随字形纵横比、可溢出盒子 —— 照 lwe:文字尺寸由 pointSize×scale
-    // (高度)决定,盒子 size 只用于对齐/换行参考,**不缩字号**。曾用"过宽改按宽度适配"(我方自创)→ 对
-    // 极扁宽的日期盒子(如 1679×162×0.252)把行高坍缩成 ~27px 细线 → 看不清。去掉宽度坍缩、让宽度自然溢出。
-    let quadH = box.y
-    let quadW = quadH * texAspect
+    // 按**高度**适配(quadH = box.y),宽度随字形纵横比、可溢出盒子 —— 盒子 size 只用于对齐/换行参考,
+    // **不缩字号**。曾用"过宽改按宽度适配"(我方自创)→ 对极扁宽的日期盒子(如 1679×162×0.252)把行高
+    // 坍缩成 ~27px 细线 → 看不清。去掉宽度坍缩、让宽度自然溢出。(旧路径,glyphScale=nil / 退路时用。)
+    var quadH = box.y
+    var quadW = quadH * texAspect
+    if let g = glyphScale, g.x > 0, g.y > 0, WPEnv.vars["WP_NO_TEXT_PTSIZE"] == nil {
+        // pt×4 真义路径:纹理按 renderPt 像素字号绘制,×glyphScale 直接落到画布尺寸(纵横比天然保真)。
+        quadW = texW * g.x
+        quadH = texH * g.y
+    }
     // ⭐对齐 = **锚点对齐**(WE 真义):horizontalalign/verticalalign 决定文字哪条边贴 origin —— right=右缘贴
     //   origin(文字向左延伸)、left=左缘贴 origin、center=中心贴 origin。**不是**「盒内把文字推到一侧」。
     //   旧「盒内对齐」(自创)对 box≠文字宽时把右对齐文字推到盒右缘 = 整体右移 box.x/2:白影时钟 203
@@ -211,8 +233,9 @@ private struct GPULayer {
     var video: VideoTexture? = nil   // 视频纹理(动态贴图);非 nil 时每帧刷新 texture
     var effects: [LayerEffect] = []  // 图层后处理效果链
     var text: TextLayerState? = nil  // 文本图层(时钟/日期);非 nil 时按秒刷新纹理
-    var textBox: SIMD2<Float>? = nil // 文本盒子(已乘 scale,画布单位):非 nil → 屏上尺寸按字形纵横比
-                                     // 适配进此盒子(WE size×scale 行为);nil → autosize×scale(旧)。
+    var textBox: SIMD2<Float>? = nil // 文本盒子(已乘 scale,画布单位):对齐/换行参考 + 退路尺寸。
+    var textGlyphScale: SIMD2<Float>? = nil  // 画布px/纹理px(含 scale;= srcPt×4/renderPt×scale):
+                                     // 非 nil → quad = 纹理×此比例(WE 字号=pointsize×4×scale,见 kWETextPtToPx)。
     var textCenterOffset: SIMD2<Float> = .zero  // 盒子内对齐产生的中心偏移(相对 origin)。
     var audioBars: AudioBarsDesc? = nil   // 音频频谱条;非 nil 时每帧按音频重画纹理
     var effectMask: MTLTexture? = nil   // 主层水面遮罩(cursorripple 折射限定用,取首个遮罩)
@@ -249,8 +272,12 @@ private struct GPULayer {
     var materialConstants: [String: [Float]] = [:]  // 材质 constantshadervalues(PBR 量,喂转译 shader)
     // puppet 网格(多部件角色部件):非矩形 bind-pose 几何替代平面 quad。非 nil 时按索引三角网格画。
     // 顶点是**单位空间** [x,y,u,v]×N(rawX/size, −rawY/size),用 layer.mvp(proj×matModel) 直渲场景(照 lwe)。
-    var puppetVB: MTLBuffer? = nil
-    var puppetAlphaVB: MTLBuffer? = nil     // 逐顶点 alpha(SKINNING_ALPHA);创建为全 1.0,含 boneAlpha 的 puppet 每帧更新
+    // 同粒子 instanceBuffers 的审计修复#2:蒙皮 puppet 每帧 copyMemory 覆写 shared 缓冲,而 inflight=3 允许
+    //   GPU 仍在读前 1~3 帧的同一块 → 顶点/alpha 撕裂(网格偶发微撕裂/闪动)。改 4 套轮换(ring=4 > inflight=3,
+    //   N%4 上次用是 N-4 帧,必已完成)。update 写/encode 读都取 frameIndex % kBufferRing 同一槽。
+    //   静态 puppet(无蒙皮,从不更新)4 槽内容恒同 bind 姿态 → 任意槽都对,零回归。
+    var puppetVBs: [MTLBuffer?] = [nil, nil, nil, nil]
+    var puppetAlphaVBs: [MTLBuffer?] = [nil, nil, nil, nil]  // 逐顶点 alpha(SKINNING_ALPHA);创建为全 1.0,含 boneAlpha 的 puppet 每帧更新(4 套轮换同上)
     var puppetIB: MTLBuffer? = nil          // u16 索引
     var puppetIndexCount: Int = 0
     var puppetDrawGroups: [PuppetMesh.DrawGroup] = []
@@ -260,7 +287,7 @@ private struct GPULayer {
     //   (matModel 缩到 S'=k⊙canvas),但 UV 重映射到 [0.5±0.5k] → 中心 [0,1] 光束落同屏幕像素、出 [0,1] 处
     //   clamp 羽化(见 SceneModel.lsUVScale)。非光束层为 nil → 合成走默认 quadBuffer(UV[0,1],零变化)。
     var lsQuadVB: MTLBuffer? = nil
-    // puppet 骨骼蒙皮动画(MDLS 骨骼 + MDLA 动画):非 nil 且 hasSkin 时,update() 每帧求值动画→蒙皮→更新 puppetVB。
+    // puppet 骨骼蒙皮动画(MDLS 骨骼 + MDLA 动画):非 nil 且 hasSkin 时,update() 每帧求值动画→蒙皮→写 puppetVBs 本帧槽。
     var puppetMesh: PuppetMesh? = nil
     var puppetAnimId: Int = 0               // animationlayers[].animation(对应 MDLA 动画 id)
     var puppetAnimRate: Float = 1           // animationlayers[].rate(播放速率)
@@ -653,7 +680,7 @@ final class SceneRenderEngine {
     private var samplerRepeatNearest: MTLSamplerState!  // repeat + nearest(NoInterpolation,无 ClampUVs)
     private let quadBuffer: MTLBuffer
     // 逐顶点 alpha(SKINNING_ALPHA)默认缓冲:全 1.0。非 puppet / 无 boneAlpha 的 scene_vertex draw 绑此 →
-    //   vAlpha=1.0 = 渲染恒等(零回归)。puppet 各自有按顶点数建的 puppetAlphaVB。
+    //   vAlpha=1.0 = 渲染恒等(零回归)。puppet 各自有按顶点数建的 puppetAlphaVBs(4 套轮换)。
     private let dummyAlphaVB: MTLBuffer
 
     /// 按图层贴图真实 flags 选主 pass 采样器。flags=nil(纯色/文本/视频/音频条等无 .tex flags)→
@@ -1460,6 +1487,7 @@ final class SceneRenderEngine {
             var size: SIMD2<Float>
             var effSize: SIMD2<Float>
             var textBox: SIMD2<Float>? = nil
+            var textGlyphScale: SIMD2<Float>? = nil
             var textCenterOffset: SIMD2<Float> = .zero
             // WE 文本 size 字段语义:size 远大于 pointsize = 真文本框(文字适配进盒子);size 远小于
             // pointsize(如歌名 size="2 2" + pointsize=10 + scale=8)= **锚点占位**,WE 忽略它、按 pointsize×scale
@@ -1474,14 +1502,20 @@ final class SceneRenderEngine {
                 effSize = SIMD2(Float(tex.width) * scaleY * layer.scale.x,
                                 Float(tex.height) * scaleY * layer.scale.y)
             } else if let box = layer.text?.boxSizePx {
-                // 真文本框 = size×scale(画布单位)。文本按字形纵横比适配进盒子(见 textQuad)。
+                // 文本框层:屏上字号 = pointsize×4×scale(WE 真义,定标见 kWETextPtToPx),size 只作
+                // 对齐/换行参考。纹理按 renderPt 像素字号绘制 → 画布px/纹理px = srcPt×4/renderPt,再乘 scale。
                 let scaledBox = SIMD2(box.x * layer.scale.x, box.y * layer.scale.y)
+                let renderPt = Float(layer.text?.pointSize ?? 32)
+                let ptToCanvas = renderPt > 0 ? srcPt * kWETextPtToPx / renderPt : 1
+                let gs = SIMD2(ptToCanvas * layer.scale.x, ptToCanvas * layer.scale.y)
                 let q = textQuad(texW: Float(tex.width), texH: Float(tex.height), box: scaledBox,
                                  hAlign: layer.text?.align ?? "center",
-                                 vAlign: layer.text?.verticalAlign ?? "center")
+                                 vAlign: layer.text?.verticalAlign ?? "center",
+                                 glyphScale: gs)
                 size = scaledBox          // baseSize 记盒子(scaleScript 不作用于文本,无碍)
                 effSize = q.size
                 textBox = scaledBox
+                textGlyphScale = gs       // 文本刷新(字符串变→纹理尺寸变)时按同一比例重建 quad
                 textCenterOffset = q.centerOffset
             } else {
                 // 无显式 size:autosize 取纹理像素 × scale(旧行为;无 size 的静态文本/问候/非文本层)。
@@ -1596,8 +1630,9 @@ final class SceneRenderEngine {
             // —— 它们落到该层框外但场景内的相邻位置,正是眼睛(rawX 全负)拼到脸中央、头发披到背后的机制。
             // (旧的「每层 size×size 局部 ortho FBO + 裁剪 + 当 albedo 铺」是我方自创、偏离 lwe:把眼睛偏心顶点
             //  整片裁光 → 光头、头发夹偏。已弃。)WP_NOPUPPET=1 可临时退回 baseline(无 puppet)对比。
-            var puppetVB: MTLBuffer? = nil, puppetIB: MTLBuffer? = nil, puppetCount = 0
-            var puppetAlphaVB: MTLBuffer? = nil
+            var puppetVBs: [MTLBuffer?] = [nil, nil, nil, nil]   // 4 套轮换(见 GPULayer.puppetVBs 注释)
+            var puppetIB: MTLBuffer? = nil, puppetCount = 0
+            var puppetAlphaVBs: [MTLBuffer?] = [nil, nil, nil, nil]
             var puppetMesh: PuppetMesh? = nil, puppetAnimId = 0, puppetAnimRate: Float = 1
             var puppetDrawGroups: [PuppetMesh.DrawGroup] = []
             var puppetClipStates: [PuppetClipState] = []
@@ -1649,15 +1684,21 @@ final class SceneRenderEngine {
                 if attachWorld != nil {
                     Log.write("puppet-attach(unified-anchor): \(layer.name) -> \(layer.parentPuppet ?? "?") @\(layer.attachment ?? "?") (\(bind.count/4) verts, own-unit-space)")
                 }
-                // shared 存储:hasSkin 时 update() 每帧就地写入蒙皮后顶点(摇摆相邻帧近一致,单缓冲竞态不可见)。
-                puppetVB = device.makeBuffer(bytes: bind, length: MemoryLayout<Float>.stride * bind.count, options: .storageModeShared)
+                // shared 存储 + 4 套轮换(审计修复#2 同构,见 GPULayer.puppetVBs):hasSkin 时 update() 每帧
+                // 写入本帧槽(frameIndex % kBufferRing),GPU 读的前 1~3 帧槽不被覆写 → 无撕裂。
+                // 4 槽都预填 bind 姿态:静态 puppet 从不更新,任意槽内容恒同 = 零回归。
+                for r in 0..<SceneRenderEngine.kBufferRing {
+                    puppetVBs[r] = device.makeBuffer(bytes: bind, length: MemoryLayout<Float>.stride * bind.count, options: .storageModeShared)
+                }
                 puppetIB = device.makeBuffer(bytes: mesh.indices, length: MemoryLayout<UInt16>.stride * mesh.indices.count)
                 puppetCount = mesh.indices.count
                 puppetDrawGroups = mesh.drawGroups
-                // 逐顶点 alpha 缓冲(SKINNING_ALPHA):默认全 1.0(渲染恒等=零回归);含 boneAlpha 的 puppet 由 update() 每帧写真值。
+                // 逐顶点 alpha 缓冲(SKINNING_ALPHA):默认全 1.0(渲染恒等=零回归);含 boneAlpha 的 puppet 由 update() 每帧写真值(同为 4 套轮换)。
                 let _vcount = max(1, bind.count / 4)
-                puppetAlphaVB = device.makeBuffer(bytes: [Float](repeating: 1, count: _vcount),
-                                                  length: MemoryLayout<Float>.stride * _vcount, options: .storageModeShared)
+                for r in 0..<SceneRenderEngine.kBufferRing {
+                    puppetAlphaVBs[r] = device.makeBuffer(bytes: [Float](repeating: 1, count: _vcount),
+                                                          length: MemoryLayout<Float>.stride * _vcount, options: .storageModeShared)
+                }
                 // MDLV 真 clipping：按“遮罩路径 + source 子网格集合”合并记录。Holo 全身 Puppet 的
                 // 8 个虹膜/高光目标共用眼白子网格 22/25；旧代码丢掉子网格表，只能整网格一次画完。
                 // 这里仅建立真实 pkg 指定的关系，不用名称/颜色/UV 猜目标。
@@ -1851,6 +1892,7 @@ final class SceneRenderEngine {
                 effects: effs,
                 text: textState,
                 textBox: textBox,
+                textGlyphScale: textGlyphScale,
                 textCenterOffset: textCenterOffset,
                 audioBars: layer.audioBars,
                 effectMask: effectMask,
@@ -1867,8 +1909,8 @@ final class SceneRenderEngine {
                 materialShader: layer.materialShader,
                 materialCombos: layer.materialCombos,
                 materialConstants: layer.materialConstants,
-                puppetVB: puppetVB,
-                puppetAlphaVB: puppetAlphaVB,
+                puppetVBs: puppetVBs,
+                puppetAlphaVBs: puppetAlphaVBs,
                 puppetIB: puppetIB,
                 puppetIndexCount: puppetCount,
                 puppetDrawGroups: puppetDrawGroups,
@@ -2504,7 +2546,7 @@ final class SceneRenderEngine {
             if l.cropShiftPx != .zero { head += " cropShift=(\(Int(l.cropShiftPx.x)),\(Int(l.cropShiftPx.y)))" }
             if l.parallax != .zero { head += " par=(\(l.parallax.x),\(l.parallax.y))" }
             if l.puppetMesh != nil { head += " puppet[anims:\(l.puppetAnimLayers.map { "\($0.animId)\($0.additive ? "+" : "")" }.joined(separator: ","))]" }
-            else if l.puppetVB != nil { head += " puppet[static]" }
+            else if l.puppetVBs[0] != nil { head += " puppet[static]" }
             L.append(head)
             for (ei, e) in l.effects.enumerated() {
                 var line = "    eff[\(ei)] \(e.weName.isEmpty ? "❌未映射" : e.weName)"
@@ -3060,13 +3102,16 @@ final class SceneRenderEngine {
                 FileHandle.standardError.write("WP_DBG_CAMERA t=\(String(format:"%.2f",t))s f\(String(format:"%.0f",fr)) zoom=\(String(format:"%.3f",zoom)) pan=(\(String(format:"%.1f",dp.x)),\(String(format:"%.1f",dp.y))) pivot=(\(Int(pivot.x)),\(Int(pivot.y)))\n".data(using: .utf8)!)
             }
         }
-        // puppet 骨骼蒙皮动画(MDLS/MDLA):每帧求值动画 → 蒙皮顶点 → 就地更新该层 puppetVB(真 WE 角色待机
+        // puppet 骨骼蒙皮动画(MDLS/MDLA):每帧求值动画 → 蒙皮顶点 → 写该层 puppetVBs 本帧槽(真 WE 角色待机
         // 摇摆/形变;lwe 无此功能)。skin() 失败/无骨返回 nil → 不更新 → 维持静态 bind 姿态(零回归)。
         // 默认启用(转置修复后 rest=I 已验证;版本保护只对 MDLS0004/MDLA0006 蒙皮)。WP_NO_PUPPET_ANIM 可临时关。
         let _perfSkinT0 = perfNow()
         if WPEnv.vars["WP_NO_PUPPET_ANIM"] == nil {
+            // 审计修复#2(puppet 版):写入本帧选用的缓冲套(frameIndex % kBufferRing),不再每帧覆写同一块——
+            // inflight=3 时 GPU 可能仍在读前 1~3 帧的同一 shared 缓冲,覆写 = 蒙皮网格撕裂(同粒子彩色斑点先例)。
+            let skinRing = frameIndex % Self.kBufferRing
             for i in layers.indices {
-                guard let mesh = layers[i].puppetMesh, let vb = layers[i].puppetVB else { continue }
+                guard let mesh = layers[i].puppetMesh, let vb = layers[i].puppetVBs[skinRing] else { continue }
                 // 多 animationlayer 叠加合成(WE 真义;御剑龙 base+additive)。skinLayers 要求精确 anim id 命中,
                 // 失败(id 不在 MDLA,如部分壁纸引用编辑器层 id)→ 回退旧单层 skin()(带 anims.first 兜底),零回归。
                 // 眼睛层用完整 3D 蒙皮(rx/ry/tz)配背面剔除;主 puppet 用平面蒙皮(丢 rx/ry,零回归)。
@@ -3101,9 +3146,9 @@ final class SceneRenderEngine {
                 let bytes = MemoryLayout<Float>.stride * sk.count
                 if vb.length >= bytes { sk.withUnsafeBytes { vb.contents().copyMemory(from: $0.baseAddress!, byteCount: bytes) } }
                 // 逐顶点 alpha(SKINNING_ALPHA):仅含 boneAlpha 的 puppet(白泽夢/白影眉毛/xraypad-眠/泠泠泉心眨眼)
-                //   每帧更新;其余 puppet 的 puppetAlphaVB 恒为创建时的全 1.0(不更新=零回归)。用 animTime(与蒙皮同步,
+                //   每帧更新(写本帧槽);其余 puppet 的 puppetAlphaVBs 恒为创建时的全 1.0(不更新=零回归)。用 animTime(与蒙皮同步,
                 //   眨眼层走眨眼调度时间)。
-                if mesh.hasBoneAlpha, let avb = layers[i].puppetAlphaVB {
+                if mesh.hasBoneAlpha, let avb = layers[i].puppetAlphaVBs[skinRing] {
                     let av = mesh.boneAlphaVerts(time: animTime, layers: layers[i].puppetAnimLayers)
                     let abytes = MemoryLayout<Float>.stride * av.count
                     if avb.length >= abytes { av.withUnsafeBytes { avb.contents().copyMemory(from: $0.baseAddress!, byteCount: abytes) } }
@@ -3622,7 +3667,8 @@ final class SceneRenderEngine {
                         // 盒子型文本:新字符串纹理纵横比可能变(如日期长短),按盒子重新适配 + 重建变换。
                         if let box = layers[i].textBox {
                             let q = textQuad(texW: Float(t.1), texH: Float(t.2), box: box,
-                                             hAlign: ts.desc.align, vAlign: ts.desc.verticalAlign)
+                                             hAlign: ts.desc.align, vAlign: ts.desc.verticalAlign,
+                                             glyphScale: layers[i].textGlyphScale)
                             layers[i].sizePx = q.size
                             layers[i].textCenterOffset = q.centerOffset
                             let center = SIMD2(layers[i].origin.x + q.centerOffset.x + clockTimeDX(layers[i].id),
@@ -4120,13 +4166,13 @@ final class SceneRenderEngine {
             // puppet 层:用单位空间 mesh 顶点 + 该层 mvp(proj×matModel)**直渲索引三角网格**(替代平面 quad),
             // 偏心/出界顶点不裁——照 lwe 把局部 puppet 顶点直接用场景投影渲(setupPuppetGeometryCallback)。
             // 非 puppet 层走原 quad 逻辑。
-            let isPup = layer.puppetVB != nil && layer.puppetIB != nil
+            let isPup = layer.puppetVBs[ring] != nil && layer.puppetIB != nil
             // 每层重绑几何@0(材质路径会覆盖 index0/1,故不能只在循环外绑一次)。
             // 自绘光束(lightshafts):用扩大+UV重映射的专属 quad(lsQuadVB)合成,把旋转后硬几何边推出画布、
             //   光束靠 shader 羽化淡出(修竖缝)。非光束层 lsQuadVB=nil → 走默认 quadBuffer(零变化)。
-            encoder.setVertexBuffer(isPup ? layer.puppetVB : (layer.lsQuadVB ?? quadBuffer), offset: 0, index: 0)
-            // 逐顶点 alpha(SKINNING_ALPHA)@2:puppet 用自身 alpha VB(含 boneAlpha 才非全 1.0),非 puppet/无 → dummy 全 1.0(恒等)。
-            encoder.setVertexBuffer(isPup ? (layer.puppetAlphaVB ?? dummyAlphaVB) : dummyAlphaVB, offset: 0, index: 2)
+            encoder.setVertexBuffer(isPup ? layer.puppetVBs[ring] : (layer.lsQuadVB ?? quadBuffer), offset: 0, index: 0)
+            // 逐顶点 alpha(SKINNING_ALPHA)@2:puppet 用自身 alpha VB(含 boneAlpha 才非全 1.0,取本帧槽 ring),非 puppet/无 → dummy 全 1.0(恒等)。
+            encoder.setVertexBuffer(isPup ? (layer.puppetAlphaVBs[ring] ?? dummyAlphaVB) : dummyAlphaVB, offset: 0, index: 2)
             func drawGeom() {
                 if isPup, let ib = layer.puppetIB {
                     // puppet 剔除:眼睛闭合靠 3D 蒙皮(trs3D),默认不剔除(puppetCull=.none)。仅 WP_EYE_CULL
@@ -4390,9 +4436,10 @@ final class SceneRenderEngine {
             // UV 散开。此前 compositeSceneBelow 只画平面 quad,导致「postProcess(bloom)壁纸 + frameBufferInput
             // composelayer + puppet 角色」(如 WLOP Chapter4 海报封面)的 composelayer 读到散架场景 → 叠出错位
             // 副本(头身分离)。与 encode 的 isPup 分支对齐。
-            if layer.puppetVB != nil, let ib = layer.puppetIB {
-                enc.setVertexBuffer(layer.puppetVB, offset: 0, index: 0)
-                enc.setVertexBuffer(layer.puppetAlphaVB ?? dummyAlphaVB, offset: 0, index: 2)  // 逐顶点 alpha@2
+            let pupRing = frameIndex % Self.kBufferRing   // 审计修复#2(puppet 版):读本帧写入的那套缓冲
+            if layer.puppetVBs[pupRing] != nil, let ib = layer.puppetIB {
+                enc.setVertexBuffer(layer.puppetVBs[pupRing], offset: 0, index: 0)
+                enc.setVertexBuffer(layer.puppetAlphaVBs[pupRing] ?? dummyAlphaVB, offset: 0, index: 2)  // 逐顶点 alpha@2
                 enc.drawIndexedPrimitives(type: .triangle, indexCount: layer.puppetIndexCount,
                                           indexType: .uint16, indexBuffer: ib, indexBufferOffset: 0)
                 enc.setVertexBuffer(quadBuffer, offset: 0, index: 0)   // 还原 quad 供后续平面层
@@ -5134,11 +5181,12 @@ final class SceneRenderEngine {
     }
 
     /// 先按每个 Puppet clipping 记录的 source 子网格画动态 screen-space 开口。
-    /// source 顶点来自本帧已更新的 puppetVB，因此眼白骨 sy→0 时开口会同步闭合。
+    /// source 顶点来自本帧已更新的 puppetVBs[本帧槽]，因此眼白骨 sy→0 时开口会同步闭合。
     private func encodePuppetClipMasks(width: Int, height: Int, commandBuffer cmd: MTLCommandBuffer) {
         guard width > 0, height > 0, let pipe = pipelinePuppetMask else { return }
+        let ring = frameIndex % Self.kBufferRing   // 审计修复#2(puppet 版):读本帧写入的那套缓冲(与 update 写入一致)
         for layer in layers where !layer.puppetClipStates.isEmpty {
-            guard let vb = layer.puppetVB, let ib = layer.puppetIB else { continue }
+            guard let vb = layer.puppetVBs[ring], let ib = layer.puppetIB else { continue }
             for state in layer.puppetClipStates {
                 if state.maskTarget?.width != width || state.maskTarget?.height != height {
                     let d = MTLTextureDescriptor.texture2DDescriptor(
@@ -5159,7 +5207,7 @@ final class SceneRenderEngine {
                 enc.setRenderPipelineState(pipe)
                 enc.setCullMode(.none)
                 enc.setVertexBuffer(vb, offset: 0, index: 0)
-                enc.setVertexBuffer(layer.puppetAlphaVB ?? dummyAlphaVB, offset: 0, index: 2)
+                enc.setVertexBuffer(layer.puppetAlphaVBs[ring] ?? dummyAlphaVB, offset: 0, index: 2)
                 var u = VertexUniforms(mvp: layer.mvp, color: SIMD4<Float>(1, 1, 1, 1))
                 enc.setVertexBytes(&u, length: MemoryLayout<VertexUniforms>.stride, index: 1)
                 var ndc = ndcScale
