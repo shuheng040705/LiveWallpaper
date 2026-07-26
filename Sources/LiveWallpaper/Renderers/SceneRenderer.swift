@@ -80,6 +80,14 @@ private final class LargeStackSerialExecutor {
     deinit { shutdown() }
 }
 
+/// CVDisplayLink 回调上下文:生命周期独立于 SceneRenderer 的堆盒子,内部 **weak** 持有 renderer。
+/// 显示链回调跑在 CoreVideo 私有线程,而 renderer 可能在 stop() 返回后立刻被释放;把 weak 引用放进
+/// 一个单独 retain 的盒子里,回调就永远只触碰活着的内存(renderer 没了 → owner 为 nil → 空跑)。
+private final class LinkContext {
+    weak var owner: SceneRenderer?
+    init(_ owner: SceneRenderer) { self.owner = owner }
+}
+
 /// Scene 壁纸渲染器:Metal 把 scene.pkg 图层合成到桌面窗口。
 /// 有视差的场景用 CVDisplayLink 每帧驱动(自动漂移 + 鼠标视差);
 /// 无视差(单图)场景画一次即静止,零持续开销。
@@ -92,6 +100,8 @@ final class SceneRenderer: WallpaperRenderer {
     private var loaded = false
 
     private var displayLink: CVDisplayLink?
+    /// CVDisplayLink 回调上下文盒子(passRetained 的裸指针);stop() 里释放。见 startDisplayLink 的说明。
+    private var linkContext: UnsafeMutableRawPointer?
     private var startTime: CFTimeInterval = 0
     private var lastRenderTime: CFTimeInterval = 0   // 帧率上限节流:上次实际渲染时刻
     private var paused = false
@@ -339,9 +349,20 @@ final class SceneRenderer: WallpaperRenderer {
         var link: CVDisplayLink?
         CVDisplayLinkCreateWithActiveCGDisplays(&link)
         guard let link else { Log.write("SceneRenderer: CVDisplayLink create failed → static draw"); drawOnce(); return }
-        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        // ⚠ 回调上下文必须是**独立于 SceneRenderer 生命周期**的堆对象。
+        //   原来直接传 `Unmanaged.passUnretained(self)`:CVDisplayLinkStop **不保证**正在执行的回调已返回,
+        //   而切壁纸走 `renderers.forEach { $0.stop() }; renderers.removeAll()`(DesktopController),
+        //   stop() 一返回 renderer 就析构 → 在途回调里 `fromOpaque().takeUnretainedValue()` 触到已释放内存
+        //   = use-after-free(崩在 CoreVideo 私有线程,表现为切壁纸偶发闪退、栈难归因)。
+        //   改:上下文是 passRetained 的独立盒子,盒内 **weak** 持有 renderer(weak 读取线程安全,对象析构后
+        //   自动为 nil → 回调空跑);盒子在 stop() 里、**等 displayLink 释放之后**再 release(见 stop())。
+        let box = LinkContext(self)
+        let ctx = Unmanaged.passRetained(box).toOpaque()
+        linkContext = ctx
         CVDisplayLinkSetOutputCallback(link, { (_, _, _, _, _, userInfo) -> CVReturn in
-            let me = Unmanaged<SceneRenderer>.fromOpaque(userInfo!).takeUnretainedValue()
+            guard let userInfo else { return kCVReturnSuccess }
+            let box = Unmanaged<LinkContext>.fromOpaque(userInfo).takeUnretainedValue()
+            guard let me = box.owner else { return kCVReturnSuccess }   // renderer 已析构 → 空跑,不触已释放内存
             me.lastLinkTick = CACurrentMediaTime()   // 标记显示链「刚回调过」,备用计时器据此判是否被节流
             me.scheduleFrameTick()
             return kCVReturnSuccess
@@ -398,12 +419,22 @@ final class SceneRenderer: WallpaperRenderer {
         if stutterLog, lastTickWall > 0 {
             let g = _tw - lastTickWall
             if g > 0.3 {
+                // 持锁读 displayLink:它是强引用 var,stop() 在 renderLock 内置 nil;ARC 的 retain 与
+                // 并发置 nil 组合不是原子的(锁外裸读 = 可能对已释放对象 retain → double free)。
+                renderLock.lock()
                 let lr = displayLink.map { CVDisplayLinkIsRunning($0) } ?? false
+                renderLock.unlock()
                 Log.write(String(format: "FRAMEGAP %.2fs paused=%@ link=%@", g, paused ? "Y" : "N", lr ? "run" : "stop"))
             }
         }
         lastTickWall = _tw
-        guard !paused, loaded, let engine, let layer = metalLayer else { return }
+        // 同上:metalLayer 是强引用 var,stop() 在 renderLock 内置 nil。这里持锁**快照**出来
+        // (只取引用,不做任何重活),锁外继续用局部量;下面 renderLock 内还有一次拆除重校验。
+        renderLock.lock()
+        let ready = !paused && loaded
+        let layerRef = metalLayer
+        renderLock.unlock()
+        guard ready, let engine, let layer = layerRef else { return }
         let now = CACurrentMediaTime()
         // 帧率上限(性能/省电):CVDisplayLink 按显示器刷新率回调(120Hz 屏即 120 次/秒),
         // 这里据 frameRateCap 跳过过密的帧——壁纸是后台动效,30fps 足够且 CPU 约减半。0=不限。
@@ -524,6 +555,10 @@ final class SceneRenderer: WallpaperRenderer {
         metalLayer = nil
         loaded = false
         renderLock.unlock()
+        // 显示链已 Stop 且强引用已置 nil(CVDisplayLink 的最后一次 release 会停掉并 join 它的线程),
+        // 此后不会再有回调进来 → 现在才可以安全释放回调上下文盒子。顺序不能反:先放盒子再放链
+        // 会让在途回调 fromOpaque 到已释放的盒子。
+        if let c = linkContext { Unmanaged<LinkContext>.fromOpaque(c).release(); linkContext = nil }
         fallbackImageView?.removeFromSuperview()
         fallbackImageView = nil
         hostView = nil
