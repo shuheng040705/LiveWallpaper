@@ -111,6 +111,18 @@ final class WorkshopDownloader: ObservableObject {
         }
     }
 
+    /// 有限等待进程退出(轮询 isRunning)。返回是否已退出。
+    /// 不用 `waitUntilExit()`:它无限阻塞,而 brew wrapper 在等不肯退的孙进程时永远不返回
+    /// (见 killProcessTree 注释)——收尾路径必须保证有界,状态机才一定能走到终态。
+    private static func waitExit(_ p: Process, timeout: TimeInterval) -> Bool {
+        let deadline = Date().addingTimeInterval(timeout)
+        while p.isRunning {
+            if Date() >= deadline { return false }
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        return true
+    }
+
     /// 加入下载队列。title 仅用于显示,sizeBytes 来自网页(估算进度)。
     func enqueue(id: String, title: String, sizeBytes: Int64 = 0) {
         DispatchQueue.main.async {
@@ -245,10 +257,22 @@ final class WorkshopDownloader: ObservableObject {
                     if isCancelled(id) { break }
                     Thread.sleep(forTimeInterval: 0.25)
                 }
-                p.waitUntilExit()
+                // ⚠ 不能无条件 waitUntilExit():取消/挂死时 wrapper 可能在等不肯退的孙进程(见
+                //   killProcessTree 注释)永远不返回 → 任务永远停在「下载中」、并发槽不释放。
+                //   有限等 → 超时再杀整棵树兜底 → 之后**无论进程死没死都继续收尾**,状态机必达终态。
+                //   8s 判据:覆盖 requestCancel 在后台触发的 killProcessTree 的 3s 宽限 + SIGKILL 生效。
+                var exited = Self.waitExit(p, timeout: 8)
+                if !exited {
+                    Log.write("WorkshopDownloader \(id): steamcmd 超时未退出 → 杀进程树兜底")
+                    Self.killProcessTree(p)
+                    exited = Self.waitExit(p, timeout: 2)
+                }
                 fh.readabilityHandler = nil
-                // 收尾:handler 停掉后可能还有残留数据没读完。
-                if let rest = try? fh.readToEnd(), !rest.isEmpty { outLock.lock(); outData.append(rest); outLock.unlock() }
+                // 收尾:handler 停掉后可能还有残留数据没读完。只在**正常退出**时才补读——readToEnd 要等
+                // EOF,被杀的 wrapper 的孙进程可能仍握着管道写端(树没死透),这里会像 waitUntilExit 一样
+                // 无限阻塞;而取消/挂死路径本来就不消费这点残留输出(挂死=静默 10 分钟,管道里也没东西)。
+                if exited, !timedOut, !isCancelled(id),
+                   let rest = try? fh.readToEnd(), !rest.isEmpty { outLock.lock(); outData.append(rest); outLock.unlock() }
                 setProcess(id, nil)
                 outLock.lock(); lastOut = String(data: outData, encoding: .utf8) ?? ""; outLock.unlock()
                 if timedOut {
@@ -298,11 +322,23 @@ final class WorkshopDownloader: ObservableObject {
             finish(id, .failed(reason)); return
         }
 
-        // 移动到壁纸库目录。
+        // 移动到壁纸库目录(「旧的让位→移入→失败回滚」防两头空,理由见 installDownloaded 注释)。
+        do {
+            try installDownloaded(from: downloaded, id: id)
+            try? FileManager.default.removeItem(atPath: tmp)
+            Log.write("WorkshopDownloader \(id): done → \(PreferencesStore.shared.libraryRoot.appendingPathComponent(id).path)")
+            finish(id, .done, bytes: Self.parseBytes(lastOut), elapsed: Date().timeIntervalSince(t0))
+        } catch {
+            finish(id, .failed("移动文件失败: \(error.localizedDescription)"))
+        }
+    }
+
+    /// 把下载好的目录移入壁纸库(正常完成与「取消但保留」共用)。纯文件操作,任意线程可调。
+    /// ⚠ 不能「先删旧再移动」:removeItem 成功而 moveItem 失败(磁盘满 / 目标卷是用户自选的外置盘
+    ///   且已卸载或无权限)时,旧壁纸已被**直接删除**(非废纸篓)且新的没落地 → 两头皆空、不可恢复。
+    ///   改成「旧的先改名让位 → 移入新的 → 成功才删旧;任何一步失败就把旧的改回来」。
+    private func installDownloaded(from downloaded: String, id: String) throws {
         let dest = PreferencesStore.shared.libraryRoot.appendingPathComponent(id)
-        // ⚠ 不能「先删旧再移动」:removeItem 成功而 moveItem 失败(磁盘满 / 目标卷是用户自选的外置盘
-        //   且已卸载或无权限)时,旧壁纸已被**直接删除**(非废纸篓)且新的没落地 → 两头皆空、不可恢复。
-        //   改成「旧的先改名让位 → 移入新的 → 成功才删旧;任何一步失败就把旧的改回来」。
         let fm = FileManager.default
         var parked: URL?          // 旧壁纸的临时让位路径
         do {
@@ -314,15 +350,12 @@ final class WorkshopDownloader: ObservableObject {
             }
             try fm.moveItem(atPath: downloaded, toPath: dest.path)
             if let p = parked { try? fm.removeItem(at: p) }   // 新的已就位,旧的可以删了
-            try? fm.removeItem(atPath: tmp)
-            Log.write("WorkshopDownloader \(id): done → \(dest.path)")
-            finish(id, .done, bytes: Self.parseBytes(lastOut), elapsed: Date().timeIntervalSince(t0))
         } catch {
             // 回滚:把让位的旧壁纸放回原处,保证失败后用户仍有原来那份可用。
             if let p = parked, !fm.fileExists(atPath: dest.path) {
                 try? fm.moveItem(at: p, to: dest)
             }
-            finish(id, .failed("移动文件失败: \(error.localizedDescription)"))
+            throw error
         }
     }
 
@@ -400,7 +433,10 @@ final class WorkshopDownloader: ObservableObject {
         cancelledSet.insert(id)
         let p = processes[id]
         lock.unlock()
-        p?.terminate()
+        // ⚠ 不能只 terminate():SIGTERM 到不了真正在下载的孙进程(brew wrapper 不 exec,见 killProcessTree
+        //   注释),wrapper 会陪着孙进程一起不退 → download 线程收尾等它时被无限卡住、孙进程继续烧带宽。
+        //   杀整棵树;killProcessTree 内含 3s 宽限的同步 sleep,不能在调用方线程(常是主线程)跑,丢后台队列。
+        if let p { DispatchQueue.global(qos: .utility).async { Self.killProcessTree(p) } }
         DispatchQueue.main.async {
             // 还在排队没轮到的直接删掉(它不会进 download);正在下的等进程退出后转 .cancelled
             if let i = self.jobs.firstIndex(where: { $0.id == id }), self.jobs[i].state == .queued {
@@ -417,10 +453,14 @@ final class WorkshopDownloader: ObservableObject {
             let tmp = NSTemporaryDirectory() + "lw_dl_\(id)"
             let downloaded = tmp + "/steamapps/workshop/content/\(self.appID)/\(id)"
             if keep, FileManager.default.fileExists(atPath: downloaded + "/project.json") {
-                let dest = PreferencesStore.shared.libraryRoot.appendingPathComponent(id)
-                try? FileManager.default.removeItem(at: dest)
-                try? FileManager.default.moveItem(atPath: downloaded, toPath: dest.path)
-                Log.write("WorkshopDownloader \(id): cancelled-but-kept (was complete)")
+                // 与正常完成路径共用 installDownloaded 的让位/回滚:旧代码在这里直接 removeItem(dest)
+                // 再 move,move 一失败(磁盘满/权限)旧壁纸已被永久删掉、两头皆空。
+                do {
+                    try self.installDownloaded(from: downloaded, id: id)
+                    Log.write("WorkshopDownloader \(id): cancelled-but-kept (was complete)")
+                } catch {
+                    Log.write("WorkshopDownloader \(id): cancelled-but-kept 入库失败: \(error.localizedDescription)(旧壁纸未受影响)")
+                }
             }
             try? FileManager.default.removeItem(atPath: tmp)
             self.clearTracking(id)
@@ -462,7 +502,8 @@ final class WorkshopDownloader: ObservableObject {
     /// 从列表移除一个任务(失败/取消/完成的;若正在下则先杀进程)+ 清临时目录。
     func remove(id: String) {
         lock.lock(); cancelledSet.insert(id); let p = processes[id]; lock.unlock()
-        p?.terminate()
+        // 与 requestCancel 同理:terminate() 杀不到孙进程,须整树杀且不能在调用方线程同步 sleep。
+        if let p { DispatchQueue.global(qos: .utility).async { Self.killProcessTree(p) } }
         DispatchQueue.main.async {
             self.jobs.removeAll { $0.id == id }
             self.clearTracking(id)
