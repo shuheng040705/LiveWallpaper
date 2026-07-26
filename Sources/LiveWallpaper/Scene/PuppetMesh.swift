@@ -57,6 +57,17 @@ struct PuppetMesh {
         return Double(a.frameCount) / Double(a.fps)
     }
     private let anims: [Anim]
+    /// 眼睑「全行程」缓存(引用型,struct 拷贝共享;仅渲染线程访问):key=动画层组合,value=该组合下
+    /// 全 anim 周期内「非虹膜顶点下降量中位数」的最大值(=这套 rig 眼睑自己的最大行程,单位=mesh 像素)。
+    /// 供 clip 遮挡把「当前眼睑走了多少」归一到「它自己最多能走多少」——眨眼时序对齐 WE 的关键量。
+    private final class LidTravelCache {
+        var v: [String: Float] = [:]
+        // 眨眼方向状态(仅渲染线程访问):key → (上次「有效变化」的 lidDesc, 方向 +1=闭合中/−1=睁开中)。
+        // 死区 0.05px:慢睁段每帧只挪 ~0.005px,逐帧比较永远测不出方向;只在累计变化超死区时更新基准值,
+        // 慢漂移累计 ~10 帧后即可翻转方向。开/闭稳态 sweep 两个方向公式同值,方向暂错无害。
+        var lastDesc: [String: (d: Float, dir: Float)] = [:]
+    }
+    private let lidTravelCache = LidTravelCache()
     // 部件间挂点(MDAT0001):父部件用具名 attachment(如「头部」「胸部」)暴露子部件可挂的世界变换。
     // 每条 = (名, 所挂骨索引, 该挂点相对该骨的局部行主序矩阵)。子部件 scene.json 的 attachment 串按名匹配此表。
     struct Attachment { let name: String; let bone: Int; let local: simd_float4x4 }  // local 已转成列主序
@@ -423,10 +434,10 @@ struct PuppetMesh {
     /// 竖向跟随其**配对眼白骨**(bind 位置最近的塌缩骨)当前帧的 sy → 闭眼时虹膜挤成线随眼白一起消失。
     /// 这是 WE 眼 rig 的真义(眼白 sy 驱动眼睛开合高度,虹膜被 clip 到该开口;我方无 clip 故用竖向挤压等效)。
     /// 睁眼(配对眼白 sy≈1)→ 竖向因子 1 → 与 skinLayers 逐元素相同(零回归)。无塌缩眼白/无虹膜骨 → 返回 nil。
-    func skinLayersEyeOcclude(time: Double, layers: [(animId: Int, rate: Float, additive: Bool, hold: Float?)], use3D: Bool = false) -> [Float]? {
-        guard hasSkin, !layers.isEmpty else { return nil }
+    /// 多 animationlayer 合成 local pose(base + additive 叠加;与 skinLayers 同一约定)。
+    /// 抽出来是为了 clip 遮挡能在**任意时刻**重求值(扫描全 anim 周期找眼睑最大行程)。
+    private func composedLocalPose(time: Double, layers: [(animId: Int, rate: Float, additive: Bool, hold: Float?)], use3D: Bool) -> [simd_float4x4]? {
         let nb = parent.count
-        // 1) 合成各骨 local pose(与 skinLayers 同)。
         var composed: [simd_float4x4]? = nil
         for l in layers {
             guard let pose = localPose(time: heldTime(l.hold, l.animId, l.rate, time), rate: l.rate, animId: l.animId, use3D: use3D) else { continue }
@@ -434,7 +445,57 @@ struct PuppetMesh {
             else if l.additive { for b in 0..<nb { composed![b] = composed![b] * (localBind[b].inverse * pose[b]) } }
             else { composed = pose }
         }
-        guard var local = composed else { return nil }
+        return composed
+    }
+
+    /// 给定 local pose,蒙皮全部**非虹膜**顶点并返回「下降量(rest.y − skinned.y)>1.5」的中位数
+    /// = 该帧眼睑(含随动睫毛/眼皮画艺)整体下降了多少。与 clip 分支运行时的 lidDesc 同一配方(可比)。
+    private func medianNonIrisDescent(local: [simd_float4x4], isIris: (Int) -> Bool) -> Float {
+        let nb = parent.count
+        var world = [simd_float4x4](repeating: matrix_identity_float4x4, count: nb)
+        for b in 0..<nb { let p = parent[b]; world[b] = (p >= 0 && p < nb) ? world[p] * local[b] : local[b] }
+        var ds: [Float] = []
+        for i in 0..<rawPos.count where !isIris(i) {
+            let p4 = SIMD4<Float>(rawPos[i].x, rawPos[i].y, 0, 1)
+            var acc = SIMD4<Float>(0, 0, 0, 0); let idx = boneIdx[i], wt = boneWt[i]
+            for k in 0..<4 {
+                let w = wt[k]; if w == 0 { continue }
+                let bi = Int(idx[k]); guard bi >= 0, bi < nb else { continue }
+                acc += (world[bi] * invBind[bi]) * p4 * w
+            }
+            guard wt[0] + wt[1] + wt[2] + wt[3] > 0, acc.y.isFinite else { continue }
+            let d = rawPos[i].y - acc.y
+            if d > 1.5 { ds.append(d) }
+        }
+        ds.sort()
+        return ds.isEmpty ? 0 : ds[ds.count / 2]
+    }
+
+    /// 该动画层组合下,整个 anim 周期内眼睑下降中位数的**最大值**(=眼睑自身全行程)。120 步采样
+    /// (帧间线性插值,极值必在采样步附近;600 帧 anim 每步 5 帧,行程曲线平滑,精度足够)。
+    /// 结果按层组合缓存(一次 ~1e6 次乘加,首帧算一次后 O(1))。
+    private func maxLidTravel(layers: [(animId: Int, rate: Float, additive: Bool, hold: Float?)], use3D: Bool, isIris: (Int) -> Bool) -> Float {
+        let key = layers.map { "\($0.animId)@\($0.rate)" }.joined(separator: "+")
+        if let v = lidTravelCache.v[key] { return v }
+        var mx: Float = 0
+        let dur = layers.compactMap { l in animDuration(animId: l.animId).map { $0 / Double(max(0.0001, l.rate)) } }.max() ?? 0
+        if dur > 0 {
+            let n = 120
+            for s in 0...n {
+                let t = dur * Double(s) / Double(n)
+                guard let local = composedLocalPose(time: t, layers: layers, use3D: use3D) else { continue }
+                mx = max(mx, medianNonIrisDescent(local: local, isIris: isIris))
+            }
+        }
+        lidTravelCache.v[key] = mx
+        return mx
+    }
+
+    func skinLayersEyeOcclude(time: Double, layers: [(animId: Int, rate: Float, additive: Bool, hold: Float?)], use3D: Bool = false) -> [Float]? {
+        guard hasSkin, !layers.isEmpty else { return nil }
+        let nb = parent.count
+        // 1) 合成各骨 local pose(与 skinLayers 同)。
+        guard let local = composedLocalPose(time: time, layers: layers, use3D: use3D) else { return nil }
 
         // 2) 识别塌缩眼白骨(当前帧 sy 显著 <1)与虹膜骨(UV 虹膜带、当前帧不塌缩)。
         //    眼白当前帧 sy = local[b] 第 1 列长度 / bind 第 1 列长度(取相对 bind 的纵向缩放因子)。
@@ -566,15 +627,9 @@ struct PuppetMesh {
                 let hasBright = eyeBrightMask.count == rawPos.count
                 var occluded = Set<Int>()
                 // ⭐2026-07-27 连续裁线 + 逐顶点运动豁免(WE 录屏铁证,白泽夢 3742497499):
-                //   旧实现是二值 close>0.5 全裁/否则全不裁 + 「全体中位数」运动门,两个都与 WE 实渲矛盾——
-                //   ① WE 录屏(用户 2026-07-27 提供)睁眼段虹膜青色像素 ~1-3.5s **连续爬升**(眼睑抬到哪虹膜露到哪),
-                //     二值分支让 close 1.0→0.5 的整个慢睁段(实测 ~4.3s)虹膜整体缺失、跨过 0.5 一帧内全弹出;
-                //   ② WE 闭眼有**红棕色弧形闭眼线**(眼睛 mesh 里随眼睑下降的睫毛画艺,暖红高饱和被 irisColorMask
-                //     假阳性标为「虹膜」),旧全裁把它一并裁掉 = 闭眼期整脸空白 ~5s;中位数门(irisDesc=0.0 被静止
-                //     teal 虹膜主导)救不了这部分顶点(安和昴的门是整条睫毛线全动才触发)。
-                //   新机制(单一、连续、逐顶点):
-                //   - 裁线 clipY 随 close 从虹膜跨度上沿(睁)连续扫到下沿之下(全闭)=「眨多少盖多少」;
-                //     闭眼时与旧全裁等价(teal 残留照样清零),睁眼过程虹膜从下往上连续露出(对齐 WE)。
+                //   ① WE 睁眼段虹膜青色像素**连续爬升**(眼睑抬到哪虹膜露到哪),不能二值全裁/全不裁;
+                //   ② WE 闭眼有**红棕色弧形闭眼线**(随眼睑下降的睫毛画艺,暖红高饱和被 irisColorMask
+                //     假阳性标为「虹膜」),全裁会把它一并裁掉 = 闭眼期整脸空白;
                 //   - 逐顶点运动豁免:顶点自身下降量 > max(1.5, 0.35×眼睑中位下降) = 随眼睑动的眼皮画艺
                 //     (白泽夢红棕闭眼线/安和昴睫毛线眉弧,位移≈眼睑位移)→ 不裁(闭眼线保留=WE);
                 //     真·卡住的虹膜(白泽夢 teal/思衡托,位移≈0)→ 照裁。安和昴整条睫毛线每个顶点都在动 →
@@ -587,6 +642,54 @@ struct PuppetMesh {
                 lidDs.sort()
                 let lidDesc = lidDs.isEmpty ? 0 : lidDs[lidDs.count / 2]
                 let exemptThresh = max(1.5, 0.35 * lidDesc)
+                // ⭐⭐2026-07-27b 裁线驱动量从 close(眼睑骨 sy 归一)改为「眼睑真实行程占比」(WE 录屏逐帧标定):
+                //   用户报「虹膜消失/出现的速度与眨眼不符」。逐帧标定 WE 录屏(60fps 抽帧量 teal 虹膜像素)发现:
+                //   - WE 慢睁段(close 1.0→0.9,~2.3s)虹膜**全程为 0**,而 close 线性裁线在 close 0.9 时留着
+                //     底部 ~10% 虹膜 = 慢睁段持续漏一条青边(用户看到的「提前出现」);
+                //   - WE 快睁段虹膜 ~1s 内 0→满,而 close 裁线要等 close→0.05 才放完最后一排顶点(「出现太慢」)。
+                //   根因:close 是 bone10 sy 的归一,但眼睑**几何行程**与 sy 非线性——本 rig(白泽夢)close 0→0.9
+                //     已走完行程的 ~90%(lidDesc 10.4/11.5),close 0.9→1.0 的 4 秒多只挪最后 10%。
+                //     拿 close 线性扫裁线 = 把 4 秒的几何死区平摊进虹膜显隐,时序必错。
+                //   修:sweep = min(1, lidDesc / (0.9 × lidTravelMax))——
+                //   - lidDesc = 当前帧眼睑真实下降中位数(纯几何量,上面刚算完);
+                //   - lidTravelMax = 该 anim 全周期里 lidDesc 的最大值(maxLidTravel 扫描缓存,纯几何量);
+                //   - 0.9 = WE 实测「开口闭拢点」:录屏两次眨眼中,虹膜归零(闭)/开始出现(睁)都发生在
+                //     眼睑走到自身行程 ~90% 处(闭:teal→0 时 lidDesc 10.3-10.5;睁:teal 起始时 ~10.4;
+                //     max 11.5)——眼睑最后 10% 行程内开口已闭拢,虹膜全藏。以「行程占比」表达可跨 rig 泛化
+                //     (不同角色 sy 曲线/行程各异,90% 闭拢点是开口几何的性质)。
+                //   几何耦合方案(裁线=真实眼睑下缘弧)已穷尽验证不可行:本 rig 眼睑弧最大只探到虹膜跨度
+                //     一半(GEOMPROBE:上弧+下弧合计只能盖 ~53% 虹膜顶点,gap 恒 ≥18px 不闭合),WE 的全藏
+                //     靠的是 mask 开口(顶点级复现不了),故保留裁线扫描、只把驱动量换成真实行程占比。
+                //   回归安全:全闭时 sweep=1 与旧 close=1 裁线一致(残留照样清零);睁眼稳态 close≤0.01 在
+                //     上方早退(逐字节零回归);lidTravelMax 失效(<3px,rig 无下降眼睑顶点)退回 close 驱动。
+                //   ⭐方向非对称(WE 录屏单周期内直接观测,同一时间锚 offset=9.3s 同时校准闭/睁两段):
+                //   - **闭合中**:虹膜可见度从行程一开始就按比例消退(sweep = r/0.9,r=行程占比)——
+                //     录屏 blink1 闭合段与本机制曲线逐点重合(0.48@t9.3 双方一致);
+                //   - **睁开中**:虹膜要等行程退回 ~90% 以下才开始出现、退到 ~50% 时已全露
+                //     (sweep = (r−0.5)/0.4)——同一 offset 下 WE 睁开段整体比「闭合公式」早 ~0.3-0.4s,
+                //     用对称公式睁开段中段恒慢半拍(即用户报的「出现速度不一致」)。
+                //   方向由 lidDesc 带死区的变化趋势判定(见 LidTravelCache.lastDesc)。
+                //   WP_EYE_SWEEP_SYM=1 退回对称公式(A/B 隔离)。
+                let travelMax = maxLidTravel(layers: layers, use3D: use3D, isIris: isIrisVert)
+                var sweep = close
+                if travelMax >= 3 {
+                    let key = layers.map { "\($0.animId)@\($0.rate)" }.joined(separator: "+")
+                    var dir: Float = -1
+                    if let last = lidTravelCache.lastDesc[key] {
+                        if abs(lidDesc - last.d) > 0.05 {
+                            dir = lidDesc > last.d ? 1 : -1
+                            lidTravelCache.lastDesc[key] = (lidDesc, dir)
+                        } else {
+                            dir = last.dir
+                        }
+                    } else {
+                        lidTravelCache.lastDesc[key] = (lidDesc, dir)
+                    }
+                    let r = lidDesc / travelMax
+                    let symmetric = WPEnv.vars["WP_EYE_SWEEP_SYM"] != nil
+                    sweep = (dir > 0 || symmetric) ? min(1, r / 0.9)
+                                                  : max(0, min(1, (r - 0.5) / 0.4))
+                }
                 let pad: Float = 2
                 var exempted = 0
                 for i in 0..<rawPos.count {
@@ -600,13 +703,62 @@ struct PuppetMesh {
                     let bn = binOf(x)
                     let span = top[bn] - bot[bn]
                     guard span.isFinite, span > 0.5 else { continue }
-                    // 连续裁线:close 0→1 把裁线从上沿上方扫到下沿下方(上眼睑先盖上半,虹膜从下往上藏)。
-                    let clipY = top[bn] + pad - close * (span + 2 * pad)
+                    // 连续裁线:行程占比 0→1 把裁线从上沿上方扫到下沿下方(上眼睑先盖上半,虹膜从下往上藏)。
+                    let clipY = top[bn] + pad - sweep * (span + 2 * pad)
                     if skinned[i].y > clipY, skinned[i].y >= bot[bn] - pad, skinned[i].y <= top[bn] + pad {
                         occluded.insert(i)
                     }
                 }
-                if occDbgClip { Log.write("OCCLUDE(discard) close=\(String(format:"%.2f",close)) irisHidden=\(occluded.count) exempt=\(exempted) lidDesc=\(String(format:"%.1f",lidDesc))") }
+                if occDbgClip { Log.write("OCCLUDE(discard) close=\(String(format:"%.2f",close)) sweep=\(String(format:"%.2f",sweep)) irisHidden=\(occluded.count) exempt=\(exempted) lidDesc=\(String(format:"%.1f",lidDesc)) travelMax=\(String(format:"%.1f",travelMax))") }
+                // 诊断探针(WP_EYE_GEOM_PROBE=1,仅日志):若裁线改用「当前帧真实下降上眼睑顶点的逐桶下缘弧」
+                // (几何耦合,非 close 线性合成),各帧会藏多少虹膜顶点——用来与 WE 录屏曲线对标定,不改渲染。
+                if WPEnv.vars["WP_EYE_GEOM_PROBE"] != nil {
+                    var lidLow = [Float](repeating: .greatestFiniteMagnitude, count: nBin)
+                    var nLid = 0
+                    for j in 0..<rawPos.count where !isIrisVert(j) {
+                        let desc = rawPos[j].y - skinned[j].y
+                        guard desc > 1.5 else { continue }
+                        let x = skinned[j].x
+                        guard x >= xmin - pad, x <= xmax + pad else { continue }
+                        let bn = binOf(x)
+                        guard top[bn] > -.greatestFiniteMagnitude, rawPos[j].y > top[bn] - 8 else { continue }
+                        lidLow[bn] = min(lidLow[bn], skinned[j].y); nLid += 1
+                    }
+                    // 下眼睑上缘弧:非虹膜 + rest 在该桶虹膜下沿之下 + 当前**上升**(闭眼时下眼睑向上顶)。
+                    var lowHigh = [Float](repeating: -.greatestFiniteMagnitude, count: nBin)
+                    var nLow = 0
+                    for j in 0..<rawPos.count where !isIrisVert(j) {
+                        let rise = skinned[j].y - rawPos[j].y
+                        guard rise > 1.5 else { continue }
+                        let x = skinned[j].x
+                        guard x >= xmin - pad, x <= xmax + pad else { continue }
+                        let bn = binOf(x)
+                        guard bot[bn] < .greatestFiniteMagnitude, rawPos[j].y < bot[bn] + 8 else { continue }
+                        lowHigh[bn] = max(lowHigh[bn], skinned[j].y); nLow += 1
+                    }
+                    var geomHidden = 0, geomHiddenEx = 0, apHidden = 0, totalFlagged = 0
+                    var gapSum: Float = 0; var gapN = 0
+                    for bn in 0..<nBin where lidLow[bn] < .greatestFiniteMagnitude && lowHigh[bn] > -.greatestFiniteMagnitude {
+                        gapSum += lidLow[bn] - lowHigh[bn]; gapN += 1
+                    }
+                    for i in 0..<rawPos.count {
+                        let flagged = isIrisVert(i) || (hasBright && eyeBrightMask[i])
+                        guard flagged else { continue }
+                        let x = skinned[i].x
+                        guard x >= xmin - pad, x <= xmax + pad else { continue }
+                        totalFlagged += 1
+                        let bn = binOf(x)
+                        var hid = false
+                        if lidLow[bn] < .greatestFiniteMagnitude, skinned[i].y > lidLow[bn] {
+                            geomHidden += 1; hid = true
+                            if rawPos[i].y - skinned[i].y <= exemptThresh { geomHiddenEx += 1 }
+                        }
+                        if !hid, lowHigh[bn] > -.greatestFiniteMagnitude, skinned[i].y < lowHigh[bn] { hid = true }
+                        if hid { apHidden += 1 }
+                    }
+                    let mgap = gapN > 0 ? gapSum / Float(gapN) : Float.nan
+                    Log.write("GEOMPROBE close=\(String(format:"%.3f",close)) lidPts=\(nLid) lowPts=\(nLow) geomHidden=\(geomHidden) geomHiddenExempt=\(geomHiddenEx) apHidden=\(apHidden) gap=\(String(format:"%.1f",mgap)) total=\(totalFlagged) synth=\(occluded.count)")
+                }
                 return unitVertsOccluded(skinned, occluded: occluded)
             }
         }
@@ -1323,6 +1475,16 @@ struct PuppetMesh {
                 let uc = wsum > 0 ? uacc/wsum : -1, vc = wsum > 0 ? vacc/wsum : -1
                 let region = vc < 0 ? "?" : (vc < 0.33 ? "睫毛上" : vc < 0.62 ? "虹膜中" : "肤眼睑下")
                 Log.write("  bone\(b) parent=\(parent[b]) bind=(\(Int(pos.x)),\(Int(pos.y))) t=(\(rng(0)),\(rng(1)),\(rng(2))) r=(\(rng(3)),\(rng(4)),\(rng(5))) s=(\(rng(6)),\(rng(7)),\(rng(8))) UVc=(\(String(format:"%.2f",uc)),\(String(format:"%.2f",vc)))[\(region)] nv=\(vlist.count)")
+            }
+            // 逐帧全轨迹 CSV(找眨眼开/闭的**非对称**骨:哪些骨在同一 close 值下开/闭位置不同)。WP_ANIM_DUMP_TRACKS=1。
+            if WPEnv.vars["WP_ANIM_DUMP_TRACKS"] != nil {
+                for b in 0..<min(parent.count, anim.tracks.count) {
+                    for k in 0..<9 {
+                        let vals = anim.tracks[b].map { $0.count > k ? $0[k] : 0 }
+                        guard let lo = vals.min(), let hi = vals.max(), hi - lo > 0.005 else { continue }
+                        Log.write("TRACK b\(b) k\(k) " + vals.map { String(format: "%.3f", $0) }.joined(separator: ","))
+                    }
+                }
             }
             // 逐帧 sclera/iris 骨 sy 轨迹(找闭眼帧 + 看塌缩方向)。WP_EYE_FRAMEDUMP=1。
             if WPEnv.vars["WP_EYE_FRAMEDUMP"] != nil {
