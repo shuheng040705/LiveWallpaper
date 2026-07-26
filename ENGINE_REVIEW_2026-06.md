@@ -1,3 +1,5 @@
+> ⚠️ 本文档状态截至 2026-06-05 前后，之后有 58+ 提交的修复未回写，勾选状态不可信；以 git log 为准。（2026-07-27 标注）
+
 # 全项目代码评审 2026-06(7-agent 并行 + lwe 逐文件对照)
 
 审阅范围:`Sources/LiveWallpaper/` 全部 Swift + `tools/` 转译器,逐个对照 `linux-wallpaperengine`(lwe)真源。

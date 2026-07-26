@@ -1,3 +1,5 @@
+> ⚠️ 本文档状态截至 2026-06-05 前后，之后有 58+ 提交的修复未回写，勾选状态不可信；以 git log 为准。（2026-07-27 标注）
+
 # LiveWallpaper 引擎保真度清单（待移植）
 
 > 2026-06-02 生成。逐子系统拿 Swift 实现对照 linux-wallpaperengine(lwe) + WE bottle 真实源码，
