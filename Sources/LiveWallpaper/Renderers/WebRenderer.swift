@@ -162,10 +162,23 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         var rel = url.path
         if rel.hasPrefix("/") { rel.removeFirst() }
         rel = rel.removingPercentEncoding ?? rel
-        let fileURL = root.appendingPathComponent(rel).standardizedFileURL
+        // ⚠ 安全(审计):必须 **resolvingSymlinksInPath** 后再比对,且按**路径分量**比对而非裸 hasPrefix。
+        //   ① standardizedFileURL 只消 `.`/`..`,**不解析符号链接** → 壁纸包里放一个指向包外的软链接
+        //      (如 link → ~/.ssh),`lwwp://wp/link/id_rsa` 就能被 Data(contentsOf:) 跟随读出;而响应头
+        //      写死 `Access-Control-Allow-Origin: *`、页面本身能发外网请求 → 可外传。进程无沙箱,读取面
+        //      是整个用户目录。
+        //   ② 裸 hasPrefix 没有分量边界:root=…/123456789 时 `…/1234567890/x` 也算通过(工坊 id 是数字,
+        //      天然容易前缀碰撞)。改用 path components 前缀比对。
+        //   另注:url.path 本身已解码一次,下面又 removingPercentEncoding = 双重解码,`%252e%252e` 能把
+        //   `..` 送进 rel —— 分量比对同时挡住这条。
+        let realRoot = root.standardizedFileURL.resolvingSymlinksInPath()
+        let fileURL = root.appendingPathComponent(rel).standardizedFileURL.resolvingSymlinksInPath()
+        let rootParts = realRoot.pathComponents
+        let fileParts = fileURL.pathComponents
+        let insideRoot = fileParts.count >= rootParts.count && Array(fileParts.prefix(rootParts.count)) == rootParts
         // TODO(性能):此处 Data(contentsOf:) 同步整文件读入内存,大资源(视频/wasm/纹理)会阻塞且占内存;
         //   后续可改为按需 mmap / 分块流式喂(didReceive 多段)。本次审计不改。
-        guard fileURL.path.hasPrefix(root.standardizedFileURL.path),
+        guard insideRoot,
               let fileData = try? Data(contentsOf: fileURL) else {
             Log.write("WebRenderer.scheme: 404 \(rel)")
             if isTaskActive(urlSchemeTask) {

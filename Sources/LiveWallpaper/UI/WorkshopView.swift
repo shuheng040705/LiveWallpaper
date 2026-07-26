@@ -245,10 +245,29 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
         wkWebView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
     }
 
+    /// 订阅/取消订阅消息只接受 Steam 官方域(含子域,如 steamcommunity.com / store.steampowered.com)。
+    /// 用后缀匹配且要求前面紧跟 "." ——避免 "evilsteamcommunity.com" 这种前缀拼接绕过。
+    private static func isTrustedOrigin(_ origin: WKSecurityOrigin) -> Bool {
+        guard origin.protocol == "https" else { return false }
+        let host = origin.host.lowercased()
+        let trusted = ["steamcommunity.com", "store.steampowered.com", "steampowered.com"]
+        return trusted.contains { host == $0 || host.hasSuffix("." + $0) }
+    }
+
     /// 收到网页「订阅」事件 → 同步用 SteamCMD 下载该壁纸(已在库则跳过)。
     /// 详情页订阅:用页面标题 + 抓文件大小;浏览网格订阅:用 id 当标题(抓不到大小,进度走块数不受影响)。
     func userContentController(_ ucc: WKUserContentController, didReceive message: WKScriptMessage) {
         if message.name == "wpDebug" { Log.write("WS-DBG \(message.body)"); return }
+        // ⚠ 安全:钩子脚本以 forMainFrameOnly:false 注入**所有**页面的**所有** iframe,而本 webview
+        //   允许导航到任意 http(s)(decidePolicyFor 只特判 steam://)。若不校验来源,任意网页(或
+        //   Steam 页里嵌的第三方 iframe)执行 `fetch('/sharedfiles/subscribe?id=...')` 就能让我们
+        //   静默用 SteamCMD 下载攻击者指定的工坊条目入库;`unsubscribe` 更能把用户本地壁纸移进废纸篓。
+        //   钩子在请求**发起时**就上报(不需要请求成功、不受 CORS 限制),所以门槛极低。
+        //   → 只接受来自 Steam 官方域的消息。
+        guard Self.isTrustedOrigin(message.frameInfo.securityOrigin) else {
+            Log.write("WorkshopView: 丢弃来自非 Steam 域的订阅消息(host=\(message.frameInfo.securityOrigin.host))")
+            return
+        }
         guard let id = message.body as? String, id.allSatisfy(\.isNumber), id.count >= 6 else { return }
         // 网页取消订阅 → 删除对应本地壁纸(交给 AppDelegate,以便处理正在播放/库刷新)。
         if message.name == "wpUnsubscribe" {
