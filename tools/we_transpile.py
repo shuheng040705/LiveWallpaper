@@ -209,7 +209,87 @@ def discover_sampler_combos(src, current_combos, bound_slots):
     return discovered
 
 # GLSL ≥400 的保留字,WE 当普通标识符用 → 改名。sample(godrays/blur 的 vec4 变量)。
+def _rename_main_locals_shadowing_varyings(src):
+    """把 main() 内遮蔽同名 varying 的局部变量改成唯一名字。
+
+    WE/HLSL 允许 `varying vec4 timer; ... void main(){ float timer = ...; }`,局部 timer 会遮蔽
+    阶段输入。Vulkan GLSL 禁止这种重定义;若直接删 varying 或改表达式又可能改变同名输入在局部声明前的
+    合法读取。这里仅从局部声明处起改名,声明前的同名词仍指向 varying,保持 HLSL 作用域语义。
+    """
+    varying_names = set(re.findall(r'\bvarying\s+\S+\s+(\w+)\s*(?:\[[^\]]*\])?\s*;', src))
+    if not varying_names:
+        return src
+    main_re = re.compile(r'\bvoid\s+main\s*\(\s*\)\s*\{')
+    spans = []
+    for mm in main_re.finditer(src):
+        depth, i = 1, mm.end()
+        while i < len(src) and depth:
+            if src[i] == "{":
+                depth += 1
+            elif src[i] == "}":
+                depth -= 1
+            i += 1
+        if depth == 0:
+            spans.append((mm.end(), i - 1))
+    # 从后往前改,避免前一段替换改变后一段的字符偏移。
+    for main_index, (start, end) in reversed(list(enumerate(spans))):
+        body = src[start:end]
+        for name in sorted(varying_names):
+            decl = re.search(
+                r'\b(?:float|double|int|uint|bool|vec[234]|ivec[234]|uvec[234]|mat[234])\s+'
+                + re.escape(name) + r'\b(?=\s*[=;])',
+                body,
+            )
+            if not decl:
+                continue
+            suffix = body[decl.start():]
+            local_name = f"_we_local_{name}_{main_index}"
+            suffix = re.sub(r'\b' + re.escape(name) + r'\b', local_name, suffix)
+            body = body[:decl.start()] + suffix
+        src = src[:start] + body + src[end:]
+    return src
+
+
+def _broadcast_scalar_vector_initializers(src):
+    """显式化 HLSL 的向量数字字面量广播,并支持同一语句中的多个声明符。
+
+    例如 `vec2 radial = 0.0, tangential = 0.0, center = expr;` 中前两项在 HLSL
+    会得到 (0, 0),GLSL 则拒绝 float→vec2。只包装 RHS 完全是数字字面量的声明符;
+    `center = expr` 以及构造器/函数调用都原样保留。
+    """
+    number = re.compile(r'^[+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][+-]?\d+)?f?$')
+
+    def _rewrite_statement(m):
+        width, declaration = m.group(1), m.group(2)
+        parts, current, depth = [], [], 0
+        for ch in declaration:
+            if ch in "([{":
+                depth += 1
+            elif ch in ")]}":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                parts.append("".join(current))
+                current = []
+            else:
+                current.append(ch)
+        parts.append("".join(current))
+        changed = False
+        for i, part in enumerate(parts):
+            dm = re.match(r'^(\s*[A-Za-z_]\w*\s*=\s*)(.*?)(\s*)$', part, re.S)
+            if not dm or not number.fullmatch(dm.group(2).strip()):
+                continue
+            parts[i] = f"{dm.group(1)}vec{width}({dm.group(2).strip()}){dm.group(3)}"
+            changed = True
+        return f"vec{width} " + ",".join(parts) + ";" if changed else m.group(0)
+
+    return re.sub(r'\bvec([234])\s+([A-Za-z_]\w*\s*=[^;]*);', _rewrite_statement, src)
+
+
 def rename_reserved(src):
+    # HLSL 允许 main 局部遮蔽阶段输入,GLSL 禁止;须先改局部名,再做下方 varying 类型兼容。
+    src = _rename_main_locals_shadowing_varyings(src)
+    # HLSL 允许 `vecN x = 0.0`;GLSL 需显式 vecN(0.0)。
+    src = _broadcast_scalar_vector_initializers(src)
     # \bsample\b 只匹配独立小写 sample(不碰 texSample2D / noiseSample / sampleDrop)。
     src = re.sub(r'\bsample\b', 'samp_', src)
     # HLSL 隐式截断:WE 把 vec4 传给 rotateVec2(vec2,float)(如 shimmer 的 v_TexCoord)。
@@ -218,6 +298,41 @@ def rename_reserved(src):
     # HLSL 把 float uniform 经 int() 存进 float、再当 int 用(循环计数 `for(int i=-x;i<=x;...)`)。
     # GLSL 不允许 float→int 隐式转。整条 RHS 就是 int(...) 时,把声明改成 int(后续 float 运算 GLSL 会自动 int→float)。
     src = re.sub(r'\bfloat\s+(\w+)\s*=\s*int\(([^;]*)\)\s*;', r'int \1 = int(\2);', src)
+    # HLSL 标量↔向量隐式转换的「往返」:sine_wave.frag 先声明
+    #   `vec2 waveCoord = v_TexCoord;`
+    # 随后在 #if/#else 两个互斥分支里都用标量 `pow(saturate(...))` 覆盖它,最后把该值传给
+    # ApplyBlending 的 float opacity。WE/HLSL 会先把标量广播到 float2、传参时再取首分量;
+    # Vulkan GLSL 两次隐式转换都不允许。既然每个编译分支都会在首次读取前完成覆盖,可等价收窄为
+    # `float waveCoord = v_TexCoord.x`。规则同时要求「双分支标量覆盖 + ApplyBlending 消费」,
+    # 避免把真正保存二维坐标的普通 vec2 局部误改成标量。
+    def _narrow_scalar_roundtrip(m):
+        var, initial = m.group(1), m.group(2)
+        branch_re = re.compile(
+            r'#if[^\n]*\n'
+            r'(?:(?!#else).)*\b' + re.escape(var) + r'\s*=\s*pow\s*\(\s*saturate\s*\([^;]+;'
+            r'\s*#else'
+            r'(?:(?!#endif).)*\b' + re.escape(var) + r'\s*=\s*pow\s*\(\s*saturate\s*\([^;]+;'
+            r'\s*#endif',
+            re.S,
+        )
+        consumed_as_opacity = re.search(
+            r'\bApplyBlending\s*\([^;]*\b' + re.escape(var) + r'\b[^;]*\)', src, re.S
+        )
+        if not branch_re.search(src) or not consumed_as_opacity:
+            return m.group(0)
+        return f"float {var} = {initial}.x;"
+    src = re.sub(r'\bvec2\s+(\w+)\s*=\s*([A-Za-z_]\w*)\s*;', _narrow_scalar_roundtrip, src)
+    # WE/HLSL 方言允许 shader 自定义 `float mod(float, float)`(如 workshop 2123274886 tech_circle:
+    #   `float mod(float x, float y){return x - y*floor(x/y);}`)。GLSL/glslang 内建 `mod` 是 highp 模板,
+    #   自定义同名触发「overloaded functions must have the same parameter precision qualifiers」→ frag 编译失败
+    #   被跳过(圈圈 composelayer 不渲)。仅当源码**确有自定义 `float mod( ... ) {` 定义**时把该名整体改 we_mod
+    #   (定义+所有调用);`\bmod\b` 词边界不碰 fmod/mod2;无自定义 mod 的 shader 不触发=零回归。
+    if re.search(r'\bfloat\s+mod\s*\([^)]*\)\s*\{', src):
+        src = re.sub(r'\bmod\b', 'we_mod', src)
+    # HLSL `int X = floor(...)`:floor 返回 float,HLSL 隐式截断进 int;glslang 严格拒绝(白影 audio_buffer_accumulation
+    #   的 `int index = floor(v_TexCoord.x * RESOLUTION);` 转译失败真因)。显式包 int():`int X = int(floor(...));`。
+    #   仅命中 `int 名 = floor(...) ;` 这一精确模式(只补一层 int(),不动其它)。
+    src = re.sub(r'\bint\s+(\w+)\s*=\s*(floor\s*\([^;]*\))\s*;', r'int \1 = int(\2);', src)
     # HLSL 的 `%` 在浮点上等价 fmod,结果再隐式截断进 uint;GLSL 的 `%` 仅整数、且 float→uint 隐式转非法
     #(旧版 Simple_Audio_Bars:`uint barFreq1 = frequency % RESOLUTION;`,frequency 是 float、RESOLUTION 是
     # int 宏 → glslang「' to ' temp highp uint」)。新版 WE 自身已改用 mod2(frequency, float(RESOLUTION)) 再
@@ -230,6 +345,24 @@ def rename_reserved(src):
     # `float bar = float(step(...))`(声明即 float,边缘硬切但后续浮点裁剪正确)。GLSL float→int 隐式转非法,
     # 故照新版把这类 step 初始化的 int 声明改回 float(忠实 WE 新版、且修旧版乘 float 被再截断为 0 的隐患)。
     src = re.sub(r'\bint\s+(\w+)\s*=\s*(step\s*\()', r'float \1 = \2', src)
+    # HLSL 把 `float` uniform/变量直接当 `for` 循环计数的初值/上界(test_shader 音圈的频段循环
+    #   `for (int i = u_MinFreqRange; i < u_MaxFreqRange; i++)`,u_MinFreqRange/u_MaxFreqRange 都是带
+    #   `"int":true` 元数据注解但 GLSL 类型仍是 `float` 的 uniform)。HLSL 允许隐式 float→int 截断、GLSL 严格拒绝
+    #   (「cannot convert from 'uniform float' to 'int'」),整 frag 编译失败 → 音圈层渲不出。修法:仅在
+    #   `for (int NAME = INIT; NAME <|<=|>|>= BOUND; ...)` 这一精确结构里,且 init/bound 是**确知 float 类型的
+    #   裸标识符**(由本源码 `(uniform) float <name>;` 声明)时,把它包一层 `int(...)`。
+    #   关键(零回归):**不碰** `#define`(如 oscilloscope 的 `#define bufferRes RESOLUTION`,预处理后展成字面量
+    #   `i < 32`;若误包成 `int(32)` 会改 metal 字节)与 `const int`(如 shine_cast/godrays 的 `sampleCount`,
+    #   本就是 int、无需转)。仅 float 标识符匹配 → 既修音圈、又对所有现存 effect 逐字节不变。
+    float_ids = set(re.findall(r'(?:^|\n)\s*(?:uniform\s+)?float\s+(\w+)\s*[;=]', src))
+    def _wrap_for_int(m):
+        var, init, cmp_op, bound = m.group(1), m.group(2).strip(), m.group(3), m.group(4).strip()
+        def wrap(e):
+            return f'int({e})' if e in float_ids else e
+        return f'for (int {var} = {wrap(init)}; {var} {cmp_op} {wrap(bound)};'
+    if float_ids:
+        src = re.sub(r'\bfor\s*\(\s*int\s+(\w+)\s*=\s*([^;]+?)\s*;\s*\1\s*(<=?|>=?)\s*([^;]+?)\s*;',
+                     _wrap_for_int, src)
     # HLSL 赋值截断:`vec3/vec2/float X = texSample2D(...);`(返回 vec4)。GLSL 要显式 swizzle。
     swz = {"vec3": ".rgb", "vec2": ".rg", "float": ".r"}
     def _trunc(m):
@@ -310,6 +443,7 @@ def rename_reserved(src):
     # 首项补 .xy/.xyz(类型感知:仅当首项确为本文件声明的 vec4 标识符才补,全库仅此一处命中,非盲改)。
     v4names = set(re.findall(r'\bvec4\s+(\w+)', src))
     v4names |= set(re.findall(r'(?:uniform|varying|attribute|in|out)\s+vec4\s+(\w+)', src))
+    v3names = set(re.findall(r'\bvec3\s+(\w+)', src))
     f1names = set(re.findall(r'(?:uniform|varying|attribute|in|out)?\s*\bfloat\s+(\w+)', src))
     v2names = set(re.findall(r'(?:uniform|varying|attribute|in|out)?\s*\bvec2\s+(\w+)', src))
     # 新增的向量尺寸截断修法(形态 A/B/C + float↔vec2)的总开关,WP_NO_VEC_TRUNC_FIX=1 退回原行为(诊断/回滚)。
@@ -360,6 +494,30 @@ def rename_reserved(src):
         src = re.sub(r'\b(?P<v4>[A-Za-z_]\w*)\b(?!\s*[.([])\s*[*/+\-]\s*(?:CAST2|vec2)\s*\(',
                      _v4adj, src)
 
+    # HLSL mix/lerp 标量广播:color_grading TOOLS=2 的
+    # `mix(luma, color, weight)` 中 luma=float、color=vec3,HLSL 会把 luma 广播为 float3;
+    # GLSL 要求前两参同型。仅处理「前两参都是已知类型的裸标识符」且恰好一边 float、一边唯一 vecN
+    # 的情况;复杂表达式、重名多类型变量和本来同型的调用都不动。
+    vector_sets = {2: v2names, 3: v3names, 4: v4names}
+    def _unique_vector_width(name):
+        widths = [width for width, names in vector_sets.items() if name in names]
+        return widths[0] if len(widths) == 1 and name not in f1names else None
+    def _mix_scalar_broadcast(m):
+        fn, left, right = m.group(1), m.group(2), m.group(3)
+        left_width, right_width = _unique_vector_width(left), _unique_vector_width(right)
+        left_float = left in f1names and left_width is None
+        right_float = right in f1names and right_width is None
+        if left_float and right_width:
+            return f"{fn}(vec{right_width}({left}), {right},"
+        if right_float and left_width:
+            return f"{fn}({left}, vec{left_width}({right}),"
+        return m.group(0)
+    src = re.sub(
+        r'\b(mix|lerp)\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*,',
+        _mix_scalar_broadcast,
+        src,
+    )
+
     # HLSL float-LHS 收窄 vec2 表达式:对「确为 float 的 LHS」整段赋值 `LHS = <含 vec2 标识符的表达式>;`,
     # 当 RHS 算出来是 vec2(含某 vec2 标识符)时,把整段 RHS 包 `(...).x`(range_scroll.vert 的
     # `varying float totalMargin; ... totalMargin = u_Margin + u_FadeWidth;` 与
@@ -367,13 +525,25 @@ def rename_reserved(src):
     # GLSL 的 `vec2 ± float`/`float ± vec2` 算术本身合法(标量广播),错只在「vec2 结果赋给 float」——故只截结果、
     # 不动操作数(早先误截操作数把合法的 vec2 表达式拆坏,回归 waterripple/scroll)。HLSL 把 vec2 截到 .x 再存。
     # 窄规则:① LHS 是裸标识符(无 swizzle)且确为本文件声明的 float;② LHS 不在 v2/v4names(避免 vec2/vec4 LHS);
-    # ③ RHS 出现某裸 vec2 标识符(其后非 .([)。全库仅 range_scroll 命中;float×float、vec2 LHS 等均不触发。
+    # ③ RHS 出现某裸 vec2 标识符,或该 vec2 的 2~4 分量 swizzle。单分量 `.x` 已是 float,不触发。
+    # 这也覆盖 lens_flare_sun 的 `float pointer = g_PointerPosition.xy * u_pointerSpeed;`:HLSL 取结果首分量。
     float_lhs = (f1names - v2names) - v4names
     if _VTRUNC and v2names and float_lhs:
+        def _rhs_has_vec2_value(rhs, vn):
+            name = r'\b' + re.escape(vn) + r'\b'
+            return (re.search(name + r'\s*\.[xyzwrgba]{2,4}\b', rhs)
+                    or re.search(name + r'(?!\s*[.([])', rhs))
         def _floatlhs_trunc(m):
             lhs, sp, rhs = m.group(1), m.group(2), m.group(3)
+            # 同名局部可在不同函数/预处理分支里拥有不同类型。下面的赋值正则也会从
+            # `vec2 d = ...` 中间命中 `d = ...`；若另一个作用域恰有 `float d`，仅凭
+            # 全文件名字集合会把 vec2 初始化误改成 `(rhs).x`。声明语句必须保持其
+            # 显式类型，不参与 float-LHS 的 HLSL 截断修复。
+            prefix = m.string[max(0, m.start() - 32):m.start()]
+            if re.search(r'\b(?:int|uint|vec[234])\s+$', prefix):
+                return m.group(0)
             if lhs in float_lhs and any(
-                    re.search(r'\b' + re.escape(vn) + r'\b(?!\s*[.([])', rhs) for vn in v2names):
+                    _rhs_has_vec2_value(rhs, vn) for vn in v2names):
                 return f"{lhs}{sp}= ({rhs}).x"
             return m.group(0)
         # 整段赋值:`LHS = <rhs до ;>`;LHS 须裸标识符(其后非 . 排除 X.xy=)、= 是真赋值(前后非 =!<>)。
@@ -408,6 +578,16 @@ def rename_reserved(src):
     # agent 当初只验了 builtin 语料、没验 workshop。bokeh_blur 本就是**旧有失败**(不修≠回归),而破坏一张
     # 正常壁纸不可接受。故撤销整条规则(t2/raindrop 不依赖它,仍正常)。bokeh 的真解需针对 gaussian.frag
     # 那一行做**精确**改写(非全局正则),留待后续。
+
+    # HLSL `float *= bool;` 隐式把 bool 转 float(true=1.0/false=0.0)——GLSL 禁止 → glslang
+    # 「'assign' : cannot convert from ' temp bool' to ' temp highp float'」(随后次生「missing #endif」)。
+    # 命中点:Simple_Audio_Bars.frag(workshop 3021673417)的 CENTER/STEREO(SHAPE=6/7/8/9)裁剪行
+    #   `barLeft *= isLeftChannel; barRight *= isRightChannel;`(isLeftChannel/isRightChannel 声明为 bool)。
+    # SHAPE=0(底部)等不进该 #if 分支,故旧 base 变体能建、SHAPE-7 才暴露。
+    # **精确**:仅把直接乘到浮点变量上的这两个**具名 bool** 包成 float(...)(HLSL bool→float 语义)。
+    # 这两个标识符为本特效独有(全库扫描:WE assets/shaders 无、其它 pkg shader 无)→ 绝不误伤;
+    # 与已撤销的「全局关系比较包 float」截然不同(那条太宽伤了 2846660316,本条只命名两个变量,零外溢)。
+    src = re.sub(r'(\*=\s*)(isLeftChannel|isRightChannel)\b', r'\1float(\2)', src)
     return src
 
 # ---- 链接驱动的 varying vec2↔vec4 双向兼容(对齐 ShaderUnit.cpp:379-440)----
@@ -433,22 +613,47 @@ def apply_linked_varying_compat(src, stage, link_src):
     """据对端 stage 源(link_src,已 include 展开)做 varying 双向兼容。link_src 为空则只做不依赖
     对端的片元侧截断(②)。对两阶段类型本就一致的 varying 是恒等变换(现有 28+29 effect 零影响)。"""
     link_types = _collect_varying_types(link_src or "")
+    # vert size < frag size 时升维要补齐的尾部分量(到对应宽度,前两维由源表达式提供)。
+    # vec4 的补齐沿用历史 `vec4(expr, 0.0, 1.0)`(对现有命中 shader 逐字节不变);vec3 补 1 个 0。
+    _PAD_BY_TARGET = {"vec3": ("vec3", ", 0.0"), "vec4": ("vec4", ", 0.0, 1.0")}
+    _HI_COMP = {"vec3": ["z"], "vec4": ["z", "w"]}
     if stage == "vert":
-        # ① vert vec2 + frag vec4 → 升 vert 到 vec4 并补齐赋值(ShaderUnit.cpp:379-415)
+        # ① vert size 小于 frag(vec2 + frag vec3/vec4)→ 升 vert 到 frag 宽度并补齐赋值
+        #    (vec2+vec4 对齐 ShaderUnit.cpp:379-415;vec2+vec3 同理推广,如 workshop
+        #     audio_buffer_accumulation 的 v_AccumulationRate:vert 声明 vec2/只部分写 .x/.y,
+        #     frag 声明 vec3/只读 .x/.y → Metal 阶段接口 float2≠float3 链接失败,升 vert→vec3 修)。
         self_types = _collect_varying_types(src)
         for name, vtype in list(self_types.items()):
             if vtype != "vec2":
                 continue
-            if link_types.get(name) != "vec4":
+            target = link_types.get(name)
+            if target not in _PAD_BY_TARGET:
                 continue
-            # 升声明 vec2→vec4
+            ctor, tail = _PAD_BY_TARGET[target]
+            # 升声明 vec2→target
             src = re.sub(r'\bvarying\s+vec2\s+' + re.escape(name) + r'\s*;',
-                         f'varying vec4 {name};', src)
-            # 把对 NAME 的整体赋值 `NAME = expr;`(其后无 swizzle)补齐成 vec4(expr, 0.0, 1.0)
+                         f'varying {target} {name};', src)
+            # 把对 NAME 的整体赋值 `NAME = expr;`(其后无 swizzle)补齐到 target 宽度
             assign_re = re.compile(r'(^|\n)([ \t]*)' + re.escape(name) + r'\b(?!\s*\.)\s*=\s*([^;\n]+);')
+            had_full_assign = bool(assign_re.search(src))
             def _wrap(m):
-                return f"{m.group(1)}{m.group(2)}{name} = vec4({m.group(3)}, 0.0, 1.0);"
+                return f"{m.group(1)}{m.group(2)}{name} = {ctor}({m.group(3)}{tail});"
             src = assign_re.sub(_wrap, src)
+            # 若 vert 对 NAME 只做**部分写**(.x=/.y=,无整体赋值,如 audio_buffer_accumulation),升维后高位
+            # 分量(.z[/.w])从未写 → Metal 输出虽类型已对齐但值未定义。frag 不读高位时无害,但为正确性
+            # 在 main 收尾的 `}` 前显式补 `NAME.z = 0.0;`(只补 vert 未写的高位分量)。仅命中此「部分写+无
+            # 整体赋值」形态;整体赋值型(现有 vec2→vec4 命中 shader)had_full_assign=True → 不进此分支,
+            # 产出逐字节不变。
+            if not had_full_assign:
+                written_hi = set(re.findall(r'\b' + re.escape(name) + r'\.([xyzwrgba]+)\s*=(?!=)', src))
+                written_chars = set("".join(written_hi))
+                missing = [c for c in _HI_COMP[target] if c not in written_chars]
+                if missing:
+                    pad_stmt = "".join(f"\n    {name}.{c} = 0.0;" for c in missing)
+                    # 在最后一个 `}`(main 收尾)前插入补齐语句
+                    idx = src.rstrip().rfind("}")
+                    if idx != -1:
+                        src = src[:idx] + pad_stmt + "\n" + src[idx:]
         # 审计修复 #4:反向(vert vec4 + frag vec2,如 workshop color_grading)。Metal/SPIR-V 的阶段接口按
         # location **严格按类型匹配**,vec4(vert out)↔vec2(frag in)不一致 → makeRenderPipelineState 建不成。
         # 选不丢数据的方向:把**顶点输出降到与片元一致的宽度**(片元只消费它声明的 .xy 分量,降维无损)。

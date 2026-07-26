@@ -8,10 +8,16 @@ WE effect 打包器:把全库 scene 用到的 effect 的真实着色器转译成
 spirv-cross --reflect 出 uniform 布局(name/offset/type)+ sampler binding。
 
 输出:
-  Tools/generated/we_effects/<shader>__<stage>.metal   每个 (shader,stage) 一份 MSL
-  Tools/generated/WEEffects.json                        manifest(effect→passes→{shader,target,binds,vs/fs:{metal,uniforms,samplers}})
+  tools/generated/we_effects/<shader>__<stage>.metal   每个 (shader,stage) 一份 MSL
+  tools/generated/WEEffects.json                        manifest(effect→passes→{shader,target,binds,vs/fs:{metal,uniforms,samplers}})
+
+⚠️⚠️ 雷区(manifest-regen-hazard):本脚本是**全量重生成**入口,会整体覆盖 WEEffects.json。
+已知全量 regen 会把 2846660316(Esperanta)的特效转坏成噪点——日常增量补特效请用
+we_add_effects.py(只 build 单条特效并入、精确正则,安全)。因此 main() 默认拒绝执行,
+必须显式传 --force-full-regen 才继续,且继续前会自动把现有 WEEffects.json 备份到
+tools/generated/backup/(带时间戳)。/Applications 部署版可作回滚锚点。
 """
-import sys, os, json, subprocess, tempfile, glob, struct
+import sys, os, json, subprocess, tempfile, glob, struct, shutil, time
 sys.path.insert(0, os.path.dirname(__file__))
 import we_transpile as T
 
@@ -700,6 +706,23 @@ def scan_pkg_local_effects():
     return found
 
 def main():
+    # ⭐门禁:全量重生成会整体覆盖 WEEffects.json,已知会把 2846660316(Esperanta)的特效
+    # 转坏成噪点(见文件头雷区说明)。默认拒绝执行,防止「顺手一跑」冲掉好 manifest;
+    # 日常补特效走 we_add_effects.py 增量并入。
+    if "--force-full-regen" not in sys.argv[1:]:
+        print("⚠️ 拒绝执行:本脚本是**全量重生成**入口,会整体覆盖 tools/generated/WEEffects.json。", file=sys.stderr)
+        print("   已知雷区:全量 regen 会把 2846660316(Esperanta)的特效转坏成噪点(manifest-regen-hazard)。", file=sys.stderr)
+        print("   增量补特效请用: python3 tools/we_add_effects.py(只 build 单条特效并入,安全)。", file=sys.stderr)
+        print("   确要全量重生成,请传 --force-full-regen(会先自动备份现有 manifest 到 tools/generated/backup/)。", file=sys.stderr)
+        sys.exit(2)
+    # 继续前自动备份现有 manifest(带时间戳),留回滚锚点;/Applications 部署版是另一个锚点。
+    cur = os.path.join(OUT, "WEEffects.json")
+    if os.path.exists(cur):
+        backup_dir = os.path.join(OUT, "backup")
+        os.makedirs(backup_dir, exist_ok=True)
+        dst = os.path.join(backup_dir, "WEEffects.%s.json" % time.strftime("%Y%m%d-%H%M%S"))
+        shutil.copy2(cur, dst)
+        print(f"==> 已备份现有 manifest → {dst}")
     os.makedirs(MSL_DIR, exist_ok=True)
     used_combos = scene_combos()          # effect → {comboSet,...}
     manifest = {}
