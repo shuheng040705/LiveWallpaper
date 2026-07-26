@@ -83,6 +83,10 @@ final class AudioPlayback: NSObject, AVAudioPlayerDelegate, @unchecked Sendable 
         guard !m else { return }
         // 单曲循环组:恢复在放的;random 组:若没有在放的(曲间静默)则不强行启动,等计时器。
         for g in gs {
+            // ⚠ startsilent 组(WE 语义:载入但**不自动播**,等脚本/事件触发)在这里不能起播。
+            //   原来单曲组无条件 play() → 睡眠唤醒 pause→resume 会把从未播过的 startsilent 音效
+            //   强行播一遍(且绕过 startGroup,连 numberOfLoops=-1 都没设)。
+            if g.desc.startSilent { continue }
             if g.players.count == 1 { g.players[0].play() }
             else if !g.players.contains(where: { $0.isPlaying }) { startGroup(g) }
         }
@@ -98,7 +102,11 @@ final class AudioPlayback: NSObject, AVAudioPlayerDelegate, @unchecked Sendable 
         for g in gs { applyVolume(g) }
         // 取消静音时若之前没在放(初始静音 / random 静默),重新起播。
         if !m, !wasPaused {
-            for g in gs where !g.players.contains(where: { $0.isPlaying }) { startGroup(g) }
+            // 同 resume():这里本意是补播「载入时因全局静音而没起播的普通组」,
+            // 不能把 startsilent 组一并误启(那违反 pkg 声明的 WE 行为)。
+            for g in gs where !g.desc.startSilent && !g.players.contains(where: { $0.isPlaying }) {
+                startGroup(g)
+            }
         }
     }
 
@@ -170,7 +178,11 @@ final class AudioPlayback: NSObject, AVAudioPlayerDelegate, @unchecked Sendable 
         if gap > 0 {
             DispatchQueue.main.async {
                 let t = Timer.scheduledTimer(withTimeInterval: gap, repeats: false) { _ in fire() }
-                self.lock.lock(); self.gapTimers.append(t); self.lock.unlock()
+                // 清掉已触发/已失效的,否则 random 模式每次曲间静默都往数组塞一个、永不回收。
+                self.lock.lock()
+                self.gapTimers.removeAll { !$0.isValid }
+                self.gapTimers.append(t)
+                self.lock.unlock()
             }
         } else {
             DispatchQueue.main.async { fire() }

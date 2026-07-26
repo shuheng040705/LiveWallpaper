@@ -150,7 +150,13 @@ final class VideoRenderer: WallpaperRenderer {
         player?.rate = Float(speed)
     }
     func setMuted(_ muted: Bool) { player?.isMuted = muted }
-    func setVolume(_ v: Double) { player?.volume = Float(v) }
+    /// v = 全局音量。⚠ 必须再乘上**每壁纸音量**,否则用户给某张视频壁纸单独设的音量
+    /// (如 30%)会在拖动全局音量滑条时被整体覆盖成纯全局值 → 音量突然变大,直到下次
+    /// load/reloadInPlace 才恢复。load(86 行)/reloadInPlace(143 行)用的就是这个乘积。
+    func setVolume(_ v: Double) {
+        let g = GeneralWallpaperSettings.shared
+        player?.volume = Float(v * g.volume(itemID) / 100.0)
+    }
     /// 屏幕适配模式变化:重新按 wallpaperScaleMode 布局(参数保留兼容旧 videoFill 调用,实际读 scaleMode)。
     func setFillMode(_ fill: Bool) { view?.applyScale() }
 }

@@ -622,6 +622,11 @@ final class SceneRenderer: WallpaperRenderer {
     }
 
     /// 全局音量/静音(DesktopController 广播,与 VideoRenderer 一致)→ 转发到壁纸音频播放。
-    func setVolume(_ v: Double) { engine?.setAudioVolume(v) }
+    /// v = 全局音量。⚠ 同 VideoRenderer:必须再乘每壁纸音量,否则拖全局滑条会覆盖掉
+    /// 用户为该壁纸单独设的音量(load 的 307 行用的就是这个乘积)。
+    func setVolume(_ v: Double) {
+        guard let item = loadedItem else { engine?.setAudioVolume(v); return }
+        engine?.setAudioVolume(v * GeneralWallpaperSettings.shared.volume(item.id) / 100.0)
+    }
     func setMuted(_ m: Bool) { engine?.setAudioMuted(m) }
 }

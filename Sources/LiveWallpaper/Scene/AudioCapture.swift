@@ -389,13 +389,29 @@ final class AudioCapture: NSObject, SCStreamOutput, SCStreamDelegate, @unchecked
             AudioHardwareDestroyProcessTap(tapID)
             return false
         }
-        lock.withLock {
+        // ⚠ 注册前必须复查 running(与 SCStream 路径的 stillWanted 同理,原来这里漏了)。
+        //   建 tap / 聚合设备 / IOProc 是 Core Audio 调用,耗时可达数百毫秒;这期间用户若切走壁纸,
+        //   release()→stop() 会在锁内读 usingTap(此刻仍为 false)→ teardownTap 无物可拆。随后本函数
+        //   才把 tap 注册上去 → 成为**孤儿**:running 已 false,handleTapInput 丢弃所有样本,
+        //   checkTapAlive 因 stillUsing=false 直接返回不拆,但 IOProc 仍在持续回调烧 CPU,
+        //   一直到进程退出;下次再 start() 还会直接覆写这几个 ID → 旧 tap/聚合设备彻底泄漏。
+        let stillWanted = lock.withLock { () -> Bool in
+            guard running else { return false }
             tapObjectID = tapID
             aggregateID = aggID
             tapIOProcID = proc
             usingTap = true
             streamStartedAt = ProcessInfo.processInfo.systemUptime   // 存活基准:若 N 秒无样本(权限静默拒绝)→ 拆掉重试 tap
             lastFrameCallback = 0
+            return true
+        }
+        guard stillWanted else {
+            Log.write("AudioCapture(tap): 建好时已不再需要(期间切走壁纸)→ 就地拆除,避免孤儿 tap 常驻")
+            AudioDeviceStop(aggID, proc)
+            AudioDeviceDestroyIOProcID(aggID, proc)
+            AudioHardwareDestroyAggregateDevice(aggID)
+            AudioHardwareDestroyProcessTap(tapID)
+            return false
         }
         Log.write("AudioCapture: started via Core Audio process tap(无屏幕共享、不压 WindowServer)")
         // 一次性存活检查:设备启动后 IOProc 应立即(即便静音也)持续回调;2.5s 内一次都没回调 = tap 死

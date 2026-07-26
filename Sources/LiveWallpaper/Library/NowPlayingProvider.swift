@@ -32,18 +32,45 @@ final class NowPlayingProvider {
         )
     }
 
-    private(set) var title = ""
-    private(set) var artist = ""
+    // ⚠ 这些字段由 poll() 在**主线程**每 3s 写,而 SceneRenderEngine 的 effectiveNowPlaying /
+    //   effectiveMediaState 在**渲染线程每帧**读 → 原来无任何同步 = 真数据竞争(TSan 必报)。
+    //   String 是 CoW 引用计数类型:切歌瞬间「主线程重赋 title」与「渲染线程读取」重叠,
+    //   retain/release 组合非原子 → 理论上可 over-release 崩溃。
+    //   修:存储改私有 + 加锁,对外仍是同名只读属性(所有调用点不用改)。
+    private let stateLock = NSLock()
+    private var _title = ""
+    private var _artist = ""
+    private var _playbackState = 0
+    private var _position: Double = 0
+    private var _duration: Double = 0
+    private var _thumbnailRevision = 0
+    private var _thumbnailPalette = ThumbnailPalette.missing
+    private var _everReceived = false
+
+    private func withState<T>(_ body: () -> T) -> T {
+        stateLock.lock(); defer { stateLock.unlock() }
+        return body()
+    }
+
+    var title: String { withState { _title } }
+    var artist: String { withState { _artist } }
     /// WE MediaPlaybackEvent:0=stopped,1=playing,2=paused。
-    private(set) var playbackState = 0
-    private(set) var position: Double = 0
-    private(set) var duration: Double = 0
+    var playbackState: Int { withState { _playbackState } }
+    var position: Double { withState { _position } }
+    var duration: Double { withState { _duration } }
     /// 封面内容变化序号 + 从真实封面像素提取的调色板。revision 只在 artwork data 变化时递增，
     /// 对齐 WE「同一封面跨曲目不重复触发 mediaThumbnailChanged」的事件语义。
-    private(set) var thumbnailRevision = 0
-    private(set) var thumbnailPalette = ThumbnailPalette.missing
+    var thumbnailRevision: Int { withState { _thumbnailRevision } }
+    var thumbnailPalette: ThumbnailPalette { withState { _thumbnailPalette } }
     /// 是否真从系统拿到过非空曲目(诊断:区分"没在播"与"API 被封")。
-    private(set) var everReceived = false
+    var everReceived: Bool { withState { _everReceived } }
+
+    /// 一次取齐所有字段的原子快照。逐个读属性会各上一次锁、可能跨越两次 poll 拿到半新半旧的组合;
+    /// 渲染线程需要一致视图时用这个。
+    func snapshot() -> (title: String, artist: String, state: Int, position: Double, duration: Double,
+                        palette: ThumbnailPalette, revision: Int) {
+        withState { (_title, _artist, _playbackState, _position, _duration, _thumbnailPalette, _thumbnailRevision) }
+    }
 
     private typealias GetInfoFn = @convention(c) (DispatchQueue, @escaping ([String: Any]?) -> Void) -> Void
     private var getInfo: GetInfoFn?
@@ -76,23 +103,33 @@ final class NowPlayingProvider {
             let duration = (info?["kMRMediaRemoteNowPlayingInfoDuration"] as? NSNumber)?.doubleValue ?? 0
             let artwork = info?["kMRMediaRemoteNowPlayingInfoArtworkData"] as? Data
             let state = (t.isEmpty && a.isEmpty) ? 0 : (rate > 0 ? 1 : 2)
-            if !t.isEmpty { self.everReceived = true }
-            if t != self.title || a != self.artist || state != self.playbackState {
-                Log.write("NowPlaying 系统: title='\(t)' artist='\(a)' state=\(state)")
+            // 调色板提取(可能较重)放在锁外先算好,锁内只做赋值,避免占着锁做像素处理阻塞渲染线程。
+            let artworkChanged = artwork != self.lastArtworkData
+            let newPalette: ThumbnailPalette? = artworkChanged
+                ? (artwork.flatMap(Self.extractPalette) ?? .missing) : nil
+            var changedLog = false
+            var revisionForLog = 0
+            var paletteHasThumb = false
+            self.withState {
+                if !t.isEmpty { self._everReceived = true }
+                changedLog = (t != self._title || a != self._artist || state != self._playbackState)
+                self._title = t
+                self._artist = a
+                self._playbackState = state
+                self._position = max(0, position)
+                self._duration = max(0, duration)
+                if let newPalette {
+                    self.lastArtworkData = artwork
+                    self._thumbnailRevision &+= 1
+                    self._thumbnailPalette = newPalette
+                }
+                revisionForLog = self._thumbnailRevision
+                paletteHasThumb = self._thumbnailPalette.hasThumbnail
             }
-            self.title = t
-            self.artist = a
-            self.playbackState = state
-            self.position = max(0, position)
-            self.duration = max(0, duration)
-            if artwork != self.lastArtworkData {
-                self.lastArtworkData = artwork
-                self.thumbnailRevision &+= 1
-                self.thumbnailPalette = artwork.flatMap(Self.extractPalette) ?? .missing
-                Log.write(
-                    "NowPlaying 封面: available=\(self.thumbnailPalette.hasThumbnail) "
-                    + "bytes=\(artwork?.count ?? 0) revision=\(self.thumbnailRevision)"
-                )
+            if changedLog { Log.write("NowPlaying 系统: title='\(t)' artist='\(a)' state=\(state)") }
+            if artworkChanged {
+                Log.write("NowPlaying 封面: available=\(paletteHasThumb) "
+                          + "bytes=\(artwork?.count ?? 0) revision=\(revisionForLog)")
             }
         }
     }
