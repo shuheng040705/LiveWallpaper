@@ -290,6 +290,24 @@ def rename_reserved(src):
     src = _rename_main_locals_shadowing_varyings(src)
     # HLSL 允许 `vecN x = 0.0`;GLSL 需显式 vecN(0.0)。
     src = _broadcast_scalar_vector_initializers(src)
+    # WE 旧版音频 shader 有一类「手工解包」访问：频谱虽声明为 `float g_AudioSpectrum64Left[64]`，
+    # 却按 HLSL 常量寄存器布局写成 `spectrum[bar / 4][bar % 4]`。真实 WE 编译器把它还原为第
+    # `bar` 个频段；Vulkan GLSL 中首个下标已返回 float，再接第二个下标会报 scalar integer
+    # expression required，导致整条音频生成特效无法进入 manifest，solidlayer 便把默认白底直接画出。
+    # 我们的 UBO 已把 16/32/64 段分别保存成 std140 float 数组，所以等价归一为 spectrum[int(bar)]。
+    # 窄匹配仅作用于同一标识符以 `/4`、`%4` 成对索引的 g_AudioSpectrum*Left/Right，不碰普通数组。
+    def _flatten_legacy_audio_register(m):
+        name, first, second = m.group(1), m.group(2).strip(), m.group(3).strip()
+        if first != second:
+            return m.group(0)
+        return f"{name}[int({first})]"
+    src = re.sub(
+        r'\b(g_AudioSpectrum(?:16|32|64)(?:Left|Right))\s*'
+        r'\[\s*([A-Za-z_]\w*)\s*/\s*4(?:\.0*)?\s*\]\s*'
+        r'\[\s*([A-Za-z_]\w*)\s*%\s*4(?:\.0*)?\s*\]',
+        _flatten_legacy_audio_register,
+        src,
+    )
     # \bsample\b 只匹配独立小写 sample(不碰 texSample2D / noiseSample / sampleDrop)。
     src = re.sub(r'\bsample\b', 'samp_', src)
     # HLSL 隐式截断:WE 把 vec4 传给 rotateVec2(vec2,float)(如 shimmer 的 v_TexCoord)。
@@ -518,6 +536,58 @@ def rename_reserved(src):
         src,
     )
 
+    # HLSL 在 mix/lerp 两端向量宽度不同时按较窄一端截断；旧工坊音频环 shader 典型写法是
+    # `mix(u_userNewColor /*vec3*/, col /*vec4*/, weight)`。GLSL 要求两端同型，必须显式取 col.rgb。
+    # 仅处理两个参数均为「已知且唯一宽度的裸标识符」、且宽度恰为 vec3/vec4 的情况；复杂表达式不猜。
+    def _mix_vec3_vec4_trunc(m):
+        fn, left, right = m.group(1), m.group(2), m.group(3)
+        lw, rw = _unique_vector_width(left), _unique_vector_width(right)
+        # 同名局部可在后面的另一个函数重新声明成别的宽度（此壁纸 main 又声明了 vec3 col），
+        # 此时全文件集合无法判唯一；回退采用调用点之前最近的显式声明，符合词法作用域遮蔽关系。
+        def nearest_width(name):
+            found = list(re.finditer(r'\b(vec[234])\s+' + re.escape(name) + r'\b', src[:m.start()]))
+            return int(found[-1].group(1)[-1]) if found else None
+        if lw is None:
+            lw = nearest_width(left)
+        if rw is None:
+            rw = nearest_width(right)
+        if lw == 3 and rw == 4:
+            return f"{fn}({left}, {right}.rgb,"
+        if lw == 4 and rw == 3:
+            return f"{fn}({left}.rgb, {right},"
+        return m.group(0)
+    src = re.sub(
+        r'\b(mix|lerp)\s*\(\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*,',
+        _mix_vec3_vec4_trunc,
+        src,
+    )
+
+    # 同一条 HLSL 截断语义也允许 vec3 返回函数直接 `return col;`，其中 col 是 vec4。
+    # 按函数体作用域做窄改写，只把「vec3 函数 + 裸 vec4 标识符返回」变成 `.rgb`。
+    vec3_function = re.compile(r'\bvec3\s+[A-Za-z_]\w*\s*\([^;{}]*\)\s*\{')
+    search_from = 0
+    while True:
+        fm = vec3_function.search(src, search_from)
+        if not fm:
+            break
+        depth, pos = 1, fm.end()
+        while pos < len(src) and depth:
+            if src[pos] == "{":
+                depth += 1
+            elif src[pos] == "}":
+                depth -= 1
+            pos += 1
+        if depth:
+            break
+        body = src[fm.end():pos - 1]
+        body = re.sub(
+            r'\breturn\s+([A-Za-z_]\w*)\s*;',
+            lambda rm: f"return {rm.group(1)}.rgb;" if rm.group(1) in v4names else rm.group(0),
+            body,
+        )
+        src = src[:fm.end()] + body + src[pos - 1:]
+        search_from = fm.end() + len(body) + 1
+
     # HLSL float-LHS 收窄 vec2 表达式:对「确为 float 的 LHS」整段赋值 `LHS = <含 vec2 标识符的表达式>;`,
     # 当 RHS 算出来是 vec2(含某 vec2 标识符)时,把整段 RHS 包 `(...).x`(range_scroll.vert 的
     # `varying float totalMargin; ... totalMargin = u_Margin + u_FadeWidth;` 与
@@ -528,6 +598,7 @@ def rename_reserved(src):
     # ③ RHS 出现某裸 vec2 标识符,或该 vec2 的 2~4 分量 swizzle。单分量 `.x` 已是 float,不触发。
     # 这也覆盖 lens_flare_sun 的 `float pointer = g_PointerPosition.xy * u_pointerSpeed;`:HLSL 取结果首分量。
     float_lhs = (f1names - v2names) - v4names
+    float_functions = set(re.findall(r'\bfloat\s+([A-Za-z_]\w*)\s*\(', src))
     if _VTRUNC and v2names and float_lhs:
         def _rhs_has_vec2_value(rhs, vn):
             name = r'\b' + re.escape(vn) + r'\b'
@@ -541,6 +612,11 @@ def rename_reserved(src):
             # 显式类型，不参与 float-LHS 的 HLSL 截断修复。
             prefix = m.string[max(0, m.start() - 32):m.start()]
             if re.search(r'\b(?:int|uint|vec[234])\s+$', prefix):
+                return m.group(0)
+            # `float d = sdRect(..., vec2(...));` 的 RHS 虽含 vec2 参数，函数返回类型已经明确是
+            # float，不能再把整个调用误截成 `(sdRect(...)).x`。只对源码中确知返回 float 的函数豁免。
+            call = re.match(r'\s*([A-Za-z_]\w*)\s*\(', rhs)
+            if call and call.group(1) in float_functions:
                 return m.group(0)
             if lhs in float_lhs and any(
                     _rhs_has_vec2_value(rhs, vn) for vn in v2names):

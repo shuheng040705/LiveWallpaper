@@ -486,4 +486,55 @@ final class WEScriptRuntimeTests: XCTestCase {
         XCTAssertFalse(text.isEmpty)
         XCTAssertEqual(runtime?.didFail, false)
     }
+
+    func testEffectVectorScriptReceivesSharedStateFromObjectScript() {
+        let controller = WEScript(
+            script: """
+            export function update(value) {
+                shared.dockAlpha = 0.25;
+                return value;
+            }
+            """,
+            propertyOverrides: [:],
+            tag: "shared-controller-test"
+        )
+        let effect = WEScript(
+            script: """
+            export var scriptProperties = createScriptProperties()
+                .addSlider({ name: 'alpha', value: 0.35 })
+                .finish();
+            export function update(value) {
+                let alpha = scriptProperties.alpha * shared.dockAlpha;
+                return new Vec2(alpha, alpha);
+            }
+            """,
+            propertyOverrides: ["alpha": 0.4],
+            tag: "shared-effect-test"
+        )
+
+        XCTAssertEqual(controller?.runBool(current: true, simTime: 1), true)
+        effect?.injectShared(controller?.sharedJSON() ?? "{}")
+        let value = effect?.runFloats(current: [0, 0.3], simTime: 1, frametime: 1.0 / 60.0)
+
+        XCTAssertEqual(value?.count, 2)
+        XCTAssertEqual(value?[0] ?? -1, 0.1, accuracy: 0.0001)
+        XCTAssertEqual(value?[1] ?? -1, 0.1, accuracy: 0.0001)
+    }
+
+    func testEffectVectorScriptSupportsVec4() {
+        let runtime = WEScript(
+            script: """
+            export function update(value) {
+                return new Vec4(value.x + 1, value.y + 2, value.z + 3, value.w + 4);
+            }
+            """,
+            propertyOverrides: [:],
+            tag: "effect-vec4-test"
+        )
+
+        XCTAssertEqual(
+            runtime?.runFloats(current: [1, 2, 3, 4], simTime: 1),
+            [2, 4, 6, 8]
+        )
+    }
 }

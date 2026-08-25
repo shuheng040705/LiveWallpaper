@@ -23,7 +23,7 @@ struct SteamLoginSheet: View {
         VStack(spacing: 0) {
             HStack(spacing: 9) {
                 Image(systemName: "person.badge.key.fill").font(.system(size: 16)).foregroundStyle(accent)
-                Text("登录 Steam").font(.system(size: 15, weight: .bold))
+                Text("登录 SteamCMD 下载账号").font(.system(size: 15, weight: .bold))
                 Spacer()
                 Button { dismiss() } label: { Image(systemName: "xmark.circle.fill").foregroundStyle(.secondary) }
                     .buttonStyle(.plain)
@@ -32,7 +32,7 @@ struct SteamLoginSheet: View {
             Divider()
 
             VStack(alignment: .leading, spacing: 14) {
-                Text("登录后可下载匿名下载不了的新壁纸。密码只用于 SteamCMD 登录,不会保存在本应用里。")
+                Text("登录后可下载匿名模式无法获取的新壁纸。密码只传给 SteamCMD，不会保存在本应用里；此登录不包含 Steam 网页订阅授权。")
                     .font(.system(size: 11)).foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
@@ -53,7 +53,7 @@ struct SteamLoginSheet: View {
                 case .success:
                     HStack(spacing: 8) {
                         Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
-                        Text("登录成功!现在可以下载新壁纸了").font(.system(size: 13))
+                        Text("SteamCMD 登录成功，现在可以下载新壁纸了").font(.system(size: 13))
                     }
                 }
 

@@ -19,7 +19,7 @@ struct LibraryActions {
     var onVideoFillChanged: (Bool) -> Void         // 视频填充模式
     var onMainScreenOnlyChanged: (Bool) -> Void    // 仅主显示器
     var onDesktopIconsChanged: (Bool) -> Void      // 桌面图标显示
-    var onDelete: (WallpaperItem) -> Void          // 删除壁纸(移到废纸篓)
+    var onDelete: (WallpaperItem) -> Void          // 仅卸载本地壁纸(移到废纸篓)
     var onApplySettings: (WallpaperItem) -> Void   // 壁纸属性改了 → 若正在播放则重载使其生效
-    var onUnsubscribe: (WallpaperItem) -> Void     // 取消 Steam 订阅 + 删除本地壁纸
+    var onUnsubscribe: (WallpaperItem) -> Void     // Steam 退订成功后再卸载本地壁纸
 }

@@ -92539,5 +92539,417 @@
     ]
    }
   ]
+ },
+ "workshop/3605510527/spin": {
+  "variants": [
+   {
+    "combos": {},
+    "passes": [
+     {
+      "shader": "workshop/3605510527/effects/spin",
+      "target": null,
+      "bind": [],
+      "uniformMeta": {
+       "g_Speed": {
+        "material": "speed",
+        "default": 1.0,
+        "combo": null
+       },
+       "g_SpinCenter": {
+        "material": "center",
+        "default": "0.5 0.5",
+        "combo": null
+       },
+       "g_Ratio": {
+        "material": "ratio",
+        "default": 1.0,
+        "combo": null
+       },
+       "g_Axis": {
+        "material": "angle",
+        "default": 0.0,
+        "combo": null
+       },
+       "g_Phase": {
+        "material": "phase",
+        "default": 0.0,
+        "combo": null
+       },
+       "g_Friction": {
+        "material": "friction",
+        "default": "1 1",
+        "combo": null
+       },
+       "g_NoiseSpeed": {
+        "material": "noisespeed",
+        "default": 5,
+        "combo": null
+       },
+       "g_NoiseAmount": {
+        "material": "noiseamount",
+        "default": 1,
+        "combo": null
+       },
+       "g_Texture0": {
+        "material": null,
+        "default": null,
+        "combo": null
+       },
+       "g_Texture1": {
+        "material": null,
+        "default": null,
+        "combo": "MASK"
+       },
+       "g_Size": {
+        "material": "size",
+        "default": 0.1,
+        "combo": null
+       },
+       "g_Feather": {
+        "material": "feather",
+        "default": 0.002,
+        "combo": null
+       }
+      },
+      "targetScale": 1,
+      "vert": {
+       "metal": "workshop__3605510527__effects__spin__ELLIPTICAL-1_NOISE-0_REPEAT-1__vert.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_ModelViewProjectionMatrix",
+         "offset": 0,
+         "type": "mat4"
+        },
+        {
+         "name": "g_Time",
+         "offset": 64,
+         "type": "float"
+        },
+        {
+         "name": "g_Texture0Resolution",
+         "offset": 80,
+         "type": "vec4"
+        },
+        {
+         "name": "g_Texture1Resolution",
+         "offset": 96,
+         "type": "vec4"
+        },
+        {
+         "name": "g_Speed",
+         "offset": 112,
+         "type": "float"
+        },
+        {
+         "name": "g_SpinCenter",
+         "offset": 120,
+         "type": "vec2"
+        },
+        {
+         "name": "g_Ratio",
+         "offset": 128,
+         "type": "float"
+        },
+        {
+         "name": "g_Axis",
+         "offset": 132,
+         "type": "float"
+        },
+        {
+         "name": "g_Phase",
+         "offset": 136,
+         "type": "float"
+        },
+        {
+         "name": "g_Friction",
+         "offset": 144,
+         "type": "vec2"
+        },
+        {
+         "name": "g_NoiseSpeed",
+         "offset": 152,
+         "type": "float"
+        },
+        {
+         "name": "g_NoiseAmount",
+         "offset": 156,
+         "type": "float"
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      },
+      "frag": {
+       "metal": "workshop__3605510527__effects__spin__ELLIPTICAL-1_NOISE-0_REPEAT-1__frag.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_Texture0Resolution",
+         "offset": 0,
+         "type": "vec4"
+        },
+        {
+         "name": "g_SpinCenter",
+         "offset": 16,
+         "type": "vec2"
+        },
+        {
+         "name": "g_Size",
+         "offset": 24,
+         "type": "float"
+        },
+        {
+         "name": "g_Feather",
+         "offset": 28,
+         "type": "float"
+        }
+       ],
+       "samplers": [
+        {
+         "name": "g_Texture0",
+         "texIndex": 0,
+         "sampIndex": 0
+        }
+       ],
+       "ubuf": 0
+      }
+     }
+    ]
+   }
+  ]
+ },
+ "workshop/3605510527/opacity": {
+  "variants": [
+   {
+    "combos": {},
+    "passes": [
+     {
+      "shader": "workshop/3605510527/effects/opacity",
+      "target": null,
+      "bind": [],
+      "uniformMeta": {
+       "g_Texture0": {
+        "material": null,
+        "default": null,
+        "combo": null
+       },
+       "g_Texture1": {
+        "material": null,
+        "default": null,
+        "combo": "MASK"
+       },
+       "g_UserAlpha": {
+        "material": "alpha",
+        "default": 1.0,
+        "combo": null
+       }
+      },
+      "targetScale": 1,
+      "vert": {
+       "metal": "workshop__3605510527__effects__opacity__base__vert.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_ModelViewProjectionMatrix",
+         "offset": 0,
+         "type": "mat4"
+        },
+        {
+         "name": "g_Texture1Resolution",
+         "offset": 64,
+         "type": "vec4"
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      },
+      "frag": {
+       "metal": "workshop__3605510527__effects__opacity__base__frag.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_UserAlpha",
+         "offset": 0,
+         "type": "float"
+        }
+       ],
+       "samplers": [
+        {
+         "name": "g_Texture0",
+         "texIndex": 0,
+         "sampIndex": 0
+        },
+        {
+         "name": "g_Texture1",
+         "texIndex": 1,
+         "sampIndex": 1
+        }
+       ],
+       "ubuf": 0
+      }
+     }
+    ]
+   },
+   {
+    "combos": {
+     "MASK": "1"
+    },
+    "passes": [
+     {
+      "shader": "workshop/3605510527/effects/opacity",
+      "target": null,
+      "bind": [],
+      "uniformMeta": {
+       "g_Texture0": {
+        "material": null,
+        "default": null,
+        "combo": null
+       },
+       "g_Texture1": {
+        "material": null,
+        "default": null,
+        "combo": "MASK"
+       },
+       "g_UserAlpha": {
+        "material": "alpha",
+        "default": 1.0,
+        "combo": null
+       }
+      },
+      "targetScale": 1,
+      "vert": {
+       "metal": "workshop__3605510527__effects__opacity__MASK-1__vert.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_ModelViewProjectionMatrix",
+         "offset": 0,
+         "type": "mat4"
+        },
+        {
+         "name": "g_Texture1Resolution",
+         "offset": 64,
+         "type": "vec4"
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      },
+      "frag": {
+       "metal": "workshop__3605510527__effects__opacity__MASK-1__frag.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_UserAlpha",
+         "offset": 0,
+         "type": "float"
+        }
+       ],
+       "samplers": [
+        {
+         "name": "g_Texture0",
+         "texIndex": 0,
+         "sampIndex": 0
+        },
+        {
+         "name": "g_Texture1",
+         "texIndex": 1,
+         "sampIndex": 1
+        }
+       ],
+       "ubuf": 0
+      }
+     }
+    ]
+   }
+  ]
+ },
+ "workshop/3605510527/video": {
+  "variants": [
+   {
+    "combos": {},
+    "passes": [
+     {
+      "shader": "workshop/3605510527/effects/video",
+      "target": null,
+      "bind": [],
+      "uniformMeta": {
+       "g_Texture0": {
+        "material": "framebuffer",
+        "default": null,
+        "combo": null
+       },
+       "R": {
+        "material": "R",
+        "default": 0.3,
+        "combo": null
+       },
+       "u_userNewColor": {
+        "material": "color",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_soundStrength": {
+        "material": "Sound Strength",
+        "default": 0.1,
+        "combo": null
+       }
+      },
+      "targetScale": 1,
+      "vert": {
+       "metal": "workshop__3605510527__effects__video__base__vert.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_ModelViewProjectionMatrix",
+         "offset": 0,
+         "type": "mat4"
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      },
+      "frag": {
+       "metal": "workshop__3605510527__effects__video__base__frag.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_AudioSpectrum64Left",
+         "offset": 0,
+         "type": "float",
+         "array": 64,
+         "arrayStride": 16
+        },
+        {
+         "name": "R",
+         "offset": 1024,
+         "type": "float"
+        },
+        {
+         "name": "u_userNewColor",
+         "offset": 1040,
+         "type": "vec3"
+        },
+        {
+         "name": "u_soundStrength",
+         "offset": 1052,
+         "type": "float"
+        },
+        {
+         "name": "g_AudioSpectrum64Right",
+         "offset": 1056,
+         "type": "float",
+         "array": 64,
+         "arrayStride": 16
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      }
+     }
+    ]
+   }
+  ]
  }
 }

@@ -15,6 +15,7 @@ particle_preview.png
 # 系统/打包产物
 .DS_Store
 dmg_stage/
+log.txt
 
 # 对话导出(本地保留、不入库)
 claude对话导出.json

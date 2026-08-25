@@ -172,10 +172,8 @@ enum TexDecoder {
     }
 
     /// .tex 头 + freeimage 判定:返回 (容器 texW/texH, 内容 imgW/imgH, 是否 freeimage 内嵌图片(PNG/JPG/...))。
-    /// 用途:**真 WE 对 freeimage 纹理的 g_TextureNResolution 仍按头部(容器,内容)喂**,而实际 GPU 纹理是
-    /// FreeImage 解码的内容尺寸 → 修正系数 imgH/texH 把 UV 压到内容上半部 = "错位采样"是 WE 的真实行为
-    /// (御剑「影子」遮罩 4096×4096 容器/4096×2296 内容 → 遮罩只用上 56%(发顶区)→ 身体音频条从发缘起、不上脸)。
-    /// lwe 对 FIF 特判成 (内容,内容)=修正1(CTexture.cpp:127-134)→ lwe≠真 WE;我们按真 WE。
+    /// 用途:上层结合**实际上传的 GPU 纹理尺寸**生成 g_TextureNResolution。freeimage 经 ImageIO/Metal
+    /// 解码后通常已去掉 POT padding，不能只凭头部容器尺寸谎报 xy，否则 shader 会重复裁剪 UV。
     static func headerInfo(_ blob: Data) -> (texW: Int, texH: Int, imgW: Int, imgH: Int, freeImage: Bool)? {
         let bytes = [UInt8](blob)
         var p = 0

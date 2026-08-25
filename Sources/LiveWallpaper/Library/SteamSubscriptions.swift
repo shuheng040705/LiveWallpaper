@@ -8,6 +8,38 @@ struct SubscribedItem: Identifiable, Hashable {
     let timeSubscribed: Int     // 订阅时间戳(倒序展示)
 }
 
+/// 本应用亲自确认过的订阅记录。SteamCMD 只负责下载，并不代表用户真的订阅；把所有数字目录
+/// 都当订阅会让“仅下载”的壁纸在卸载时无意义地弹网页登录。客户端 VDF + 本记录共同构成证据。
+enum SteamSubscriptionRegistry {
+    private static let key = "steam.confirmedSubscriptions.v1"
+    private static let lock = NSLock()
+
+    static func markSubscribed(_ id: String) {
+        guard WallpaperUninstallPolicy.isSteamWorkshopID(id) else { return }
+        mutate { $0.insert(id) }
+    }
+
+    static func markUnsubscribed(_ id: String) {
+        mutate { $0.remove(id) }
+    }
+
+    static func wasConfirmedByApp(_ id: String) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return Set(UserDefaults.standard.stringArray(forKey: key) ?? []).contains(id)
+    }
+
+    static func isKnownSubscribed(_ id: String) -> Bool {
+        SteamSubscriptions.loadSubscriptions().contains { $0.id == id } || wasConfirmedByApp(id)
+    }
+
+    private static func mutate(_ change: (inout Set<String>) -> Void) {
+        lock.lock(); defer { lock.unlock() }
+        var ids = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        change(&ids)
+        UserDefaults.standard.set(ids.sorted(), forKey: key)
+    }
+}
+
 enum SteamSubscriptions {
     static let appID = "431960"   // Wallpaper Engine
 
@@ -89,7 +121,9 @@ enum SteamSubscriptions {
 
     /// 某 id 是否已在壁纸库(已下载)。
     static func isInstalled(_ id: String) -> Bool {
-        FileManager.default.fileExists(atPath: PreferencesStore.shared.libraryRoot.appendingPathComponent(id).path)
+        LocalWallpaperProbe.isReady(
+            at: PreferencesStore.shared.libraryRoot.appendingPathComponent(id, isDirectory: true)
+        )
     }
 
     /// 已装项从 project.json 读标题;读不到回退 nil。

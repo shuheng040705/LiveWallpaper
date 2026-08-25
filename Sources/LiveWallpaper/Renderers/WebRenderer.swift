@@ -11,7 +11,7 @@ import UniformTypeIdentifiers
 ///
 /// 解决:用自定义 scheme(lwwp://)经 WKURLSchemeHandler 直接喂文件。自定义 scheme 是
 /// 一个正常 origin,XHR/fetch 遵守普通同源规则,可正常读取同目录资源。
-final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKURLSchemeHandler {
+final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKURLSchemeHandler, WKUIDelegate {
 
     static let scheme = "lwwp"          // Live Wallpaper Web Project
 
@@ -42,6 +42,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         let config = WKWebViewConfiguration()
         config.mediaTypesRequiringUserActionForPlayback = []   // 允许自动播放
         config.setURLSchemeHandler(self, forURLScheme: Self.scheme)
+        WebMediaCapturePolicy.install(into: config.userContentController)
 
         // 注入最小 Wallpaper Engine 运行时垫片:很多 WE 网页壁纸在 wallpaperPropertyListener
         // 被调用(applyUserProperties)后才设置背景/初始化,WE 启动时会调一次。这里在文档开始
@@ -62,6 +63,9 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         let wv = WKWebView(frame: host.bounds, configuration: config)
         wv.autoresizingMask = [.width, .height]
         wv.navigationDelegate = self
+        // Web 壁纸是不受信任的第三方内容。它可以播放已有媒体，但绝不允许通过 getUserMedia
+        // 打开 Mac 的摄像头或麦克风，否则仅启动壁纸就会抢占微信/FaceTime 的设备。
+        wv.uiDelegate = self
         wv.setValue(false, forKey: "drawsBackground")          // 透明背景(失败也无妨)
         host.addSubview(wv)
         webView = wv
@@ -88,6 +92,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     func stop() {
         webView?.stopLoading()
         webView?.navigationDelegate = nil
+        webView?.uiDelegate = nil
         webView?.removeFromSuperview()
         webView = nil
         rootURL = nil
@@ -105,6 +110,16 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     }
 
     // MARK: - WKNavigationDelegate
+
+    @available(macOS 12.0, *)
+    func webView(_ webView: WKWebView,
+                 requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+                 initiatedByFrame frame: WKFrameInfo,
+                 type: WKMediaCaptureType,
+                 decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+        Log.write("WebRenderer: denied camera/microphone request from web wallpaper (host=\(origin.host), type=\(type.rawValue))")
+        decisionHandler(.deny)
+    }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         Log.write("WebRenderer: didFinish \(webView.url?.absoluteString ?? "nil")")

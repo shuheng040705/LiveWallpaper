@@ -29,10 +29,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private lazy var subscriptionsWindow = SubscriptionsWindowController()
     private var cancellables = Set<AnyCancellable>()
     private var cancelAlertShowing = Set<String>()   // 正在弹取消询问的 job id(去重)
+    private var uninstallingIDs = Set<String>()      // 防止菜单/卡片连点触发重复退订和删除
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
         setupMainMenu()
+        // 启动即迁移/恢复 Steam Community 网页授权，不能等到用户下一次打开设置或执行退订：
+        // 这样升级前仍有效的 WebKit session cookie 会立刻进入 Keychain，避免迁移窗口内丢失。
+        SteamWebSession.shared.refresh()
         // 首页预览每次重启重新渲染一遍(清磁盘缓存),反映引擎最新改动(用户要求)。
         RenderedPreviewCache.shared.invalidateAllOnLaunch()
         // UI 预览模式(WP_UI_PREVIEW=1,截图验证用):不启动桌面渲染/电源/轮换,
@@ -53,6 +57,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         observeDownloads()
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        WorkshopDownloader.shared.shutdown()
+    }
+
     /// 监听「打开下载窗口」请求,以及取消下载后的「保留/删除」询问。
     private func observeDownloads() {
         NotificationCenter.default.addObserver(
@@ -65,7 +73,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(onUnsubscribeWallpaper(_:)), name: .unsubscribeWallpaper, object: nil)
         WorkshopDownloader.shared.$jobs
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] jobs in self?.handleCancelledJobs(jobs) }
+            .sink { [weak self] jobs in
+                self?.handleCancelledJobs(jobs)
+                self?.updateStatusItemAppearance()
+            }
             .store(in: &cancellables)
     }
 
@@ -77,10 +88,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 打开「我的 Steam 订阅」窗口(独立可拖拽改大小的 NSWindow,取代原 SwiftUI sheet)。
     @objc private func openSubscriptions() { subscriptionsWindow.show() }
 
-    /// 网页里取消订阅 → 删除对应本地壁纸(移到废纸篓,与右键删除同一路径,处理正在播放/库刷新)。
+    /// Steam 网页已经取消订阅 → 只做本地卸载。此通知的前置条件是 Steam 操作已经成功，
+    /// 所以不能再走一次网页退订，也不能误报成“无论成功都删”。
     @objc private func onUnsubscribeWallpaper(_ note: Notification) {
-        guard let id = note.userInfo?["id"] as? String, let item = library.item(id: id) else { return }
-        deleteWallpaper(item)
+        guard let id = note.userInfo?["id"] as? String else { return }
+        guard !uninstallingIDs.contains(id) else { return }
+        uninstallingIDs.insert(id)
+        if let item = library.item(id: id) {
+            removeLocalWallpaper(item, subscriptionWasCancelled: true)
+        } else {
+            // project.json 损坏或扫描尚未完成时，订阅面板仍应能卸载这个实际存在的目录。
+            let folder = PreferencesStore.shared.libraryRoot.appendingPathComponent(id, isDirectory: true)
+            guard FileManager.default.fileExists(atPath: folder.path) else {
+                uninstallingIDs.remove(id)
+                return
+            }
+            removeLocalWallpaper(
+                id: id,
+                title: "创意工坊 #\(id)",
+                folderURL: folder,
+                restoreItem: nil,
+                subscriptionWasCancelled: true
+            )
+        }
     }
 
     /// 出现「已取消」的下载 → 弹应用级询问:保留已下内容还是删除。
@@ -113,33 +143,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
+    /// Dock/台前调度中的 app 缩略图被再次点中时，桌面壁纸窗口本身也算“可见窗口”，系统传入的
+    /// flag 因而不能代表库窗口是否可见。统一走 show()，由控制器恢复或重建真正的主窗口。
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
+        openLibrary()
+        return false
+    }
+
     /// 主窗口的所有回调:把 UI 操作接到运行中的渲染器/轮换器/系统。
     private func makeActions() -> LibraryActions {
         LibraryActions(
             onSelect: { [weak self] item in self?.apply(item, interactive: true) },
-            onMuteChanged: { [weak self] m in self?.desktop.setMuted(m) },
+            onMuteChanged: { [weak self] m in
+                self?.desktop.setMuted(m)
+                self?.updateStatusItemAppearance()
+            },
             onVolumeChanged: { [weak self] v in self?.desktop.setVolume(v) },
-            onRotationChanged: { [weak self] in self?.rotation.reschedule() },
+            onRotationChanged: { [weak self] in
+                self?.rotation.reschedule()
+                self?.updateStatusItemAppearance()
+            },
             onLoginChanged: { LoginItem.setEnabled($0) },
             onPowerChanged: { [weak self] on in self?.power.isEnabled = on },
             onAssetsPathChanged: { [weak self] in self?.desktop.reloadCurrent() },
             onLibraryRootChanged: { [weak self] in self?.library.scan(); self?.startWatchingLibrary() },
             onNext: { [weak self] in self?.rotation.advance() },
-            onTogglePause: { [weak self] in self?.desktop.togglePause() },
-            onClear: { [weak self] in self?.desktop.clear(); self?.libraryWindow.updateCurrent(nil) },
+            onTogglePause: { [weak self] in self?.togglePause() },
+            onClear: { [weak self] in self?.clearCurrentWallpaper() },
             onQuit: { NSApp.terminate(nil) },
             isPaused: { [weak self] in self?.desktop.isPaused ?? false },
             onVideoFillChanged: { [weak self] f in self?.desktop.setVideoFill(f) },
             onMainScreenOnlyChanged: { [weak self] on in self?.desktop.setMainScreenOnly(on) },
             onDesktopIconsChanged: { on in DesktopIcons.setVisible(on) },
-            onDelete: { [weak self] item in self?.deleteWallpaper(item) },
+            onDelete: { [weak self] item in self?.requestUninstall(item, cancelSteamSubscription: false) },
             onApplySettings: { [weak self] item in self?.scheduleSettingsReload(item) },
             onUnsubscribe: { [weak self] item in
-                // 先取消 Steam 订阅(网页会话),无论成功与否都删除本地壁纸。
-                SteamSubscription.unsubscribe(id: item.id) { ok, msg in
-                    Log.write("Unsubscribe \(item.id): \(ok ? "OK" : "fail") — \(msg)")
-                }
-                self?.deleteWallpaper(item)
+                self?.requestUninstall(item, cancelSteamSubscription: true)
             }
         )
     }
@@ -154,22 +193,207 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
     }
 
-    /// 删除壁纸:若是当前正在播放的先关掉,把文件夹移到废纸篓(可恢复),再重新扫描。
-    private func deleteWallpaper(_ item: WallpaperItem) {
-        if desktop.current?.id == item.id {
-            desktop.clear()
-            libraryWindow.updateCurrent(nil)
+    /// 统一卸载入口。Steam 工坊项目先退订，只有服务端确认成功后才自动移除本地文件。
+    /// 本地导入的壁纸没有 Steam 订阅，直接走可恢复的“移到废纸篓”。
+    private func requestUninstall(_ item: WallpaperItem, cancelSteamSubscription: Bool) {
+        guard !uninstallingIDs.contains(item.id) else {
+            Log.write("uninstall: \(item.id) already in progress, ignored duplicate request")
+            return
         }
-        do {
-            try FileManager.default.trashItem(at: item.folderURL, resultingItemURL: nil)
-            Log.write("deleteWallpaper: trashed \(item.id)")
-        } catch {
-            Log.write("deleteWallpaper: trash failed \(item.id): \(error)")
+        uninstallingIDs.insert(item.id)
+
+        let knownSubscribed = SteamSubscriptionRegistry.isKnownSubscribed(item.id)
+        let requiresSteam = WallpaperUninstallPolicy.requiresSteamUnsubscribe(
+            itemID: item.id,
+            requested: cancelSteamSubscription,
+            knownSubscribed: knownSubscribed
+        )
+        guard requiresSteam else {
+            if cancelSteamSubscription, WallpaperUninstallPolicy.isSteamWorkshopID(item.id), !knownSubscribed {
+                Log.write("uninstall: \(item.id) has no subscription evidence → local uninstall without web authorization")
+            }
+            removeLocalWallpaper(item, subscriptionWasCancelled: false)
+            return
         }
-        library.scan()
+
+        Log.write("uninstall: unsubscribe Steam workshop \(item.id) before local removal")
+        unsubscribeAndRemove(item)
     }
 
-    // MARK: - 菜单栏图标:左键直接开主窗口,右键给个"退出"兜底
+    /// SteamCMD 下载登录与网页退订授权是两套会话。缺网页 Cookie 时直接打开 Steam 官方授权页，
+    /// 授权成功自动重试，不再把设置页里已登录的下载账号误报成“未登录 Steam”。
+    private func unsubscribeAndRemove(_ item: WallpaperItem) {
+        SteamSubscription.unsubscribe(id: item.id) { [weak self] outcome in
+            guard let self else { return }
+            switch outcome {
+            case .success(let message):
+                Log.write("uninstall: unsubscribe \(item.id): OK — \(message)")
+                guard WallpaperUninstallPolicy.mayRemoveLocalFiles(
+                    requiresSteamUnsubscribe: true,
+                    unsubscribeSucceeded: true
+                ) else {
+                    self.uninstallingIDs.remove(item.id)
+                    return
+                }
+                self.removeLocalWallpaper(item, subscriptionWasCancelled: true)
+
+            case .authenticationRequired:
+                Log.write("uninstall: \(item.id) needs Steam web authorization; opening official login")
+                SteamWebSession.shared.clearAuthenticationCookies {
+                    SteamWebLoginWindowController.shared.authorize(workshopID: item.id) { [weak self] authorized in
+                        guard let self else { return }
+                        if authorized {
+                            self.unsubscribeAndRemove(item)
+                        } else {
+                            self.uninstallingIDs.remove(item.id)
+                            self.showWebAuthorizationCancelled(item)
+                        }
+                    }
+                }
+
+            case .failure(let message):
+                Log.write("uninstall: unsubscribe \(item.id): fail — \(message)")
+                self.uninstallingIDs.remove(item.id)
+                self.showUnsubscribeFailure(item, message: message)
+            }
+        }
+    }
+
+    /// 真正的本地卸载：停止关联下载/预览，安全停止正在使用的壁纸，移到废纸篓后重扫库。
+    /// 若移动失败，会恢复刚才正在使用的壁纸，避免一次失败操作把桌面留空。
+    private func removeLocalWallpaper(_ item: WallpaperItem, subscriptionWasCancelled: Bool) {
+        removeLocalWallpaper(
+            id: item.id,
+            title: item.title,
+            folderURL: item.folderURL,
+            restoreItem: item,
+            subscriptionWasCancelled: subscriptionWasCancelled
+        )
+    }
+
+    private func removeLocalWallpaper(
+        id: String,
+        title: String,
+        folderURL: URL,
+        restoreItem: WallpaperItem?,
+        subscriptionWasCancelled: Bool
+    ) {
+        guard WallpaperUninstallPolicy.isSafeLibraryChild(
+            folderURL: folderURL,
+            libraryRoot: PreferencesStore.shared.libraryRoot
+        ) else {
+            uninstallingIDs.remove(id)
+            Log.write("uninstall: refused unsafe path \(folderURL.path)")
+            showLocalRemovalFailure(
+                title: title,
+                subscriptionWasCancelled: subscriptionWasCancelled,
+                error: WallpaperUninstallError.unsafePath
+            )
+            return
+        }
+
+        WorkshopDownloader.shared.remove(id: id)
+        RenderedPreviewCache.shared.cancel(id)
+
+        let wasCurrent = desktop.currentID == id
+        let wasLastWallpaper = PreferencesStore.shared.lastWallpaperID == id
+        if wasCurrent {
+            clearCurrentWallpaper()
+        } else if wasLastWallpaper {
+            PreferencesStore.shared.lastWallpaperID = nil
+        }
+
+        do {
+            try FileManager.default.trashItem(at: folderURL, resultingItemURL: nil)
+            Log.write("uninstall: trashed \(id), steamCancelled=\(subscriptionWasCancelled)")
+            uninstallingIDs.remove(id)
+            library.scan()
+        } catch {
+            Log.write("uninstall: trash failed \(id): \(error)")
+            uninstallingIDs.remove(id)
+            if wasCurrent, let restoreItem {
+                apply(restoreItem)
+            } else if wasLastWallpaper {
+                PreferencesStore.shared.lastWallpaperID = id
+            }
+            showLocalRemovalFailure(
+                title: title,
+                subscriptionWasCancelled: subscriptionWasCancelled,
+                error: error
+            )
+        }
+    }
+
+    /// Steam 退订失败时默认保留本地文件；用户仍可明确选择“仅卸载本地”。
+    private func showUnsubscribeFailure(_ item: WallpaperItem, message: String) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "未能取消 Steam 订阅"
+        alert.informativeText = "\(message)\n\n为防止 Steam 自动重新下载，本地壁纸尚未删除。"
+        alert.addButton(withTitle: "保留壁纸")
+        alert.addButton(withTitle: "仅卸载本地")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            requestUninstall(item, cancelSteamSubscription: false)
+        }
+    }
+
+    private func showWebAuthorizationCancelled(_ item: WallpaperItem) {
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "未完成 Steam 网页授权"
+        alert.informativeText =
+            "设置中的 SteamCMD 下载账号仍然有效；订阅管理需要单独的 Steam 社区网页授权。\n\n授权窗口已关闭，因此没有取消订阅，也没有删除本地壁纸。"
+        alert.addButton(withTitle: "保留壁纸")
+        alert.addButton(withTitle: "仅卸载本地")
+        NSApp.activate(ignoringOtherApps: true)
+        if alert.runModal() == .alertSecondButtonReturn {
+            requestUninstall(item, cancelSteamSubscription: false)
+        }
+    }
+
+    private func showLocalRemovalFailure(
+        title: String,
+        subscriptionWasCancelled: Bool,
+        error: Error
+    ) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "无法卸载「\(title)」"
+        let prefix = subscriptionWasCancelled
+            ? "Steam 订阅已取消，但本地文件夹没有移入废纸篓。"
+            : "本地文件夹没有移入废纸篓。"
+        alert.informativeText = "\(prefix)\n\n\(error.localizedDescription)"
+        alert.addButton(withTitle: "知道了")
+        NSApp.activate(ignoringOtherApps: true)
+        alert.runModal()
+    }
+
+    private enum WallpaperUninstallError: LocalizedError {
+        case unsafePath
+
+        var errorDescription: String? {
+            switch self {
+            case .unsafePath:
+                return "目标不在当前壁纸库的直接子目录中，已为安全起见拒绝操作。请重新扫描壁纸库后再试。"
+            }
+        }
+    }
+
+    private func clearCurrentWallpaper() {
+        desktop.clear()
+        PreferencesStore.shared.lastWallpaperID = nil
+        libraryWindow.updateCurrent(nil)
+        updateStatusItemAppearance()
+    }
+
+    private func togglePause() {
+        guard desktop.current != nil else { return }
+        desktop.togglePause()
+        updateStatusItemAppearance()
+    }
+
+    // MARK: - WE 风格状态栏菜单
 
     private func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
@@ -180,22 +404,141 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusItemClicked)
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
+        updateStatusItemAppearance()
     }
 
     @objc private func statusItemClicked() {
-        if NSApp.currentEvent?.type == .rightMouseUp {
-            // 右键:弹一个只有"退出"的极简菜单
-            let menu = NSMenu()
-            let quit = NSMenuItem(title: "退出 Live Wallpaper", action: #selector(quit), keyEquivalent: "q")
-            quit.target = self
-            menu.addItem(quit)
-            statusItem.menu = menu
-            statusItem.button?.performClick(nil)   // 弹出
-            statusItem.menu = nil                   // 立即解绑,保持左键=直接打开
+        if let event = NSApp.currentEvent, event.type == .rightMouseUp,
+           let button = statusItem.button {
+            // 与 WE 一样：左键进入库，右键提供运行时快捷控制和程序入口。
+            let menu = makeStatusMenu()
+            // 直接用当前右键事件弹上下文菜单。旧实现“临时绑定 statusItem.menu → performClick
+            // → 立刻解绑”在部分 macOS 版本会一闪即关；上下文菜单会自行完成事件跟踪，
+            // 且不改变左键仍然打开主窗口的行为。
+            NSMenu.popUpContextMenu(menu, with: event, for: button)
         } else {
             // 左键:直接打开主窗口
             openLibrary()
         }
+    }
+
+    private func makeStatusMenu() -> NSMenu {
+        let state = TrayMenuPresentation(
+            currentTitle: desktop.current?.title,
+            isPaused: desktop.isPaused,
+            isMuted: PreferencesStore.shared.isMuted,
+            rotationEnabled: rotation.isEnabled,
+            pendingDownloads: WorkshopDownloader.shared.pendingCount
+        )
+        let hasCurrent = desktop.current != nil
+        let hasPlayableItems = library.items.contains { $0.type.isPlayable }
+        let menu = NSMenu()
+
+        let current = NSMenuItem(title: state.currentSummary, action: nil, keyEquivalent: "")
+        current.isEnabled = false
+        current.image = menuImage("photo.fill")
+        menu.addItem(current)
+        menu.addItem(.separator())
+
+        menu.addItem(statusMenuItem("打开壁纸库与创意工坊…", symbol: "rectangle.grid.2x2",
+                                    action: #selector(openLibrary)))
+        menu.addItem(statusMenuItem("壁纸与应用设置…", symbol: "gearshape",
+                                    action: #selector(openSettings)))
+        menu.addItem(.separator())
+
+        menu.addItem(statusMenuItem("下一张壁纸", symbol: "forward.end.fill",
+                                    action: #selector(nextWallpaper), enabled: hasPlayableItems))
+        menu.addItem(statusMenuItem(state.pauseTitle, symbol: state.pauseSymbol,
+                                    action: #selector(togglePauseFromMenu), enabled: hasCurrent))
+        menu.addItem(statusMenuItem(state.muteTitle, symbol: state.muteSymbol,
+                                    action: #selector(toggleMuteFromMenu), enabled: hasCurrent))
+        menu.addItem(statusMenuItem("停止壁纸", symbol: "stop.fill",
+                                    action: #selector(stopWallpaperFromMenu), enabled: hasCurrent))
+
+        menu.addItem(.separator())
+        menu.addItem(statusMenuItem(state.rotationTitle, symbol: "repeat",
+                                    action: #selector(toggleRotationFromMenu),
+                                    state: state.rotationEnabled ? .on : .off))
+        menu.addItem(statusMenuItem(state.downloadsTitle, symbol: "arrow.down.circle",
+                                    action: #selector(openDownloads)))
+        menu.addItem(statusMenuItem("我的 Steam 订阅…", symbol: "shippingbox",
+                                    action: #selector(openSubscriptions)))
+
+        menu.addItem(.separator())
+        menu.addItem(statusMenuItem("开机启动", symbol: "power",
+                                    action: #selector(toggleLoginItemFromMenu),
+                                    state: LoginItem.isEnabled ? .on : .off))
+        menu.addItem(.separator())
+        menu.addItem(statusMenuItem("退出 Live Wallpaper", symbol: "xmark.circle",
+                                    action: #selector(quit)))
+        return menu
+    }
+
+    private func statusMenuItem(
+        _ title: String,
+        symbol: String,
+        action: Selector,
+        enabled: Bool = true,
+        state: NSControl.StateValue = .off
+    ) -> NSMenuItem {
+        let item = NSMenuItem(title: title, action: action, keyEquivalent: "")
+        item.target = self
+        item.isEnabled = enabled
+        item.state = state
+        item.image = menuImage(symbol)
+        return item
+    }
+
+    private func menuImage(_ symbol: String) -> NSImage? {
+        let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        image?.size = NSSize(width: 15, height: 15)
+        return image
+    }
+
+    private func updateStatusItemAppearance() {
+        guard statusItem != nil else { return }
+        let hasCurrent = desktop.current != nil
+        let symbol = desktop.isPaused && hasCurrent
+            ? "pause.circle"
+            : (hasCurrent ? "photo.on.rectangle.angled" : "photo")
+        statusItem.button?.image = NSImage(
+            systemSymbolName: symbol,
+            accessibilityDescription: "Live Wallpaper"
+        )
+        let stateText: String
+        if let title = desktop.current?.title {
+            stateText = desktop.isPaused ? "\(title)（已暂停）" : title
+        } else {
+            stateText = "未选择壁纸"
+        }
+        statusItem.button?.toolTip = "Live Wallpaper · \(stateText)"
+    }
+
+    @objc private func nextWallpaper() {
+        rotation.advance()
+        updateStatusItemAppearance()
+    }
+
+    @objc private func togglePauseFromMenu() {
+        togglePause()
+    }
+
+    @objc private func toggleMuteFromMenu() {
+        desktop.setMuted(!PreferencesStore.shared.isMuted)
+        updateStatusItemAppearance()
+    }
+
+    @objc private func stopWallpaperFromMenu() {
+        clearCurrentWallpaper()
+    }
+
+    @objc private func toggleRotationFromMenu() {
+        rotation.setEnabled(!rotation.isEnabled)
+        updateStatusItemAppearance()
+    }
+
+    @objc private func toggleLoginItemFromMenu() {
+        _ = LoginItem.setEnabled(!LoginItem.isEnabled)
     }
 
     /// 主菜单:.regular 模式下顶部菜单栏 + 标准快捷键(搜索框复制粘贴、⌘W、⌘Q)。
@@ -253,6 +596,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if interactive && PreferencesStore.shared.reportRenderGaps { self.showRenderGapsIfAny(item) }
         }
         libraryWindow.updateCurrent(item.id)
+        updateStatusItemAppearance()
     }
 
     /// 加载后若有渲染缺口(没渲成功的项),弹窗列出。空=全渲成功,不弹。

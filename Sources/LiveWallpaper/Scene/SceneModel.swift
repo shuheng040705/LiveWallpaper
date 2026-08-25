@@ -231,6 +231,10 @@ struct LayerEffect {
     var maskPath: String?   // 遮罩纹理(pkg 内路径);非 nil 时效果只作用于遮罩白色区域
     // 转译特效引擎用:WE effect 名 + pkg 真实参数(material-key→值)+ combos。
     var weName: String = ""
+    // scene.json `effects[]` 中的原始下标。parseEffects 会过滤不可见/未知特效，不能再用过滤后的
+    // 数组下标去关联共享脚本宿主；保留原始下标后，NSL 宿主算出的 constantshadervalues 回灌
+    // 能精确命中同一个 effect/pass/key。
+    var sceneEffectIndex: Int = -1
     var weParams: [String: String] = [:]               // 合并全 pass 的 csv(同名后写覆盖)
     var weParamsPerPass: [[String: String]] = []        // 逐 pass 的 csv(多 pass effect 如 bloom:
                                                         // 各 pass 的 strength/Tint 可不同 → 按 pass 取真值)
@@ -251,6 +255,9 @@ struct LayerEffect {
     // weAnim 保留合并视图;真正求值用 weAnimPerPass,避免多 pass 同名参数被最后一个动画错误覆盖。
     var weAnim: [String: WEKeyframeAnimation] = [:]
     var weAnimPerPass: [[String: WEKeyframeAnimation]] = []
+    // constantshadervalues 中的 `{script,scriptproperties,value}` 绑定。WE 在对象脚本上下文里逐帧
+    // 求值；我方按 pass/key 保存运行时，静态 value 仅作脚本失败 fallback。
+    var weScriptsPerPass: [[String: WEScript]] = []
     // ⭐该后处理特效所在 fullscreenlayer 的**渲染序 cutoff**(收集时 layers.count = 其下方已渲图层数)。
     //   WE 语义:fullscreenlayer 后处理只作用于其**下方**已合成的场景,不染其上图层(人物/UI)。
     //   多个全屏后处理层位于场景不同位置时(白影 3497488774:238「天空后处理」pos8 vs 209「后处理层」pos122),
@@ -295,6 +302,38 @@ struct LayerEffect {
             }
         }
     }
+
+    var hasScriptBindings: Bool {
+        weScriptsPerPass.contains { !$0.isEmpty }
+    }
+
+    /// 逐帧求值 effect constant 脚本。先注入同对象其它字段脚本导出的 shared 快照，再以当前
+    /// 静态/关键帧值作为 update(value) 入参；失败时保留原值。支持 float/Vec2/Vec3/Vec4。
+    mutating func applyScriptBindings(at time: Double, frametime: Double, sharedSnapshots: [String]) {
+        guard hasScriptBindings else { return }
+        for passIndex in weScriptsPerPass.indices {
+            guard passIndex < weParamsPerPass.count else { continue }
+            for (key, script) in weScriptsPerPass[passIndex] {
+                for snapshot in sharedSnapshots where snapshot != "{}" {
+                    script.injectShared(snapshot)
+                }
+                guard let encoded = weParamsPerPass[passIndex][key] else { continue }
+                let values = encoded
+                    .split(whereSeparator: { $0 == " " || $0 == "," || $0 == "\t" })
+                    .compactMap { Float($0) }
+                guard !values.isEmpty,
+                      values.count <= 4,
+                      let updated = script.runFloats(current: values, simTime: time, frametime: frametime) else {
+                    continue
+                }
+                weParamsPerPass[passIndex][key] = updated.map { String($0) }.joined(separator: " ")
+            }
+        }
+        // 与关键帧路径一致：完整逐 pass 参数重建合并视图，严格保留后 pass 覆盖前 pass。
+        for pass in weParamsPerPass {
+            for (key, value) in pass { weParams[key] = value }
+        }
+    }
 }
 
 /// WE 相机视差使用的有效控制节点。父节点默认把自己的深度和锚点传播给全部后代；
@@ -303,6 +342,38 @@ struct SceneParallaxState {
     var depth: SIMD2<Float> = .zero
     var anchorPx: SIMD2<Float> = .zero
     var anchorId: Int = -1
+}
+
+/// WE 裁剪部件的坐标补偿策略。relative origin 动画的 `value` 是编辑器已经排好位置的基准坐标，
+/// 每帧求值又会把它加回；此时再叠 cropoffset 会产生第二次位移（御剑发饰即因此持续偏右上）。
+enum WECropOffsetPolicy {
+    static func defaultFraction(hasParent: Bool, hasRelativeOriginAnimation: Bool) -> Float {
+        if hasParent || hasRelativeOriginAnimation { return 0 }
+        return 0.5
+    }
+}
+
+/// 没有显式 parallaxDepth 的区域 composelayer，可通过名称中的独立目标 token 关联到它修饰的图层。
+/// 例如 `音条-身体` → `身体`、`Audio Bars - Body` → `Body`。只认分隔后的完整 token，
+/// 不做子串模糊匹配，避免把普通 UI/短名称误关联到场景图层。
+enum WEComposeParallaxAssociation {
+    static func referencedLayerName(composeName: String, availableNames: [String]) -> String? {
+        let tokens = Set(
+            composeName.lowercased()
+                .components(separatedBy: CharacterSet.alphanumerics.inverted)
+                .filter { !$0.isEmpty }
+        )
+        guard !tokens.isEmpty else { return nil }
+        return availableNames
+            .filter { name in
+                let normalized = name.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+                return normalized.count >= 2 && tokens.contains(normalized)
+            }
+            .max { lhs, rhs in
+                if lhs.count != rhs.count { return lhs.count < rhs.count }
+                return lhs < rhs
+            }
+    }
 }
 
 enum WEParallaxResolver {
@@ -325,6 +396,33 @@ enum WEParallaxResolver {
     }
 }
 
+/// WE 的对象可见性分成两层：对象自己的 visible，以及全部父级的 visible 门控。
+/// 子对象的脚本可以改变前者，但不能越过一个已经隐藏的父组。
+enum WEVisibilityResolver {
+    static func ancestorsVisible(
+        for id: Int,
+        parentOf: [Int: Int],
+        selfVisible: (Int) -> Bool
+    ) -> Bool {
+        var current = parentOf[id]
+        var hops = 0
+        while let parent = current, hops < 32 {
+            if !selfVisible(parent) { return false }
+            current = parentOf[parent]
+            hops += 1
+        }
+        return true
+    }
+
+    static func effectiveVisible(
+        for id: Int,
+        parentOf: [Int: Int],
+        selfVisible: (Int) -> Bool
+    ) -> Bool {
+        selfVisible(id) && ancestorsVisible(for: id, parentOf: parentOf, selfVisible: selfVisible)
+    }
+}
+
 /// 一个待渲染图层的描述(尚未解码纹理)。
 struct LayerDesc {
     var id: Int
@@ -333,13 +431,18 @@ struct LayerDesc {
     var originPx: SIMD3<Float>    // 图层中心(场景像素坐标,y 向下)
     var sizePx: SIMD2<Float>?     // 显式 size;nil=autosize(取纹理像素尺寸)
     var cropOffset: SIMD2<Float> = .zero   // model.json cropoffset(裁剪重定位,纹理像素;多部件角色用)
-    var cropShiftPx: SIMD2<Float> = .zero  // 实际应用的 cropoffset 世界位移(POT 命中才非零);origin 关键帧层每帧需再加上它(否则关键帧覆盖掉 origin 上的 crop)
+    var cropShiftPx: SIMD2<Float> = .zero  // 按策略实际应用的 cropoffset 世界位移(POT 命中才非零)
     var scale: SIMD3<Float>
     var anglesDeg: SIMD3<Float>
     var parallax: SIMD2<Float>
     var parallaxAnchorPx: SIMD2<Float> = .zero
     var parallaxAnchorId: Int = -1
+    // 区域 composelayer 通过名称关联到的真实内容层。除继承视差外，渲染器可用该层贴图的 alpha
+    // 收紧 opacity 辅助遮罩，避免作者提供的“整人剪影”把身体音频条放行到头/脸上。
+    var composeContentLayerId: Int = -1
     var visible: Bool
+    // 静态父链门控。visible 脚本只允许改变对象自身显隐，不能把已关闭父组下的子层重新点亮。
+    var ancestorVisible: Bool = true
     var texturePath: String?     // pkg 内部路径,如 "materials/Foo.tex"
     var color: SIMD4<Float>
     var blend: BlendMode
@@ -521,7 +624,7 @@ struct AnimationLayerDesc {
 /// effect pass override 的单个常量绑定(ObjectParser.cpp:381-394 / ImageEffectPassOverride)。
 /// WE 里每个 constant 是个 UserSetting(可挂 property/condition/script)。这里至少保留原始
 /// 求值后的字符串值 + 是否有 property/script/condition 连接的标记;真正的逐帧 property/script
-/// 求值绑定(bindScriptContext)未实现 —— 见 parseEffects 处的 TODO。
+/// property/condition 的动态重绑仍未实现；script 绑定已由 LayerEffect.weScriptsPerPass 逐帧求值。
 struct EffectConstantBinding {
     var value: String            // 求值/unwrap 后的字符串(给 WEEffectChain 当 csv 用)
     var property: String?        // 连接的用户属性 key(短形 {user:"key"} 或条件形 name)
@@ -663,6 +766,10 @@ struct SceneDocument {
     /// WE 脚本可查询的完整 scene 对象树。与 `layers` 不同，这里必须保留无 image 的父容器，
     /// 否则子层脚本 `thisLayer.getParent()` 会错误返回 null。
     var scriptLayerDefs: [WEScript.SceneLayerDefinition] = []
+    /// 当前壁纸的完整有效用户属性（用户覆盖优先，否则 project.json 默认）。共享 NSL 宿主必须在
+    /// library/init/applyUserProperties 之前拿到它；否则脚本看到空的 engine.userProperties，
+    /// “静止点/视差强度/草摆/人物摆动”等控件只改 UI、不改运行时。
+    var scriptUserProperties: [String: WallpaperProperty.Value] = [:]
     /// ⭐有 cursor 互动脚本回调(cursorClick/cursorDown/cursorMove/cursorEnter)的对象 id 集。
     /// 供互动 hit-test + 台前调度点击穿透判定(这些对象的 bbox=可点击区,不只 puppet 角色)。
     var interactiveIds: Set<Int> = []
@@ -732,7 +839,8 @@ struct SceneDocument {
             let objects = scene?["objects"] as? [[String: Any]] ?? []
             let definitions = objects.compactMap(Self.scriptLayerDefinition)
             return Self.$activeScriptLayerDefs.withValue(definitions) {
-                Self.buildScoped(from: source, item: item, timeStageConfig: timeStageConfig)
+                Self.buildScoped(from: source, item: item, timeStageConfig: timeStageConfig,
+                                 scriptUserProperties: parseOverrides)
             }
         }
     }
@@ -740,7 +848,8 @@ struct SceneDocument {
     /// 必须在 VecParse.$overrides 的词法作用域内执行;拆成独立函数可避免把整段解析器重新缩进,
     /// 也让任何未来入口都只能经 build 建立隔离上下文。
     private static func buildScoped(from source: SceneSource, item: WallpaperItem?,
-                                    timeStageConfig: [String: String]) -> SceneDocument? {
+                                    timeStageConfig: [String: String],
+                                    scriptUserProperties: [String: WallpaperProperty.Value]) -> SceneDocument? {
         // 用户改过(覆盖值 ≠ project.json 默认)的属性名 —— 供跨层控制器脚本(Dock)首帧派发 applyUserProperties。
         let changedUserPropertyNames = Self.changedUserProperties(item)
 
@@ -974,13 +1083,19 @@ struct SceneDocument {
         // 调试:WP_ONLY_IDS=593,363 → 只渲列出的 id,其余全隐(用于隔离单层看形状/方向,排除随机粒子噪声)
         let onlyIds: Set<Int> = Set((WPEnv.vars["WP_ONLY_IDS"] ?? "")
             .split(separator: ",").compactMap { Int($0.trimmingCharacters(in: .whitespaces)) })
+        func ancestorsVisible(_ id: Int) -> Bool {
+            if !onlyIds.isEmpty { return onlyIds.contains(id) }
+            if forceShow.contains(id) { return true }
+            return WEVisibilityResolver.ancestorsVisible(for: id, parentOf: parentOf) {
+                selfVisible[$0] ?? true
+            }
+        }
         func effectiveVisible(_ id: Int) -> Bool {
             if !onlyIds.isEmpty { return onlyIds.contains(id) }
             if forceShow.contains(id) { return true }
-            var v = selfVisible[id] ?? true
-            var pid = parentOf[id], n = 0
-            while let p = pid, n < 16 { v = v && (selfVisible[p] ?? true); pid = parentOf[p]; n += 1 }
-            return v
+            return WEVisibilityResolver.effectiveVisible(for: id, parentOf: parentOf) {
+                selfVisible[$0] ?? true
+            }
         }
 
         // 部件间 attachment 解析支持:id→对象,供查父对象的 puppet/size。
@@ -1180,7 +1295,8 @@ struct SceneDocument {
                 // pulse/blurprecise 等特效被静默丢弃(违反"不漏用任何 pkg 数据")。与图像层一致解析进 effects
                 // 链(SceneRenderEngine 的统一图层循环会据此建 mask/aux/特效链并跑 WEEffectChain;文本纹理每秒
                 // 刷新、effectedTexture 每帧重算)。effectVisible 仍过滤引用未定义属性/条件不命中的特效。
-                tl.effects = Self.parseEffects(obj["effects"], keepWENamed: true, source: source)
+                tl.effects = Self.parseEffects(obj["effects"], keepWENamed: true, source: source,
+                                               canvas: canvas)
                 tl.effectPassOverrides = Self.parseEffectPassOverridesPerEffect(obj["effects"])
                 tl.sceneObjIndex = sceneObjIndex
                 layers.append(tl); continue
@@ -1203,7 +1319,8 @@ struct SceneDocument {
                 //   透明底 + additive 合成的特效承载层(光束足迹由 shader 的 point0..3 透视 UV 决定,不靠 quad 尺寸)。
                 //   只在对象**可见**(effectiveVisible:自身 + 父链 visible,默认开)且 WP_NO_LIGHTSHAFTS 未设时建。
                 let shapeVisible = sid >= 0 ? effectiveVisible(sid) : Self.parseVisible(obj["visible"])
-                let shapeFx = Self.parseEffects(obj["effects"], keepWENamed: true, source: source)
+                let shapeFx = Self.parseEffects(obj["effects"], keepWENamed: true, source: source,
+                                                canvas: canvas)
                 let hasSelfDraw = WPEnv.vars["WP_NO_LIGHTSHAFTS"] == nil
                     && shapeFx.contains { $0.weCombos["DIRECTDRAW"] == "1" }
                 if shapeVisible, hasSelfDraw {
@@ -1348,7 +1465,8 @@ struct SceneDocument {
                 //   只活**最后一个**,前面的(玻璃水珠雨 raindrop_on_glass + 调色 tint)全被丢 → "雨的特效没了"。
                 //   按场景顺序 append,保留全部后处理链的正确先后。单后处理层壁纸 `+=` 等价于 `=`,零影响。
                 if Self.parseVisible(obj["visible"]) {
-                    var added = Self.parseEffects(obj["effects"], keepWENamed: true, source: source)
+                    var added = Self.parseEffects(obj["effects"], keepWENamed: true, source: source,
+                                                  canvas: canvas)
                     if !added.isEmpty {
                         // 记录本后处理层的渲染序 cutoff(此刻 layers.count = 其下方已渲图层数),供引擎判定
                         //   「早段后处理只染下方场景、不染其上人物」(白影 238 天空后处理 vs 209 全帧后处理)。
@@ -1371,6 +1489,7 @@ struct SceneDocument {
                 // 先把组合层指令(effect.json 的 fbos / passes 的 command/source/target/bind)解析建模,
                 // 存进 doc.projectLayers,供 SceneRenderEngine 搭 FBO 链(渲染不在本任务)。
                 let pl = Self.parseProjectLayer(obj, imageRef: imageRef, source: source,
+                                                canvas: canvas,
                                                 absoluteOrigin: absoluteOrigin, absoluteScale: absoluteScale)
                 projectLayers.append(pl)
                 // 当它只挂未实现的交互效果(cursorripple 鼠标点击涟漪)时,直接当 quad 画会出假同心圆。
@@ -1638,7 +1757,8 @@ struct SceneDocument {
 
             // keepWENamed:保留所有有 weName 的真 WE 转译特效(godrays/iris/shimmer/swing/blur/
             // twirl 等没有旧 kind 映射的也照样跑真 shader),不再被 kind==.none 门丢掉。
-            let effects = Self.parseEffects(obj["effects"], keepWENamed: true, source: source)
+            let effects = Self.parseEffects(obj["effects"], keepWENamed: true, source: source,
+                                            canvas: canvas)
             // effect pass override(ObjectParser.cpp:381-394):与 effects 一一对应(保序、含被滤掉的位置→空)。
             let passOverrides = Self.parseEffectPassOverridesPerEffect(obj["effects"])
             // animationlayers(puppet warp,ObjectParser.cpp:439-463):rate/visible/blend/animation,解析存下。
@@ -1651,6 +1771,9 @@ struct SceneDocument {
             let size = VecParse.floats(obj["size"])
             // 用累积绝对 origin(含父层偏移),否则带 parent 的图层(如企鹅部件)会跑到角落。
             let objId = (obj["id"] as? NSNumber)?.intValue ?? -1
+            // 提前解析一次，cropoffset 策略需要知道 origin 是否是 relative 关键帧；后面直接复用，
+            // 避免对同一份对象数据重复解析并保证建模/运行时使用完全相同的动画描述。
+            let originKeyAnimation = WEKeyframeAnimation.parse(obj["origin"])
             var absOrigin = objId >= 0 ? absoluteOrigin(objId) : VecParse.f3(obj["origin"])
             let absScale = objId >= 0 ? absoluteScale(objId) : VecParse.f3(obj["scale"], default: SIMD3(1, 1, 1))
             // alignment(CImage.cpp:228-248):origin 默认是 quad 中心;alignment 串含 top/bottom/left/right
@@ -1695,11 +1818,10 @@ struct SceneDocument {
             if let tp = texPath, let blob = source.data(for: tp), let h = TexDecoder.headerWH(blob) {
                 texContainerPOT = isPOT(h.texW) && isPOT(h.texH)
             }
-            // ⭐cropoffset 规则(2026-06-10 终版,经两组用户实测铁证定):**顶层件=全量应用,有父子件=不应用**。
-            //   铁证:① 刀(顶层,crop(0.5,−386.5))全量后刀刃落胸口=WE 截图位置(用户最早实测"加了偏移才跟WE相同";
-            //   静息时 WE 龙嘴并不含刀——"含刀"是俯冲动画瞬间,preview 录的就是那段);② 面具/挂饰(parent=576)
-            //   无偏移=用户确认正确 → 子件 origin 是父相对坐标,编辑器裁剪补偿已在父链/相对坐标里,再加=重复计算。
-            //   lwe/repkg 不读 cropoffset 是它们的缺口(lwe autosize 也是 TODO),非权威。
+            // ⭐cropoffset 规则:**静态顶层件=半量应用,有父子件=不应用,relative origin 动画=不应用**。
+            //   静态顶层半量保留既有实测结果；面具/挂饰(parent=576)无偏移已确认正确；relative origin
+            //   的 `value` 已是编辑器基准，真实 WE 窗口逐帧对照确认再次叠加会重复计算。
+            //   lwe/repkg 不读 cropoffset 是它们的缺口(lwe autosize 也是 TODO),不能单独作为真值。
             //   ⚠️preview.gif 不能当位置基准(camerapreview=true,WE 用独立预览相机拍的特写,画面运动一半是相机);
             //   位置基准=用户桌面截图(实况壁纸)。WP_CROP_FRAC=x 诊断覆盖(对全部件,含子件)。
             var cropShiftPx = SIMD2<Float>(0, 0)
@@ -1709,9 +1831,13 @@ struct SceneDocument {
                 // 父链累积 scale/angle(无父 → 单位 (1,1)/0,cropoffset 即世界平移);有父则把局部 crop 旋到世界。
                 let pScale = parentOf[objId] != nil ? parentAbsoluteScale(objId) : SIMD3<Float>(1, 1, 1)
                 let pAngle = parentOf[objId] != nil ? parentAbsoluteAngle(objId) : 0
-                // 顶层=×0.5 半量 / 有父=×0 不应用(2026-06-10 数据定;⚠2026-06-20 用户明确「没说半量是错的」→
-                //   保持 ×0.5,我曾误读记忆改成全量被用户当场纠正退回)。WP_CROP_FRAC=x 覆盖;WP_NO_CROPOFFSET 全关。
-                let defaultFrac: Float = parentOf[objId] == nil ? 0.5 : 0.0   // 顶层半量 / 有父不应用
+                // relative origin 关键帧的 value 已是编辑器排好位置的基准，每帧 evaluate 会返回 base+delta；
+                // 再补 cropoffset 会重复位移。真实 WE 窗口与本机逐帧 A/B（御剑 119 发饰）确认该类应为 0。
+                // 静态顶层仍 ×0.5、有父仍 ×0。WP_CROP_FRAC=x 覆盖；WP_NO_CROPOFFSET 全关。
+                let defaultFrac = WECropOffsetPolicy.defaultFraction(
+                    hasParent: parentOf[objId] != nil,
+                    hasRelativeOriginAnimation: originKeyAnimation?.relative == true
+                )
                 let frac = Float(WPEnv.vars["WP_CROP_FRAC"] ?? "") ?? defaultFrac
                 let lx = mdlCropOffset.x * frac
                 let ly = mdlCropOffset.y * frac
@@ -1748,6 +1874,7 @@ struct SceneDocument {
                 isSolid: isSolidReal && !texOverridden,
                 effects: effects
             )
+            if objId >= 0 { layer.ancestorVisible = ancestorsVisible(objId) }
             layer.parallaxAnchorPx = parallaxState.anchorPx
             layer.parallaxAnchorId = parallaxState.anchorId
             layer.scaleScript = scaleScript
@@ -1779,7 +1906,7 @@ struct SceneDocument {
             layer.cropShiftPx = cropShiftPx
             // 对象 origin/angles 的 WE 关键帧动画(如头发/发饰随头摆动)。无 animation 时返回 nil(零影响)。
             // 无父链的层(头发0202/发饰 parent=None)关键帧值即绝对值;有父链时 update() 走父链变换。
-            layer.originKeyAnim = WEKeyframeAnimation.parse(obj["origin"])
+            layer.originKeyAnim = originKeyAnimation
             layer.angleKeyAnim = WEKeyframeAnimation.parse(obj["angles"])
             layer.scaleKeyAnim = WEKeyframeAnimation.parse(obj["scale"])
             layer.colorKeyAnim = WEKeyframeAnimation.parse(obj["color"])
@@ -2082,6 +2209,38 @@ struct SceneDocument {
             for i in postChainLayerCutoff..<layers.count { layers[i].abovePost = true }
         }
 
+        // ── 区域 composelayer 继承其命名目标的视差 ──────────────────────────────────────
+        // WE 工程常把贴在人物/物件上的音频可视化做成独立 composelayer，却不给该层重复写 parallaxDepth；
+        // 目标只保留在层名中（御剑 `音条-身体` → `身体`）。若不关联，我方人物随鼠标移动、遮罩和音频条
+        // 却钉在屏幕坐标，最终横穿并遮挡人物。只处理 regionFit + 零视差 + 完整名称 token 命中的层；
+        // 打雷(fullscreen compose)、已有显式视差的剑音条、无明确目标名的 UI 均不受影响。
+        if WPEnv.vars["WP_NO_COMPOSE_PARALLAX_LINK"] == nil {
+            for i in layers.indices where layers[i].frameBufferInput
+                && layers[i].regionFit
+                && layers[i].parallax == .zero {
+                let candidates = layers.indices.filter {
+                    $0 != i && !layers[$0].frameBufferInput && layers[$0].visible
+                        && layers[$0].parallax != .zero && !layers[$0].name.isEmpty
+                }
+                guard let targetName = WEComposeParallaxAssociation.referencedLayerName(
+                    composeName: layers[i].name,
+                    availableNames: candidates.map { layers[$0].name }
+                ) else { continue }
+                // 同名图层可能不止一个：优先场景对象顺序最近者，使局部组合保持在作者的同一分组附近。
+                guard let target = candidates
+                    .filter({ layers[$0].name == targetName })
+                    .min(by: {
+                        abs(layers[$0].sceneObjIndex - layers[i].sceneObjIndex)
+                            < abs(layers[$1].sceneObjIndex - layers[i].sceneObjIndex)
+                    }) else { continue }
+                layers[i].parallax = layers[target].parallax
+                layers[i].parallaxAnchorPx = layers[target].parallaxAnchorPx
+                layers[i].parallaxAnchorId = layers[target].parallaxAnchorId
+                layers[i].composeContentLayerId = layers[target].id
+                Log.write("scene: compose parallax link id=\(layers[i].id) \(layers[i].name) → id=\(layers[target].id) \(targetName) depth=\(layers[target].parallax)")
+            }
+        }
+
         // ── 同 parallaxDepth 组继承 cropoffset(剑音条跟刀)──────────────────────────────────
         // frameBufferInput 音频条(composelayer)自身无贴图、无 cropoffset。若它与某个已应用 cropoffset 的对象
         // **同一 parallaxDepth(同视觉平面)**,说明被设计贴在那个对象上(御剑:剑音条/670 与刀同深度 2.8/3.2)。
@@ -2120,6 +2279,7 @@ struct SceneDocument {
         )
         var doc = SceneDocument(canvasWidth: cw, canvasHeight: ch, clearColor: clear, layers: layers, emitters: emitters)
         doc.scriptLayerDefs = activeScriptLayerDefs
+        doc.scriptUserProperties = scriptUserProperties
         doc.ambientColor = VecParse.f3(general["ambientcolor"], default: .zero)   // lwe 默认 vec3(0);读 pkg 真值,不硬编码
         doc.timeStageConfig = timeStageConfig
         // ⭐互动:扫每个对象所有字段的 script 字符串,含 cursor 回调(cursorClick/cursorDown/cursorMove/cursorEnter)
@@ -2481,6 +2641,7 @@ struct SceneDocument {
     /// 把 effect.json 声明的 fbos[] 与各 pass 的 command/source/target/bind 抽出来建模,供 SceneRenderEngine
     /// 搭 FBO 链(渲染不在本任务)。effect.json 路径来自 obj.effects[].file。
     private static func parseProjectLayer(_ obj: [String: Any], imageRef: String, source: SceneSource,
+                                          canvas: SIMD2<Float>,
                                           absoluteOrigin: (Int) -> SIMD3<Float>,
                                           absoluteScale: (Int) -> SIMD3<Float>) -> ProjectLayerDesc {
         let objId = (obj["id"] as? NSNumber)?.intValue ?? -1
@@ -2494,7 +2655,8 @@ struct SceneDocument {
         pl.sizePx = size.count >= 2 ? SIMD2(size[0], size[1]) : nil
         pl.visible = Self.parseVisible(obj["visible"])
         // 转译特效链(若该层有真 shader 内容);与普通层一致用 keepWENamed。
-        pl.effects = Self.parseEffects(obj["effects"], keepWENamed: true, source: source)
+        pl.effects = Self.parseEffects(obj["effects"], keepWENamed: true, source: source,
+                                       canvas: canvas)
         // 读各 effect 的 effect.json,抽 fbos[] + passes 的 command/source/target/bind(EffectParser.cpp:47-114)。
         guard let effects = obj["effects"] as? [[String: Any]] else { return pl }
         for e in effects {
@@ -2619,10 +2781,11 @@ struct SceneDocument {
     /// —— 供后处理链(bloom/filmgrain/localcontrast 这类纯 WE 转译特效)解析。
     /// source(缺陷 3):传进后 resolveMask 能走多级 fallback(materials/<ref>.tex / <ref>.tex / 内置),
     /// 解开遮罩 .tex 不在 materials/<base>.tex 时被静默丢弃的 bug。为 nil 时退回旧单级解析(无 source 调用点)。
-    static func parseEffects(_ raw: Any?, keepWENamed: Bool = false, source: SceneSource? = nil) -> [LayerEffect] {
+    static func parseEffects(_ raw: Any?, keepWENamed: Bool = false, source: SceneSource? = nil,
+                             canvas: SIMD2<Float> = SIMD2(1920, 1080)) -> [LayerEffect] {
         guard let arr = raw as? [[String: Any]] else { return [] }
         var out: [LayerEffect] = []
-        for e in arr {
+        for (sceneEffectIndex, e) in arr.enumerated() {
             // effect 自身可见性(可被脚本属性包装 / 绑用户开关)。
             guard Self.effectVisible(e["visible"]) else {
                 Log.write("FXDIAG parse-drop visible-gate file=\((e["file"] as? String) ?? "?") visible=\(String(describing: e["visible"]).prefix(120))")
@@ -2745,17 +2908,30 @@ struct SceneDocument {
             // 淡入淡出包络=打雷)。packCSV 已把它 unwrap 成静态 value 当 fallback;这里额外存动画,每帧求值覆盖。
             var weAnim: [String: WEKeyframeAnimation] = [:]
             var weAnimPerPass: [[String: WEKeyframeAnimation]] = []
+            var weScriptsPerPass: [[String: WEScript]] = []
             for ps in passes {
                 var passAnimations: [String: WEKeyframeAnimation] = [:]
+                var passScripts: [String: WEScript] = [:]
                 if let cs = ps["constantshadervalues"] as? [String: Any] {
                     for (k, v) in cs {
                         if let anim = WEKeyframeAnimation.parse(v) {
                             passAnimations[k] = anim
                             weAnim[k] = anim
                         }
+                        if let binding = v as? [String: Any],
+                           let sourceText = binding["script"] as? String,
+                           let script = WEScript(
+                               script: sourceText,
+                               propertyOverrides: Self.resolveScriptProperties(binding["scriptproperties"]),
+                               tag: "fx:\(weName).\(k)",
+                               canvas: canvas
+                           ) {
+                            passScripts[k] = script
+                        }
                     }
                 }
                 weAnimPerPass.append(passAnimations)
+                weScriptsPerPass.append(passScripts)
             }
             // combo 取**全 pass 的并集**,不能只读 passes.first ——多 pass effect 的关键 combo 常落在
             // 后面的 pass 上。典型:blur 的 COMPOSITE(投影/辉光)由场景设在第 4 个 combine pass;只读
@@ -2797,9 +2973,11 @@ struct SceneDocument {
                                  weName: weName, weParams: weParams,
                                  weParamsPerPass: weParamsPerPass, weCombos: weCombos,
                                  weAux: weAux)
+            le.sceneEffectIndex = sceneEffectIndex
             le.weSceneCombos = weSceneCombos
             le.weAnim = weAnim
             le.weAnimPerPass = weAnimPerPass
+            le.weScriptsPerPass = weScriptsPerPass
             out.append(le)
         }
         return out
@@ -2897,7 +3075,8 @@ struct SceneDocument {
         // ANTIALIAS/CLIP_*)把条画到透明底图上;perspective(单应变换)用 4 角 point0-3 把条贴到场景梯形
         // (地板/水面)。两者均已转译进 manifest。keepWENamed=true 保留这些 kind==.none 的真 WE 特效
         // (否则被 `kind != .none` 门滤掉),且**保序**(Simple_Audio_Bars 先画、perspective 后扭)。
-        let fx = SceneDocument.parseEffects(obj["effects"], keepWENamed: true, source: source)
+        let fx = SceneDocument.parseEffects(obj["effects"], keepWENamed: true, source: source,
+                                            canvas: canvas)
         let parallaxState = objId >= 0 ? effectiveParallax(objId) : SceneParallaxState()
         var layer = LayerDesc(
             id: objId,

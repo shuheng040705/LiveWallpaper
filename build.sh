@@ -69,7 +69,29 @@ fi
 # 重定向到已注册的 /Applications/ 副本,所以只构建到开发目录会让用户一直跑旧版。除非 NO_DEPLOY=1。
 if [ "${NO_DEPLOY:-0}" != "1" ]; then
   echo "==> 部署到 /Applications/"
-  killall LiveWallpaper 2>/dev/null && sleep 1 || true
+  # 先让旧版正常退出，使 applicationWillTerminate 有机会关闭常驻 SteamCMD。
+  # 过去直接 killall 会把 App 杀掉、却把下载子进程留成 PPID=1 的孤儿；连续部署后多个
+  # SteamCMD 会争同一份 config/content_log，重新制造“点击后卡很久才下载”。
+  if pgrep -f "/Applications/LiveWallpaper.app/Contents/MacOS/LiveWallpaper" >/dev/null 2>&1; then
+    osascript -e 'tell application "LiveWallpaper" to quit' 2>/dev/null || true
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      pgrep -f "/Applications/LiveWallpaper.app/Contents/MacOS/LiveWallpaper" >/dev/null 2>&1 || break
+      sleep 0.3
+    done
+  fi
+  # 正常退出失败才强制结束 App。
+  killall LiveWallpaper 2>/dev/null || true
+  sleep 1
+  # 只清理由本应用专属 staging 参数标识出的遗留 worker，不碰用户其它 SteamCMD。
+  orphan_workers=$(ps -axo pid=,ppid=,command= | awk '
+    $2 == 1 &&
+    index($0, "com.a55555.livewallpaper/SteamWorkshop") &&
+    index($0, "/MacOS/steamcmd") { print $1 }
+  ')
+  for worker_pid in $orphan_workers; do
+    kill -TERM "$worker_pid" 2>/dev/null || true
+  done
+  [ -z "$orphan_workers" ] || sleep 1
   rm -rf /Applications/LiveWallpaper.app
   cp -R "$APP" /Applications/LiveWallpaper.app
   # ⭐防护:把当前 manifest+metal 强制再刷一遍进 /Applications(防止陈旧 manifest 残留 → 特效失效

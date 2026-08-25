@@ -31,7 +31,12 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
         // 升为常规 app,使窗口受台前调度/常规激活管理。
 
         if let window {
+            // 关闭过的 NSWindow 因 isReleasedWhenClosed=false 仍可能被控制器持有；它此前已从
+            // AppActivationPolicy 注销。再次 show() 必须重新登记，否则 app 仍是 .accessory，
+            // 台前调度不会把这个窗口当成可回到左侧栏的常规窗口。
+            AppActivationPolicy.windowOpened(window)
             rebuildContent()
+            if window.isMiniaturized { window.deminiaturize(nil) }
             window.makeKeyAndOrderFront(nil)
             NSApp.activate(ignoringOtherApps: true)
             return
@@ -48,6 +53,9 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
         w.titleVisibility = .hidden          // 自定义顶部标签栏托管导航,系统标题隐藏
         w.isReleasedWhenClosed = false
         w.isRestorable = false               // 不做窗口/状态恢复(避免重启残留旧 tab/面板状态)
+        // 明确加入系统窗口管理。通常 titled window 默认即 managed，但显式设置可避免应用从
+        // .accessory 切到 .regular 后仍沿用非管理窗口语义，保证 Mission Control/台前调度接管。
+        w.collectionBehavior.insert(.managed)
         w.appearance = NSAppearance(named: .darkAqua)   // 仿 WaifuX:整窗深色玻璃
         w.delegate = self
         AppActivationPolicy.windowOpened(w)   // 统一管理 Dock/Cmd-Tab 可见性
@@ -85,6 +93,14 @@ final class LibraryWindowController: NSObject, NSWindowDelegate {
         RenderedPreviewCache.shared.setWindowVisible(false)
         // 仅当再无其它常规窗口(设置/下载/订阅)时才降回菜单栏代理,见 AppActivationPolicy。
         if let w = notification.object as? NSWindow { AppActivationPolicy.windowClosed(w) }
+        // 下次打开创建全新的受管理窗口，杜绝已关闭窗口以 .accessory 身份“复活”。
+        window = nil
+    }
+
+    /// 窗口被系统/台前调度重新激活时自愈登记状态。windowOpened 是幂等的，不会重复计数。
+    func windowDidBecomeKey(_ notification: Notification) {
+        if let w = notification.object as? NSWindow { AppActivationPolicy.windowOpened(w) }
+        RenderedPreviewCache.shared.setWindowVisible(true)
     }
 
     /// 最小化:库不可见 → 停壁纸预览渲染(还原时再开)。

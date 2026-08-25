@@ -92,9 +92,21 @@ struct DownloadRow: View {
 
     private func rightText(elapsed: TimeInterval) -> String {
         switch job.state {
-        case .queued: return "排队中"
-        case .connecting: return "连接 Steam…"
+        case .queued: return job.phase == .subscribing ? "正在同步 Steam 订阅…" : "排队中"
+        case .connecting:
+            switch job.phase {
+            case .queued: return "排队中"
+            case .subscribing: return "正在同步 Steam 订阅…"
+            case .waitingForSteamClient: return "等待 Steam 客户端接管…"
+            case .steamClientDownloading: return "Steam 客户端正在下载…"
+            case .startingDownloader: return "启动 Steam 下载服务…"
+            case .authenticating: return "登录 Steam…"
+            case .preparing: return "获取清单与 CDN…"
+            case .transferring: return "准备传输…"
+            case .installing: return "正在安装到壁纸库…"
+            }
         case .downloading:
+            if job.phase == .installing { return "正在安装到壁纸库…" }
             // 有真实采样:百分比 + 已下载/总大小 + 实时速度(都是真实值,不编)。
             if let f = job.fraction {
                 if job.liveSpeedMBps > 0.05 {

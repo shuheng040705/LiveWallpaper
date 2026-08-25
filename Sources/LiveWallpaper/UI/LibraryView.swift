@@ -7,6 +7,14 @@ struct LibraryView: View {
     var currentID: String?
     var actions: LibraryActions
 
+    init(library: WallpaperLibrary, currentID: String?, actions: LibraryActions) {
+        self.library = library
+        self.currentID = currentID
+        self.actions = actions
+        // libraryWindow 在扫描完成后才构造视图；预览模式可在第一帧直接带出侧栏，避免截图时序竞争。
+        _settingsItem = State(initialValue: WPEnv.vars["WP_PREVIEW_PANEL"] != nil ? library.items.first : nil)
+    }
+
     /// 首页「创意工坊热门」在线货架数据源(浏览/推荐 Steam 工坊壁纸)。
     @ObservedObject private var workshopFeed = WorkshopFeed.shared
 
@@ -139,6 +147,12 @@ struct LibraryView: View {
             // 截图验证用:WP_PREVIEW_SETTINGS 时自动打开设置窗口。
             if showSettings { NotificationCenter.default.post(name: .showSettings, object: nil); showSettings = false }
         }
+        // UI 截图模式下库扫描可能晚于 onAppear 完成；首项出现时再打开一次侧栏，避免预览图漏掉面板。
+        .onChange(of: filtered.first?.id) { _ in
+            if WPEnv.vars["WP_PREVIEW_PANEL"] != nil, settingsItem == nil {
+                settingsItem = filtered.first
+            }
+        }
     }
 
     /// 内容 + 右侧壁纸检视面板**并排**(面板不覆盖内容;选中壁纸时内容区自动变窄、网格重排)。
@@ -152,12 +166,12 @@ struct LibraryView: View {
                     item: item,
                     onApply: { actions.onApplySettings(item) },
                     onClose: { withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil } },
-                    onUnsubscribe: item.id.allSatisfy(\.isNumber) ? {
+                    onUnsubscribe: WallpaperUninstallPolicy.isSteamWorkshopID(item.id) ? {
                         actions.onUnsubscribe(item); favVersion += 1
                         withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil }
                     } : nil
                 )
-                .frame(width: 340)
+                .frame(width: 382)
                 .transition(.move(edge: .trailing))
             }
         }
@@ -447,7 +461,9 @@ struct LibraryView: View {
     }
 
     private func workshopInLibrary(_ id: String) -> Bool {
-        library.items.contains { $0.id == id }
+        library.items.contains { $0.id == id } || LocalWallpaperProbe.isReady(
+            at: PreferencesStore.shared.libraryRoot.appendingPathComponent(id, isDirectory: true)
+        )
     }
 
     /// 点击工坊推荐卡片/hero:**直接在 app 内订阅 + 下载**该壁纸到本地库(不再跳转创意工坊网页 tab)。
@@ -460,17 +476,17 @@ struct LibraryView: View {
     private func startWorkshopDownload(_ item: WorkshopFeed.Item) {
         // 已在库:无需下载,点击不跳转(保持在首页)。
         if workshopInLibrary(item.id) { return }
-        guard WorkshopDownloader.shared.isSteamCMDAvailable else {
+        guard WorkshopDownloader.shared.isAnyDownloadBackendAvailable else {
             let alert = NSAlert()
-            alert.messageText = "未检测到 SteamCMD"
-            alert.informativeText = "直接下载创意工坊壁纸需要 SteamCMD。请在终端运行:\nbrew install --cask steamcmd\n安装后重试。"
+            alert.messageText = "没有可用的 Steam 下载后端"
+            alert.informativeText = "请先运行当前壁纸库对应的 CrossOver Steam，或在终端安装 SteamCMD：\nbrew install --cask steamcmd"
             alert.alertStyle = .warning
             alert.addButton(withTitle: "好")
             alert.runModal()
             return
         }
         // 立即入队并开始下载(尺寸只用于进度估算,这里拿不到精确大小传 0,不影响下载与块进度)。
-        WorkshopDownloader.shared.enqueue(id: item.id, title: item.title)
+        WorkshopAcquisition.start(id: item.id, title: item.title)
     }
 
     // MARK: - 壁纸库(问候语 + 大标题 + 胶囊筛选 + 网格)
@@ -650,16 +666,24 @@ struct LibraryView: View {
         }
         Button { NSWorkspace.shared.activateFileViewerSelecting([item.folderURL]) } label: { Label("在访达中显示", systemImage: "folder") }
         Divider()
-        Button(role: .destructive) { confirmDelete(item) } label: { Label("删除壁纸", systemImage: "trash") }
-    }
-
-    private func confirmDelete(_ item: WallpaperItem) {
-        let alert = NSAlert()
-        alert.messageText = "删除壁纸「\(item.title)」?"
-        alert.informativeText = "壁纸文件夹会被移到废纸篓,可在废纸篓里恢复。"
-        alert.alertStyle = .warning
-        alert.addButton(withTitle: "删除"); alert.addButton(withTitle: "取消")
-        if alert.runModal() == .alertFirstButtonReturn { actions.onDelete(item); favVersion += 1 }
+        if WallpaperUninstallPolicy.isSteamWorkshopID(item.id) {
+            Button(role: .destructive) {
+                // 删除动作不再弹确认框；右键即执行。Steam 工坊项目仍由 onUnsubscribe
+                // 先同步退订，成功后再清理本地文件，失败时保留本地壁纸。
+                actions.onUnsubscribe(item)
+                favVersion += 1
+            } label: {
+                Label("卸载（同时同步订阅）", systemImage: "trash")
+            }
+        } else {
+            Button(role: .destructive) {
+                // 本地壁纸右键直接移入废纸篓，不再打断操作询问。
+                actions.onDelete(item)
+                favVersion += 1
+            } label: {
+                Label("卸载本地壁纸", systemImage: "trash")
+            }
+        }
     }
 
     private var emptyState: some View {
@@ -911,7 +935,9 @@ struct WorkshopHero: View {
         } else if let job, WorkshopDownloader.isActive(job.state) {
             HStack(spacing: 8) {
                 ProgressView().controlSize(.small).scaleEffect(0.8).tint(.white)
-                Text(job.fraction.map { String(format: "下载中 %d%%", Int($0 * 100)) } ?? "下载中…")
+                Text(job.state == .downloading && job.phase != .installing
+                     ? "下载 \(job.compactStatus)"
+                     : job.compactStatus)
                     .font(.system(size: 13, weight: .semibold).monospacedDigit()).foregroundStyle(.white)
             }
             .padding(.horizontal, 18).padding(.vertical, 10)
@@ -925,8 +951,10 @@ struct WorkshopHero: View {
                 heroPill("下载", icon: "arrow.down.circle.fill", bg: AnyShapeStyle(Color.accentColor))
             }
             .buttonStyle(.plain)
-            .disabled(!downloader.isSteamCMDAvailable)
-            .help(downloader.isSteamCMDAvailable ? "直接下载到壁纸库" : "未安装 SteamCMD")
+            .disabled(!downloader.isAnyDownloadBackendAvailable)
+            .help(downloader.isAnyDownloadBackendAvailable
+                  ? "优先使用 Steam 客户端，必要时回退 SteamCMD"
+                  : "未运行对应 Steam 客户端，且未安装 SteamCMD")
         }
     }
 
@@ -1137,8 +1165,8 @@ struct WorkshopCard: View {
                 if isDownloading {
                     VStack(spacing: 4) {
                         ProgressView().controlSize(.small).tint(.white)
-                        if let f = job?.fraction {
-                            Text(String(format: "%d%%", Int(f * 100)))
+                        if let job {
+                            Text(job.compactStatus)
                                 .font(.system(size: 11, weight: .bold).monospacedDigit()).foregroundStyle(.white)
                         }
                     }
@@ -1202,7 +1230,7 @@ struct WorkshopCard: View {
         if inLibrary {
             badge("已在库", icon: "checkmark", color: .green)
         } else if isDownloading {
-            badge(job?.fraction.map { String(format: "%d%%", Int($0 * 100)) } ?? "下载中", icon: "arrow.down", color: .accentColor)
+            badge(job?.compactStatus ?? "下载中", icon: "arrow.down", color: .accentColor)
         } else if failedReason != nil {
             badge("失败", icon: "exclamationmark", color: .red)
         }
@@ -1220,9 +1248,11 @@ struct WorkshopCard: View {
 
     private var helpText: String {
         if inLibrary { return "已在壁纸库中" }
-        if isDownloading { return "下载中…" }
+        if isDownloading { return job?.compactStatus ?? "下载中…" }
         if let r = failedReason { return "下载失败:\(r)(点击重试)" }
-        return downloader.isSteamCMDAvailable ? "点击直接下载到壁纸库" : "未安装 SteamCMD,无法下载"
+        return downloader.isAnyDownloadBackendAvailable
+            ? "点击订阅并下载到壁纸库"
+            : "未运行对应 Steam 客户端，且未安装 SteamCMD"
     }
 }
 

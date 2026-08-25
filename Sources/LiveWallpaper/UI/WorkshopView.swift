@@ -24,7 +24,9 @@ struct WorkshopView: View {
 
     private var alreadyInLibrary: Bool {
         guard let id = currentItemID else { return false }
-        return FileManager.default.fileExists(atPath: PreferencesStore.shared.libraryRoot.appendingPathComponent(id).path)
+        return LocalWallpaperProbe.isReady(
+            at: PreferencesStore.shared.libraryRoot.appendingPathComponent(id, isDirectory: true)
+        )
     }
 
     var body: some View {
@@ -84,14 +86,15 @@ struct WorkshopView: View {
 
     @ViewBuilder
     private func downloadButton(id: String) -> some View {
-        let downloading = downloader.jobs.contains { $0.id == id && ($0.state == .downloading || $0.state == .connecting || $0.state == .queued) }
+        let job = downloader.jobs.first { $0.id == id }
+        let downloading = job.map { WorkshopDownloader.isActive($0.state) } ?? false
         if alreadyInLibrary {
             label("已在库中", "checkmark.circle.fill", .green, disabled: true)
         } else if downloading {
             let frac = downloader.jobs.first { $0.id == id }?.fraction
             HStack(spacing: 5) {
                 ProgressView().controlSize(.small).scaleEffect(0.7)
-                Text(frac.map { String(format: "%d%%", Int($0 * 100)) } ?? "下载中")
+                Text(frac.map { String(format: "%d%%", Int($0 * 100)) } ?? job?.compactStatus ?? "下载中")
                     .font(.system(size: 12, weight: .medium).monospacedDigit())
             }
             .padding(.horizontal, 12).padding(.vertical, 7)
@@ -101,14 +104,16 @@ struct WorkshopView: View {
                 let title = web.pageTitle.isEmpty ? id : web.pageTitle
                 // 立即入队并开始下载(不等网页抓尺寸——尺寸只用于进度估算,异步补即可)。
                 // 之前先 fetchFileSize 再 enqueue,网页抓取耗时全算进「准备」,用户误以为卡住。
-                downloader.enqueue(id: id, title: title)
+                WorkshopAcquisition.start(id: id, title: title)
                 web.fetchFileSize { bytes in downloader.updateSize(id: id, bytes: bytes) }
             } label: {
                 label("下载", "arrow.down.circle.fill", accent, filled: true)
             }
             .buttonStyle(.plain)
-            .disabled(!downloader.isSteamCMDAvailable)
-            .help(downloader.isSteamCMDAvailable ? "用 SteamCMD 下载到壁纸库" : "未安装 SteamCMD")
+            .disabled(!downloader.isAnyDownloadBackendAvailable)
+            .help(downloader.isAnyDownloadBackendAvailable
+                  ? "优先使用当前 Steam 客户端，未接管时自动回退 SteamCMD"
+                  : "未运行对应 Steam 客户端，且未安装 SteamCMD")
         }
     }
 
@@ -126,11 +131,13 @@ struct WorkshopView: View {
 
     private var infoBar: some View {
         HStack(spacing: 6) {
-            Image(systemName: downloader.isSteamCMDAvailable ? "info.circle.fill" : "exclamationmark.triangle.fill")
-                .font(.system(size: 10)).foregroundStyle(downloader.isSteamCMDAvailable ? .blue : .orange)
-            Text(downloader.isSteamCMDAvailable
-                 ? "进入壁纸详情页点「下载」即可直接下到壁纸库(可同时下多个,无需 Steam 客户端)"
-                 : "未检测到 SteamCMD,无法直接下载。终端运行:brew install --cask steamcmd")
+            Image(systemName: downloader.isAnyDownloadBackendAvailable ? "info.circle.fill" : "exclamationmark.triangle.fill")
+                .font(.system(size: 10)).foregroundStyle(downloader.isAnyDownloadBackendAvailable ? .blue : .orange)
+            Text(downloader.isCrossOverSteamAvailable
+                 ? "下载会先交给当前 CrossOver Steam；20 秒未接管时自动回退 SteamCMD"
+                 : (downloader.isSteamCMDAvailable
+                    ? "当前 Steam 客户端未运行，使用已预热的 SteamCMD 直接下载"
+                    : "请运行对应 CrossOver Steam，或安装 SteamCMD：brew install --cask steamcmd"))
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             Spacer()
         }
@@ -165,7 +172,7 @@ struct WorkshopView: View {
 
 /// 持有一个**长期存活**的 WKWebView 并观察其状态。单例 + 持久实例:切换分类导致
 /// WorkshopView 重建时,复用同一个 WebController/WKWebView → 保留浏览位置(不每次回首页)。
-final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler {
+final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKScriptMessageHandler, WKUIDelegate {
     static let shared = WebController()
 
     /// 注入页面的 JS:拦截「订阅」的网络请求(/sharedfiles/subscribe)本身,从 body 取 workshop id
@@ -200,23 +207,55 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
       // 端点:WebAPI(主页/浏览,protobuf)+ 社区(详情页,明文 id)。订阅 vs 取消订阅分别处理。
       function isUnsub(u){ u = u || ''; return /IPublishedFileService\\/Unsubscribe/i.test(u) || /\\/sharedfiles\\/unsubscribe/i.test(u); }
       function isSub(u){ u = u || ''; return (/IPublishedFileService\\/Subscribe/i.test(u) || /\\/sharedfiles\\/subscribe/i.test(u)) && !isUnsub(u); }
-      function handle(url, body){
+      function eventFor(url, body){
         url = url || '';
         var unsub = isUnsub(url) || isUnsub(body);
         var sub = !unsub && (isSub(url) || isSub(body));
-        if (!unsub && !sub) return;
+        if (!unsub && !sub) return null;
         var s = body + '&' + url;
         var m = s.match(/(?:^|&|\\?)(?:id|publishedfileid)=(\\d+)/i);
         var id = m ? m[1] : null;
         if (!id){ var p = s.match(/input_protobuf_encoded=([^&\\s]+)/); if (p) id = idFromProto(p[1]); }
-        if (!id) return;
-        send(unsub ? 'wpUnsubscribe' : 'wpSubscribe', id);   // 取消订阅→删本地;订阅→下载
+        return id ? { name: unsub ? 'wpUnsubscribe' : 'wpSubscribe', id: id } : null;
+      }
+      function sendEvent(e){ if (e) send(e.name, e.id); }
+      function httpOK(status){ return status >= 200 && status < 300; }
+      function responseSaysSuccess(text){
+        if (!text) return true;
+        try {
+          var j = JSON.parse(text);
+          if (typeof j.success === 'number') return j.success === 1;
+          if (typeof j.success === 'boolean') return j.success;
+        } catch(_){}
+        return true;
       }
       var O = XMLHttpRequest.prototype.open, S = XMLHttpRequest.prototype.send;
       XMLHttpRequest.prototype.open = function(m, u){ this.__wu = u; return O.apply(this, arguments); };
-      XMLHttpRequest.prototype.send = function(b){ try { handle(this.__wu, bodyStr(b)); } catch(_){} return S.apply(this, arguments); };
-      if (window.fetch){ var F = window.fetch; window.fetch = function(i, init){ try { var u=(typeof i==='string')?i:(i&&i.url)||''; handle(u, bodyStr(init&&init.body)); } catch(_){} return F.apply(this, arguments); }; }
-      if (navigator.sendBeacon){ var B = navigator.sendBeacon.bind(navigator); navigator.sendBeacon = function(u, d){ try { handle(u, bodyStr(d)); } catch(_){} return B(u, d); }; }
+      XMLHttpRequest.prototype.send = function(b){
+        var e = null; try { e = eventFor(this.__wu, bodyStr(b)); } catch(_){}
+        if (e) this.addEventListener('load', function(){ if (httpOK(this.status) && responseSaysSuccess(this.responseText)) sendEvent(e); }, { once:true });
+        return S.apply(this, arguments);
+      };
+      if (window.fetch){
+        var F = window.fetch;
+        window.fetch = function(i, init){
+          var e = null; try { var u=(typeof i==='string')?i:(i&&i.url)||''; e=eventFor(u, bodyStr(init&&init.body)); } catch(_){}
+          return F.apply(this, arguments).then(function(r){
+            if (e && r && r.ok) {
+              try { r.clone().text().then(function(t){ if (responseSaysSuccess(t)) sendEvent(e); }); }
+              catch(_) { sendEvent(e); }
+            }
+            return r;
+          });
+        };
+      }
+      if (navigator.sendBeacon){
+        var B = navigator.sendBeacon.bind(navigator);
+        navigator.sendBeacon = function(u, d){
+          var e = null; try { e=eventFor(u, bodyStr(d)); } catch(_){}
+          var accepted = B(u, d); if (accepted) sendEvent(e); return accepted;
+        };
+      }
     })();
     """
 
@@ -234,6 +273,7 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
         let cfg = WKWebViewConfiguration()
         cfg.websiteDataStore = .default()   // 保留 Steam 登录态
         let ucc = WKUserContentController()
+        WebMediaCapturePolicy.install(into: ucc)
         ucc.addUserScript(WKUserScript(source: Self.subscribeHookJS, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         cfg.userContentController = ucc
         wkWebView = WKWebView(frame: .zero, configuration: cfg)
@@ -242,6 +282,7 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
         ucc.add(self, name: "wpUnsubscribe")   // 网页取消订阅 → 同步删除本地壁纸
         ucc.add(self, name: "wpDebug")         // 诊断(保留,正式版 JS 不再发)
         wkWebView.navigationDelegate = self
+        wkWebView.uiDelegate = self
         wkWebView.customUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
     }
 
@@ -279,16 +320,23 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
         }
         guard message.name == "wpSubscribe" else { return }
         let dest = PreferencesStore.shared.libraryRoot.appendingPathComponent(id)
-        if FileManager.default.fileExists(atPath: dest.path) {   // 已在库,不重复下
+        if LocalWallpaperProbe.isReady(at: dest) {   // 已在库,不重复下
             Log.write("Subscribe→download: \(id) 已在库,跳过"); return
         }
         Log.write("Subscribe→download: 捕获订阅 \(id),加入下载队列")
         let onDetail = currentURL?.absoluteString.contains("id=\(id)") ?? false
         if onDetail {
             let title = pageTitle.isEmpty ? id : pageTitle
-            fetchFileSize { bytes in WorkshopDownloader.shared.enqueue(id: id, title: title, sizeBytes: bytes) }
+            // 先立即入队给用户反馈，文件大小只作为进度估算异步补充，绝不能阻塞下载开始。
+            WorkshopAcquisition.start(id: id, title: title, subscriptionConfirmed: true)
+            fetchFileSize { bytes in WorkshopDownloader.shared.updateSize(id: id, bytes: bytes) }
         } else {
-            WorkshopDownloader.shared.enqueue(id: id, title: "创意工坊 #\(id)", sizeBytes: 0)
+            WorkshopAcquisition.start(
+                id: id,
+                title: "创意工坊 #\(id)",
+                sizeBytes: 0,
+                subscriptionConfirmed: true
+            )
         }
     }
 
@@ -335,8 +383,21 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
     }
 
     // MARK: - WKNavigationDelegate
+    @available(macOS 12.0, *)
+    func webView(_ webView: WKWebView,
+                 requestMediaCapturePermissionFor origin: WKSecurityOrigin,
+                 initiatedByFrame frame: WKFrameInfo,
+                 type: WKMediaCaptureType,
+                 decisionHandler: @escaping (WKPermissionDecision) -> Void) {
+        Log.write("WorkshopView: denied camera/microphone request (host=\(origin.host), type=\(type.rawValue))")
+        decisionHandler(.deny)
+    }
+
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { sync(loading: true) }
-    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) { sync(loading: false) }
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        sync(loading: false)
+        SteamWebSession.shared.refresh()
+    }
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { sync(loading: false) }
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { sync(loading: false) }
 

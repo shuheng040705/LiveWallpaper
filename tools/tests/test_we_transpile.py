@@ -10,6 +10,26 @@ import we_transpile
 
 
 class HLSLCompatibilityTests(unittest.TestCase):
+    def test_legacy_packed_audio_register_access_is_flattened(self):
+        source = """
+uniform float g_AudioSpectrum64Left[64];
+float volume(float barID) {
+    return g_AudioSpectrum64Left[barID / 4][barID % 4];
+}
+"""
+
+        converted = we_transpile.rename_reserved(source)
+
+        self.assertIn("g_AudioSpectrum64Left[int(barID)]", converted)
+        self.assertNotIn("[barID / 4][barID % 4]", converted)
+
+    def test_mismatched_packed_audio_register_indices_are_not_rewritten(self):
+        source = "return g_AudioSpectrum64Left[a / 4][b % 4];"
+
+        converted = we_transpile.rename_reserved(source)
+
+        self.assertEqual(source, converted)
+
     def test_scalar_literals_in_multi_vector_declaration_are_broadcast(self):
         source = """
 void compute() {
@@ -100,6 +120,21 @@ vec3 vibrance(vec3 color, float luma) {
 
         self.assertIn("return mix(vec3(luma), color, weight);", converted)
 
+    def test_mix_truncates_vec4_to_vec3_operand_width(self):
+        source = """
+uniform vec3 tint;
+vec3 render() {
+    vec4 color = vec4(0.0);
+    color = vec4(mix(tint, color, weight), 1.0);
+    return color;
+}
+"""
+
+        converted = we_transpile.rename_reserved(source)
+
+        self.assertIn("mix(tint, color.rgb, weight)", converted)
+        self.assertIn("return color.rgb;", converted)
+
     def test_float_truncation_does_not_rewrite_same_named_vec2_declaration(self):
         source = """
 float roundedBox(vec2 p) {
@@ -116,6 +151,19 @@ void main() {
 
         self.assertIn("vec2 d = abs(p) - vec2(0.5);", converted)
         self.assertNotIn("vec2 d = (abs(p) - vec2(0.5)).x;", converted)
+
+    def test_float_returning_function_with_vec2_argument_is_not_swizzled(self):
+        source = """
+float sdRect(vec2 p, vec2 offset) { return length(p - offset); }
+void main() {
+    float distance = sdRect(uv, vec2(0.5));
+}
+"""
+
+        converted = we_transpile.rename_reserved(source)
+
+        self.assertIn("float distance = sdRect(uv, vec2(0.5));", converted)
+        self.assertNotIn("sdRect(uv, vec2(0.5))).x", converted)
 
 
 if __name__ == "__main__":

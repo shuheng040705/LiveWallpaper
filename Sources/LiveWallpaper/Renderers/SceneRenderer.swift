@@ -317,6 +317,9 @@ final class SceneRenderer: WallpaperRenderer {
         // 审计修复 #1:engine.load 会重建 layers/particleGroups,与后台 frameTick 竞争 → 持锁。
         //（在 frameQueue 上跑时本就互斥,持锁仍保留:同步 load 路径仍可能来自主线程。)
         renderLock.lock()
+        // 先把当前壁纸的音频许可推入引擎，再解析场景。否则含音频条的场景会在 load 中先启动
+        // 系统音频捕获，直到 load 完成后 applyGeneralProps 才关闭，启动 App 时仍会短暂占用媒体设备。
+        applyGeneralProps()
         engine.load(document: doc, source: source)
         renderLock.unlock()
         // 3D 透视场景(太阳系/土星)走 3D 模型路径,故意清空 2D layers——此时 layerCount=0 但**不是**加载失败,
@@ -338,7 +341,12 @@ final class SceneRenderer: WallpaperRenderer {
         let g = GeneralWallpaperSettings.shared
         engine.setGeneralProps(audioListen: g.audioListen(item.id),
                                flip: g.flip(item.id),
-                               filter: g.filter(item.id).rawValue)
+                               filter: g.filter(item.id).rawValue,
+                               scaleMode: g.effectiveScaleMode(item.id),
+                               position: g.position(item.id),
+                               brightness: g.brightness(item.id),
+                               contrast: g.contrast(item.id),
+                               saturation: g.saturation(item.id))
         // 音量:WE 是 per-wallpaper(0–100)。叠加全局静音/音量上限作整体乘子,喂壁纸自带 BGM 播放。
         engine.setAudioVolume(PreferencesStore.shared.volume * g.volume(item.id) / 100.0)
     }
@@ -354,6 +362,7 @@ final class SceneRenderer: WallpaperRenderer {
         paused = true                      // 让 frameTick 在换文档期间空转
         // 审计修复 #1:换文档(重建 engine 状态)必须与后台 frameTick 互斥 → 持锁包住整段。
         renderLock.lock()
+        applyGeneralProps()
         engine.load(document: doc, source: source)
         renderLock.unlock()
         paused = wasPaused
@@ -512,14 +521,11 @@ final class SceneRenderer: WallpaperRenderer {
         let (mouseViewport, mainDisplayHeight) = mouseViewportSnapshot()
         let mouse = WEMouseViewportMath.appKitPoint(fromQuartz: cgLoc,
                                                     mainDisplayHeight: mainDisplayHeight)
-        var mn = SIMD2<Float>(0, 0)
-        // WE「属性」通用区·鼠标视差总闸:用户在该壁纸关掉「鼠标视差」→ 喂引擎归中光标(mn=0),
-        //   引擎的鼠标驱动视差/交互(cameraparallax + xray/depthparallax)随之平滑归中、停止跟随。
-        //   默认开 → 走真实光标 → 现状行为零回归。这是全引擎统一的鼠标输入入口,无需改 SceneRenderEngine。
+        // 真实交互光标必须始终进入引擎：X-Ray/cursorripple/鼠标粒子并不要求
+        // scene.general.cameraparallax。旧代码在无相机视差的壁纸上把它清零，导致 X-Ray 永远钉在中心。
+        let mn = WEMouseViewportMath.normalized(point: mouse, viewport: mouseViewport)
+        // 通用区「鼠标视差」只控制 camera parallax 通道；材质/粒子交互仍使用上面的真实 mn。
         let mouseParallaxOn = GeneralWallpaperSettings.shared.mouseParallax(loadedItem?.id ?? "")
-        if mouseParallaxOn {
-            mn = WEMouseViewportMath.normalized(point: mouse, viewport: mouseViewport)
-        }
 
         // 审计修复 #1:整段 update+render 持锁,防止主线程在此期间重建/释放 engine 状态(数据竞争)。
         // 锁内只做 GPU 命令编码(nextDrawable 可能阻塞但不回主线程同步等待),不会与主线程死锁。
@@ -530,7 +536,7 @@ final class SceneRenderer: WallpaperRenderer {
         //   loaded=false/metalLayer=nil(正在拆除),本帧不应再用 stale 的 layer 渲染(nextDrawable 可能阻塞/失败)。
         //   锁内重校验当前状态,已拆除则立刻放锁退出。
         guard loaded, metalLayer != nil else { renderLock.unlock(); return }
-        engine.update(time: t, mouseNorm: mn)
+        engine.update(time: t, mouseNorm: mn, cameraParallaxEnabled: mouseParallaxOn)
         let _tU = _flog ? CACurrentMediaTime() : 0
         // 按需渲染:无连续动画内容、视差已收敛且鼠标未动 → 画面与上帧一致,跳过渲染(空闲 CPU/GPU 趋近 0)。
         guard engine.frameDidChange else { renderLock.unlock(); return }

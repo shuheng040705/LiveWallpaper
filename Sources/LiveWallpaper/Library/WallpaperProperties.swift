@@ -55,6 +55,39 @@ final class WallpaperPropertyStore: ObservableObject {
     static let shared = WallpaperPropertyStore()
     private let d = UserDefaults.standard
 
+    /// 预设 JSON 中的跨类型值。显式保存类型，避免 Bool/NSNumber 在 Codable 与 UserDefaults 间混淆。
+    struct PresetValue: Codable, Equatable {
+        enum Kind: String, Codable { case color, bool, number, string }
+        var kind: Kind
+        var color: [Float]? = nil
+        var bool: Bool? = nil
+        var number: Double? = nil
+        var string: String? = nil
+
+        init(_ value: WallpaperProperty.Value) {
+            switch value {
+            case .color(let c): kind = .color; color = [c.x, c.y, c.z]
+            case .bool(let b): kind = .bool; bool = b
+            case .number(let n): kind = .number; number = n
+            case .string(let s): kind = .string; string = s
+            }
+        }
+
+        var value: WallpaperProperty.Value? {
+            switch kind {
+            case .color:
+                guard let c = color, c.count >= 3 else { return nil }
+                return .color(SIMD3(c[0], c[1], c[2]))
+            case .bool:
+                return bool.map(WallpaperProperty.Value.bool)
+            case .number:
+                return number.map(WallpaperProperty.Value.number)
+            case .string:
+                return string.map(WallpaperProperty.Value.string)
+            }
+        }
+    }
+
     // project.json 的 general.properties 解析缓存(按 path)。loadOverrides 现在给每个属性都求值
     // (条件层显隐需要属性默认),一个场景 123 个属性逐个 rawDefault 会把 project.json 重复解析上百遍;
     // reloadInPlace 又频繁触发 → 缓存一次解析。project.json 一个会话内不变,失效无需考虑。
@@ -362,6 +395,26 @@ final class WallpaperPropertyStore: ObservableObject {
         case .string(let s): d.set(s, forKey: key)
         }
         objectWillChange.send()   // 通知设置面板重算重读(色块/值即时刷新)
+    }
+
+    /// 捕获当前所有可交互自定义属性（含未改动的 pkg 默认值），用于保存一个可完整复现的 WE 风格预设。
+    func presetSnapshot(forID id: String, folderURL: URL) -> [String: PresetValue] {
+        var result: [String: PresetValue] = [:]
+        for property in properties(forID: id, folderURL: folderURL) where property.type != .label {
+            result[property.id] = PresetValue(value(forID: id, property: property, folderURL: folderURL))
+        }
+        return result
+    }
+
+    /// 应用预设中仍存在于当前 project.json 的属性。壁纸更新后被作者移除的旧 key 会被安全忽略。
+    func applyPreset(_ snapshot: [String: PresetValue], forID id: String, folderURL: URL) {
+        let valid = Set(properties(forID: id, folderURL: folderURL).map(\.id))
+        for (propertyKey, stored) in snapshot where valid.contains(propertyKey) {
+            if let value = stored.value {
+                setValue(value, forID: id, propertyKey: propertyKey)
+            }
+        }
+        objectWillChange.send()
     }
 
     /// 求值属性的显示条件(如 "clock.value == true" / "tuowei.value == false")。

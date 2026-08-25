@@ -10,6 +10,8 @@ struct SettingsForm: View {
     @State private var showSteamLogin = false
     @State private var steamAccount = PreferencesStore.shared.steamAccount
     @State private var subscribedSummary = "检测你账号订阅的全部工坊壁纸,可批量下载"
+    @ObservedObject private var downloader = WorkshopDownloader.shared
+    @ObservedObject private var steamWebSession = SteamWebSession.shared
 
     var body: some View {
         Form {
@@ -28,7 +30,10 @@ struct SettingsForm: View {
         .sheet(isPresented: $showSteamLogin) {
             SteamLoginSheet(onDone: { steamAccount = PreferencesStore.shared.steamAccount })
         }
-        .task { subscribedSummary = await SteamSubscriptions.summaryLine() }
+        .task {
+            steamWebSession.refresh()
+            subscribedSummary = await SteamSubscriptions.summaryLine()
+        }
     }
 
     // MARK: - 通用行辅助(标题 + 可选副标题 + 右侧控件)
@@ -293,7 +298,7 @@ struct SettingsForm: View {
 
     private var soundSection: some View {
         Section("声音") {
-            toggleRow("音频反应", "音频条/律动随系统音乐起伏(需采集系统音频)。CPU 偏高时可关,音频壁纸将不再随声音变化", $audioReactive) {
+            toggleRow("音频反应总开关", "允许已单独开启“音频响应”的壁纸采集系统播放声音；不会使用摄像头或麦克风", $audioReactive) {
                 PreferencesStore.shared.audioReactiveEnabled = $0
                 actions.onAssetsPathChanged()   // 重载壁纸:开→重新采集,关→停采集(replayd/coreaudiod 闲置)
             }
@@ -355,9 +360,25 @@ struct SettingsForm: View {
                 Image(systemName: WorkshopDownloader.shared.isSteamCMDAvailable ? "checkmark.circle.fill" : "xmark.circle.fill")
                     .foregroundStyle(WorkshopDownloader.shared.isSteamCMDAvailable ? .green : .orange)
             }
-            row("Steam 账号",
-                steamAccount == nil ? "匿名只能下老壁纸;登录后可下新壁纸" : "已登录:\(steamAccount!)") {
+            row("SteamCMD 下载账号",
+                steamDownloadStatus) {
                 Button(steamAccount == nil ? "登录" : "重新登录") { showSteamLogin = true }
+            }
+            row("Steam 网页订阅授权",
+                steamWebSession.isAuthenticated
+                    ? "已授权并安全保存到 macOS 钥匙串；Steam 未吊销前可长期使用"
+                    : "未授权；与 SteamCMD 下载登录相互独立") {
+                if steamWebSession.isChecking {
+                    ProgressView().controlSize(.small)
+                } else if steamWebSession.isAuthenticated {
+                    Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                } else {
+                    Button("授权…") {
+                        SteamWebLoginWindowController.shared.authorize { _ in
+                            steamWebSession.refresh()
+                        }
+                    }
+                }
             }
             row("我的 Steam 订阅", subscribedSummary) {
                 Button("查看…") {
@@ -366,6 +387,14 @@ struct SettingsForm: View {
                 }
             }
         }
+    }
+
+    private var steamDownloadStatus: String {
+        guard let steamAccount else { return "匿名只能下载部分旧壁纸；登录后可下载新壁纸" }
+        if downloader.loginExpired {
+            return "账号 \(steamAccount) 的 SteamCMD 下载令牌已失效"
+        }
+        return "账号 \(steamAccount) 已保存；仅用于 SteamCMD 下载"
     }
 
     // MARK: - 资源目录

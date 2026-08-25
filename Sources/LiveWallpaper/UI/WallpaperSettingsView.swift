@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 /// 主界面右侧滑出的壁纸设置边栏(嵌入式,随窗口高度撑满)。
 /// 选中壁纸即应用 + 滑出本边栏,在此直接调该壁纸的可调属性。
@@ -10,7 +12,17 @@ struct WallpaperSettingsPanel: View {
 
     @State private var version = 0   // 改动后递增,触发条件重算 + 控件刷新
     @ObservedObject private var store = WallpaperPropertyStore.shared
-    private let accent = Color.accentColor
+    @ObservedObject private var presets = WallpaperPresetStore.shared
+    @State private var selectedPresetID: UUID?
+    /// WE 的 schemecolor 对未绑定画面效果的视频仍作为壁纸配色方案存在；在 macOS 侧用于当前属性面板的
+    /// 强调色，场景壁纸若把它绑定到图层/特效则还会继续走 WallpaperPropertyStore 影响画面。
+    private var accent: Color {
+        if let property = schemeColorProp,
+           case .color(let c) = store.value(forID: item.id, property: property, folderURL: item.folderURL) {
+            return Color(red: Double(c.x), green: Double(c.y), blue: Double(c.z))
+        }
+        return .accentColor
+    }
 
     /// 直接从 item 派生,绝不为空/失步(修「时全时空」)。
     private var allProperties: [WallpaperProperty] {
@@ -58,18 +70,16 @@ struct WallpaperSettingsPanel: View {
             header
             Divider().opacity(0.4)
             ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    // WE「属性」通用区:每个壁纸固定的 8 个标准通用控件(与 project.json 无关)。
+                VStack(alignment: .leading, spacing: 16) {
+                    wallpaperInfo
+                    quickActions
+                    sectionDivider(title: "属性")
                     GeneralPropertiesSection(item: item, accent: accent,
                                              schemeColorProp: schemeColorProp,
                                              onChange: { version += 1; onApply() })
-                    // 清晰分隔线:通用区 ↑ / 壁纸自定义属性 ↓。
-                    sectionDivider(title: "壁纸专属")
                     // project.json 自定义属性(去掉已并进通用区的 schemecolor)。
-                    if customRenderUnits.isEmpty {
-                        Text("这个壁纸没有额外的自定义属性").font(.system(size: 11)).foregroundStyle(.secondary)
-                            .frame(maxWidth: .infinity, alignment: .leading).padding(.vertical, 4)
-                    } else {
+                    if !customRenderUnits.isEmpty {
+                        sectionDivider(title: "壁纸专属")
                         ForEach(customRenderUnits) { unit in
                             switch unit {
                             case .single(let prop):
@@ -81,8 +91,10 @@ struct WallpaperSettingsPanel: View {
                             }
                         }
                     }
+                    sectionDivider(title: "我的预设")
+                    presetSection
                 }
-                .padding(.horizontal, 18).padding(.vertical, 16)
+                .padding(.horizontal, 18).padding(.vertical, 14)
                 // 不再用 .id(...version...) 破坏性重建子树 —— 那会在选色时销毁正与系统颜色面板
                 // 绑定的 ColorPicker、令其脱钩(色块不跟手)。store 现为 ObservableObject,改值
                 // 会发通知让 body 自然重算重读 value,无需强制重建。
@@ -97,7 +109,9 @@ struct WallpaperSettingsPanel: View {
         }
         .frame(maxHeight: .infinity)
         .background(VisualEffectView(material: .sidebar).ignoresSafeArea())
+        .tint(accent)
         .id(item.id)   // 切换壁纸时强制重建,彻底避免状态残留
+        .onAppear { selectedPresetID = presets.presets(for: item.id).first?.id }
     }
 
     /// project.json 里的 schemecolor 属性(若有)→ 并进通用区「主题配色」。
@@ -129,8 +143,8 @@ struct WallpaperSettingsPanel: View {
         HStack(spacing: 10) {
             Image(systemName: "slider.horizontal.3").font(.system(size: 15)).foregroundStyle(accent)
             VStack(alignment: .leading, spacing: 1) {
-                Text("壁纸设置").font(.system(size: 14, weight: .bold))
-                Text(item.title).font(.system(size: 10.5)).foregroundStyle(.secondary).lineLimit(1)
+                Text("属性").font(.system(size: 14, weight: .bold))
+                Text("配置当前壁纸").font(.system(size: 10.5)).foregroundStyle(.secondary)
             }
             Spacer()
             Button(action: onClose) {
@@ -139,6 +153,200 @@ struct WallpaperSettingsPanel: View {
             .buttonStyle(.plain).help("关闭")
         }
         .padding(.horizontal, 16).padding(.top, 16).padding(.bottom, 14)
+    }
+
+    private var wallpaperInfo: some View {
+        HStack(alignment: .top, spacing: 12) {
+            Group {
+                if let url = item.previewURL, let image = NSImage(contentsOf: url) {
+                    Image(nsImage: image).resizable().scaledToFill()
+                } else {
+                    ZStack {
+                        Color.white.opacity(0.05)
+                        Image(systemName: "photo").foregroundStyle(.tertiary)
+                    }
+                }
+            }
+            .frame(width: 66, height: 66)
+            .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+            .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.white.opacity(0.10)))
+
+            VStack(alignment: .leading, spacing: 5) {
+                Text(item.title).font(.system(size: 13, weight: .semibold)).lineLimit(2)
+                Label(item.type.displayName, systemImage: typeIcon)
+                    .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                if WallpaperUninstallPolicy.isSteamWorkshopID(item.id) {
+                    Text("创意工坊 · \(item.id)")
+                        .font(.system(size: 9.5).monospacedDigit()).foregroundStyle(.tertiary)
+                } else {
+                    Text("本地壁纸").font(.system(size: 9.5)).foregroundStyle(.tertiary)
+                }
+            }
+            Spacer(minLength: 0)
+        }
+    }
+
+    private var typeIcon: String {
+        switch item.type {
+        case .video: return "film"
+        case .scene: return "sparkles.rectangle.stack"
+        case .web: return "globe"
+        case .application: return "app"
+        case .unknown: return "questionmark.square"
+        }
+    }
+
+    private var quickActions: some View {
+        HStack(spacing: 8) {
+            if WallpaperUninstallPolicy.isSteamWorkshopID(item.id) {
+                quickButton("Steam", icon: "safari") {
+                    if let url = URL(string: "https://steamcommunity.com/sharedfiles/filedetails/?id=\(item.id)") {
+                        NSWorkspace.shared.open(url)
+                    }
+                }
+            }
+            quickButton("访达", icon: "folder") {
+                NSWorkspace.shared.activateFileViewerSelecting([item.folderURL])
+            }
+            quickButton("复制 ID", icon: "doc.on.doc") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(item.id, forType: .string)
+            }
+        }
+    }
+
+    private func quickButton(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon)
+                .font(.system(size: 10.5, weight: .medium))
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 7)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.white.opacity(0.055)))
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(Color.white.opacity(0.08)))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var currentPresets: [WallpaperPreset] { presets.presets(for: item.id) }
+
+    private var selectedPreset: WallpaperPreset? {
+        guard let id = selectedPresetID else { return nil }
+        return currentPresets.first { $0.id == id }
+    }
+
+    private var presetSection: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            HStack(spacing: 8) {
+                Picker("", selection: $selectedPresetID) {
+                    Text(currentPresets.isEmpty ? "还没有预设" : "选择预设").tag(UUID?.none)
+                    ForEach(currentPresets) { preset in
+                        Text(preset.name).tag(Optional(preset.id))
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+
+                Button("加载") { loadSelectedPreset() }
+                    .disabled(selectedPreset == nil)
+            }
+
+            HStack(spacing: 8) {
+                presetButton("保存", icon: "plus") { savePreset() }
+                presetButton("导入", icon: "square.and.arrow.down") { importPreset() }
+                presetButton("导出", icon: "square.and.arrow.up") { exportSelectedPreset() }
+                    .disabled(selectedPreset == nil)
+                Button {
+                    if let preset = selectedPreset {
+                        presets.delete(preset)
+                        selectedPresetID = currentPresets.first?.id
+                    }
+                } label: {
+                    Image(systemName: "trash").frame(width: 24, height: 24)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .disabled(selectedPreset == nil)
+                .help("删除所选预设")
+            }
+        }
+    }
+
+    private func presetButton(_ title: String, icon: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Label(title, systemImage: icon).font(.system(size: 10.5))
+                .frame(maxWidth: .infinity)
+        }
+        .controlSize(.small)
+    }
+
+    private func savePreset() {
+        let alert = NSAlert()
+        alert.messageText = "保存当前配置"
+        alert.informativeText = "输入预设名称；同名预设会被更新。"
+        alert.addButton(withTitle: "保存")
+        alert.addButton(withTitle: "取消")
+        let field = NSTextField(string: "我的预设")
+        field.frame = NSRect(x: 0, y: 0, width: 260, height: 24)
+        alert.accessoryView = field
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let preset = presets.saveCurrent(name: field.stringValue, item: item)
+        selectedPresetID = preset.id
+    }
+
+    private func loadSelectedPreset() {
+        guard let preset = selectedPreset else { return }
+        do {
+            try presets.apply(preset, to: item)
+            version += 1
+            onApply()
+        } catch {
+            showPresetError(error)
+        }
+    }
+
+    private func exportSelectedPreset() {
+        guard let preset = selectedPreset else { return }
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "\(safeFileName(preset.name)).livewallpaper-preset.json"
+        panel.canCreateDirectories = true
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            try presets.exportData(preset).write(to: url, options: .atomic)
+        } catch {
+            showPresetError(error)
+        }
+    }
+
+    private func importPreset() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            let preset = try presets.importData(Data(contentsOf: url), for: item)
+            try presets.apply(preset, to: item)
+            selectedPresetID = preset.id
+            version += 1
+            onApply()
+        } catch {
+            showPresetError(error)
+        }
+    }
+
+    private func safeFileName(_ raw: String) -> String {
+        let invalid = CharacterSet(charactersIn: "/:\\?%*|\"<>")
+        return raw.components(separatedBy: invalid).joined(separator: "-")
+    }
+
+    private func showPresetError(_ error: Error) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "预设操作失败"
+        alert.informativeText = error.localizedDescription
+        alert.addButton(withTitle: "好")
+        alert.runModal()
     }
 
     private var resetBar: some View {
@@ -158,10 +366,10 @@ struct WallpaperSettingsPanel: View {
     }
 
     private var unsubscribeBar: some View {
-        Button(action: confirmUnsubscribe) {
+        Button(action: { onUnsubscribe?() }) {
             HStack(spacing: 7) {
                 Image(systemName: "xmark.bin").font(.system(size: 12))
-                Text("取消订阅并删除壁纸").font(.system(size: 12, weight: .medium))
+                Text("卸载（同时同步订阅）").font(.system(size: 12, weight: .medium))
                 Spacer()
             }
             .foregroundStyle(.red)
@@ -169,25 +377,12 @@ struct WallpaperSettingsPanel: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("取消该壁纸的创意工坊订阅,并把壁纸文件夹移到废纸篓")
+        .help("先取消创意工坊订阅；成功后再把本地文件夹移到废纸篓")
     }
 
-    /// 确认后:取消订阅 + 删除本地壁纸(回调里完成,并关闭本面板)。
-    private func confirmUnsubscribe() {
-        let a = NSAlert()
-        a.messageText = "取消订阅「\(item.title)」?"
-        a.informativeText = "将取消该壁纸的创意工坊订阅,并把壁纸文件夹移到废纸篓(可在废纸篓恢复)。"
-        a.alertStyle = .warning
-        a.addButton(withTitle: "取消订阅并删除")
-        a.addButton(withTitle: "取消")
-        if a.runModal() == .alertFirstButtonReturn { onUnsubscribe?() }
-    }
 }
 
-/// WE「属性」通用区:每个壁纸顶部固定的 8 个标准通用控件(与 project.json 自定义属性无关)。
-/// 顺序对齐 WE 实拍:音频监听 / 主题配色 / 音量 / 播放速度 / 鼠标视差 / 翻转 / 图片筛选器 / 显示颜色选项。
-/// 持久化:通用区 7 项存 GeneralWallpaperSettings(per-wallpaper);主题配色复用 project.json 的
-/// schemecolor(若有,走 WallpaperPropertyStore),没有则提供本地默认色块占位。
+/// WE 通用属性区。按壁纸类型/项目能力显示，所有可见控件都接到真实渲染路径。
 struct GeneralPropertiesSection: View {
     let item: WallpaperItem
     let accent: Color
@@ -196,40 +391,57 @@ struct GeneralPropertiesSection: View {
 
     @ObservedObject private var g = GeneralWallpaperSettings.shared
     @ObservedObject private var propStore = WallpaperPropertyStore.shared
-    @State private var localScheme: Color = .white   // schemecolor 缺省时的本地占位
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
-            Text("属性").font(.system(size: 11, weight: .semibold)).foregroundStyle(.secondary)
-
-            // 1) 音频监听(bool,默认开)
-            Toggle(isOn: Binding(get: { g.audioListen(item.id) },
-                                 set: { g.setAudioListen($0, item.id); onChange() })) {
-                Text("音频监听").font(.system(size: 12.5))
-            }.toggleStyle(.switch).tint(accent)
-
-            // 2) 主题配色(color)— 复用 schemecolor(若有),否则本地占位
-            HStack {
-                Text("主题配色").font(.system(size: 12.5)).lineLimit(1)
-                Spacer()
-                ColorPicker("", selection: schemeBinding, supportsOpacity: false).labelsHidden()
+            if item.type == .scene {
+                Toggle(isOn: Binding(get: { g.audioListen(item.id) },
+                                     set: { g.setAudioListen($0, item.id); onChange() })) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("音频响应").font(.system(size: 12.5))
+                        Text("开启后会采集系统播放声音；默认关闭")
+                            .font(.system(size: 10.5)).foregroundStyle(.secondary)
+                    }
+                }.toggleStyle(.switch).tint(accent)
             }
 
-            // 3) 音量(slider 0–100,默认 100)
-            sliderRow(label: "音量", value: Binding(get: { g.volume(item.id) },
-                                                  set: { g.setVolume($0, item.id); onChange() }),
-                      range: 0...100, format: "%.0f")
+            if schemeColorProp != nil {
+                HStack {
+                    Text("配色方案").font(.system(size: 12.5)).lineLimit(1)
+                    Spacer()
+                    ColorPicker("", selection: schemeBinding, supportsOpacity: false).labelsHidden()
+                }
+            }
 
-            // 4) 播放速度(slider 0–100,默认 100 = 正常速度)
-            sliderRow(label: "播放速度", value: Binding(get: { g.playbackSpeed(item.id) },
-                                                     set: { g.setPlaybackSpeed($0, item.id); onChange() }),
-                      range: 0...100, format: "%.0f")
+            if supportsMediaControls {
+                sliderRow(label: "音量", value: Binding(get: { g.volume(item.id) },
+                                                      set: { g.setVolume($0, item.id); onChange() }),
+                          range: 0...100, format: "%.0f")
+                sliderRow(label: "播放速度", value: Binding(get: { g.playbackSpeed(item.id) },
+                                                         set: { g.setPlaybackSpeed($0, item.id); onChange() }),
+                          range: 0...100, format: "%.0f")
 
-            // 5) 鼠标视差(bool)— 真实 WE 通用区控件,**仅当该壁纸 pkg 确有视差时显示**:
-            //   判据 = scene.json general.cameraparallax==true(= 引擎 hasParallax；amount=0 时 shader
-            //   仍可能读取 g_ParallaxPosition，不能据此隐藏总闸)。
-            //   pkg 无视差(cameraparallax=false/缺失/amount=0)的壁纸 WE 本就不显示此控件 → 此处不渲染。
-            //   默认勾选状态 = pkg 的 cameraparallax(见 g.mouseParallax 默认回退 pkgCameraParallax),非无条件开。
+                HStack {
+                    Text("对齐").font(.system(size: 12.5)).lineLimit(1)
+                    Spacer()
+                    Picker("", selection: Binding(get: { g.alignment(item.id) },
+                                                  set: { g.setAlignment($0, item.id); onChange() })) {
+                        ForEach(GeneralWallpaperSettings.Alignment.allCases) { value in
+                            Text(value.label).tag(value)
+                        }
+                    }
+                    .labelsHidden()
+                    .fixedSize()
+                }
+
+                sliderRow(label: "位置", value: Binding(get: { g.position(item.id) },
+                                                       set: { g.setPosition($0, item.id); onChange() }),
+                          range: 0...100, format: "%.0f")
+                    .opacity(positionAvailable ? 1 : 0.45)
+                    .disabled(!positionAvailable)
+                    .help(positionAvailable ? "移动填充模式下被裁切的可见区域" : "当前对齐模式没有裁切区域")
+            }
+
             if GeneralWallpaperSettings.hasParallax(item.id) {
                 Toggle(isOn: Binding(get: { g.mouseParallax(item.id) },
                                      set: { g.setMouseParallax($0, item.id); onChange() })) {
@@ -237,30 +449,54 @@ struct GeneralPropertiesSection: View {
                 }.toggleStyle(.switch).tint(accent)
             }
 
-            // 6) 翻转(bool,默认关)
-            Toggle(isOn: Binding(get: { g.flip(item.id) },
-                                 set: { g.setFlip($0, item.id); onChange() })) {
-                Text("翻转").font(.system(size: 12.5))
-            }.toggleStyle(.switch).tint(accent)
+            if supportsMediaControls {
+                Toggle(isOn: Binding(get: { g.flip(item.id) },
+                                     set: { g.setFlip($0, item.id); onChange() })) {
+                    Text("水平翻转").font(.system(size: 12.5))
+                }.toggleStyle(.switch).tint(accent)
 
-            // 7) 图片筛选器(combo,默认无)
-            HStack {
-                Text("图片筛选器").font(.system(size: 12.5)).lineLimit(1)
-                Spacer()
-                Picker("", selection: Binding(get: { g.filter(item.id) },
-                                              set: { g.setFilter($0, item.id); onChange() })) {
-                    ForEach(GeneralWallpaperSettings.ImageFilter.allCases) { f in
-                        Text(f.label).tag(f)
+                HStack {
+                    Text("图片筛选器").font(.system(size: 12.5)).lineLimit(1)
+                    Spacer()
+                    Picker("", selection: Binding(get: { g.filter(item.id) },
+                                                  set: { g.setFilter($0, item.id); onChange() })) {
+                        ForEach(GeneralWallpaperSettings.ImageFilter.allCases) { f in
+                            Text(f.label).tag(f)
+                        }
                     }
-                }.labelsHidden().fixedSize()
-            }
+                    .labelsHidden().fixedSize()
+                }
 
-            // 8) 显示颜色选项(bool,默认关)
-            Toggle(isOn: Binding(get: { g.showColorOptions(item.id) },
-                                 set: { g.setShowColorOptions($0, item.id); onChange() })) {
-                Text("显示颜色选项").font(.system(size: 12.5))
-            }.toggleStyle(.switch).tint(accent)
+                Toggle(isOn: Binding(get: { g.showColorOptions(item.id) },
+                                     set: { g.setShowColorOptions($0, item.id); onChange() })) {
+                    Text("显示颜色选项").font(.system(size: 12.5))
+                }.toggleStyle(.switch).tint(accent)
+
+                if g.showColorOptions(item.id) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        sliderRow(label: "亮度", value: Binding(get: { g.brightness(item.id) },
+                                                              set: { g.setBrightness($0, item.id); onChange() }),
+                                  range: 0...200, format: "%.0f")
+                        sliderRow(label: "对比度", value: Binding(get: { g.contrast(item.id) },
+                                                               set: { g.setContrast($0, item.id); onChange() }),
+                                  range: 0...200, format: "%.0f")
+                        sliderRow(label: "饱和度", value: Binding(get: { g.saturation(item.id) },
+                                                               set: { g.setSaturation($0, item.id); onChange() }),
+                                  range: 0...200, format: "%.0f")
+                    }
+                    .padding(10)
+                    .background(RoundedRectangle(cornerRadius: 7).fill(Color.white.opacity(0.035)))
+                }
+            }
         }
+    }
+
+    private var supportsMediaControls: Bool { item.type == .scene || item.type == .video }
+
+    private var positionAvailable: Bool {
+        let mode = g.effectiveScaleMode(item.id)
+        return mode == GeneralWallpaperSettings.Alignment.cover.rawValue
+            || mode == GeneralWallpaperSettings.Alignment.balanced.rawValue
     }
 
     /// 主题配色绑定:有 schemecolor 属性 → 读写 WallpaperPropertyStore;否则用本地占位(@State)。
@@ -280,7 +516,8 @@ struct GeneralPropertiesSection: View {
                     onChange()
                 })
         }
-        return Binding(get: { localScheme }, set: { localScheme = $0 })
+        // 只有 schemeColorProp 非空时才渲染 ColorPicker；此分支只是满足 Binding 的完整性。
+        return .constant(.white)
     }
 
     @ViewBuilder

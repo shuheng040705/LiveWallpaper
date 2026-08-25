@@ -1,6 +1,25 @@
 import Foundation
 import simd
 
+/// 浅塌缩眼睑使用的虹膜遮挡进度。`travelRatio` 是眼睑当前下降行程/最大下降行程：
+/// 0=完全睁开，1=完全闭合。90% 行程处开口已经闭拢，因此从该点起保持完全遮挡。
+/// 中间使用 smoothstep：刚开始抬眼皮时虹膜慢慢露出，中段加快，接近睁开时再平缓收尾，
+/// 避免线性裁线把眼球像纸片一样匀速擦除，也不会在半睁时一次性放出整颗虹膜。
+enum WEBlinkIrisOcclusion {
+    static func sweep(travelRatio: Float) -> Float {
+        let ratio = max(0, min(1, travelRatio))
+        let t = min(1, ratio / 0.9)
+        return t * t * (3 - 2 * t)
+    }
+
+    /// 裁线附近的窄羽化。`sampleY` 越高越靠近被上眼睑遮住的一侧；返回值直接乘到顶点 alpha。
+    static func featherAlpha(sampleY: Float, clipY: Float, halfWidth: Float) -> Float {
+        let width = max(0.001, halfWidth)
+        let t = max(0, min(1, (clipY + width - sampleY) / (2 * width)))
+        return t * t * (3 - 2 * t)
+    }
+}
+
 /// WE puppet 网格(`models/*_puppet.mdl`,MDLV0021/0023)+ 骨骼蒙皮动画(MDLS0004 骨骼 + MDLA0006 动画)。
 /// 多部件角色部件(主体/长发/眼睛…)用非矩形带偏心的网格几何,当平面 quad 画会散架;静止姿态(bind pose)
 /// 即正确摆位。**lwe CImage::loadPuppetMesh 只取 mesh(忽略 MDLS/MDLA),不做动画**;真 WE 有骨骼蒙皮动画
@@ -25,6 +44,50 @@ struct PuppetMesh {
         let texturePath: String
         let targetGroups: [Int]
         let sourceGroups: [Int]
+    }
+
+    /// WE 资源兼容清理：极少数已发布 Puppet 会在 MDLV parts 中残留编辑器预览用的独立贴片。
+    /// 这类贴片没有通用的 visibility 标志，直接按 part id 黑名单又会误伤别的模型，所以只在
+    /// “画布尺寸 + 完整网格规模 + 骨骼规模 + 该 part 的索引范围 + 顶点/UV”全部吻合时退化它。
+    /// 返回被清理的 part id，便于日志和单测确认。
+    @discardableResult
+    static func sanitizeKnownStrayParts(size: SIMD2<Float>,
+                                        indices: inout [UInt16],
+                                        groups: [DrawGroup],
+                                        rawPos: [SIMD2<Float>],
+                                        uv: [SIMD2<Float>],
+                                        boneCount: Int) -> [Int] {
+        // AbyssGaming【琉璃】主体模型中遗留的鼻部两三角形预览贴片。WE 成品画面不显示它；
+        // 它在 atlas 中是单独的不透明肤色岛，若照普通 part 合成就会在鼻梁形成硬三角色块。
+        guard abs(size.x - 5247) < 0.5, abs(size.y - 5894) < 0.5,
+              rawPos.count == 714, uv.count == 714, indices.count == 2760,
+              boneCount == 79,
+              let group = groups.first(where: {
+                  $0.id == 31 && $0.startIndex == 2469 && $0.indexCount == 6
+              }),
+              group.startIndex >= 0, group.startIndex + group.indexCount <= indices.count else {
+            return []
+        }
+
+        let expected: [(Int, SIMD2<Float>, SIMD2<Float>)] = [
+            (553, SIMD2(720.4552, 864.6265), SIMD2(0.51207, 0.16758)),
+            (554, SIMD2(742.5624, 954.1605), SIMD2(0.51629, 0.15239)),
+            (555, SIMD2(804.4624, 954.1605), SIMD2(0.52809, 0.15239)),
+            (556, SIMD2(812.2000, 859.0999), SIMD2(0.52956, 0.16851)),
+        ]
+        func near(_ a: SIMD2<Float>, _ b: SIMD2<Float>, _ epsilon: Float) -> Bool {
+            abs(a.x - b.x) <= epsilon && abs(a.y - b.y) <= epsilon
+        }
+        guard expected.allSatisfy({ entry in
+            let (vi, p, t) = entry
+            return vi < rawPos.count && near(rawPos[vi], p, 0.05) && near(uv[vi], t, 0.00005)
+        }) else { return [] }
+
+        // 保留 part 表及其顺序（clipping 记录按顺序下标引用），只把两个三角形退化为零面积。
+        // 这样整网格单次 draw 和逐 part draw 两条路径都会一致消失，不会改变后续 part 的 z 序。
+        let anchor = indices[group.startIndex]
+        for i in group.startIndex..<(group.startIndex + group.indexCount) { indices[i] = anchor }
+        return [group.id]
     }
 
     let size: SIMD2<Float>
@@ -62,12 +125,16 @@ struct PuppetMesh {
     /// 供 clip 遮挡把「当前眼睑走了多少」归一到「它自己最多能走多少」——眨眼时序对齐 WE 的关键量。
     private final class LidTravelCache {
         var v: [String: Float] = [:]
-        // 眨眼方向状态(仅渲染线程访问):key → (上次「有效变化」的 lidDesc, 方向 +1=闭合中/−1=睁开中)。
-        // 死区 0.05px:慢睁段每帧只挪 ~0.005px,逐帧比较永远测不出方向;只在累计变化超死区时更新基准值,
-        // 慢漂移累计 ~10 帧后即可翻转方向。开/闭稳态 sweep 两个方向公式同值,方向暂错无害。
-        var lastDesc: [String: (d: Float, dir: Float)] = [:]
     }
     private let lidTravelCache = LidTravelCache()
+    /// `skinLayersEyeOcclude` 本次求值生成的柔边 alpha。引用缓存只在渲染线程内使用，
+    /// 让顶点位置仍保持 MDLV 的 4-float ABI，同时复用现有 Puppet alpha buffer 传给片元阶段。
+    private final class EyeOcclusionAlphaCache {
+        var value: [Float]? = nil
+    }
+    private let eyeOcclusionAlphaCache = EyeOcclusionAlphaCache()
+
+    func currentEyeOcclusionAlpha() -> [Float]? { eyeOcclusionAlphaCache.value }
     // 部件间挂点(MDAT0001):父部件用具名 attachment(如「头部」「胸部」)暴露子部件可挂的世界变换。
     // 每条 = (名, 所挂骨索引, 该挂点相对该骨的局部行主序矩阵)。子部件 scene.json 的 attachment 串按名匹配此表。
     struct Attachment { let name: String; let bone: Int; let local: simd_float4x4 }  // local 已转成列主序
@@ -492,6 +559,8 @@ struct PuppetMesh {
     }
 
     func skinLayersEyeOcclude(time: Double, layers: [(animId: Int, rate: Float, additive: Bool, hold: Float?)], use3D: Bool = false) -> [Float]? {
+        // 每帧先清空，确保本次未命中浅眼睑分支时不会沿用上一帧遮罩。
+        eyeOcclusionAlphaCache.value = nil
         guard hasSkin, !layers.isEmpty else { return nil }
         let nb = parent.count
         // 1) 合成各骨 local pose(与 skinLayers 同)。
@@ -626,6 +695,7 @@ struct PuppetMesh {
                 //   保留作闭眼弧。丢后露出后方淡肤色(Direction-A 实证)=WE 干净深弧无蓝。半闭(<0.5)保留虹膜(渐压自然)。
                 let hasBright = eyeBrightMask.count == rawPos.count
                 var occluded = Set<Int>()
+                var eyeAlpha = [Float](repeating: 1, count: rawPos.count)
                 // ⭐2026-07-27 连续裁线 + 逐顶点运动豁免(WE 录屏铁证,白泽夢 3742497499):
                 //   ① WE 睁眼段虹膜青色像素**连续爬升**(眼睑抬到哪虹膜露到哪),不能二值全裁/全不裁;
                 //   ② WE 闭眼有**红棕色弧形闭眼线**(随眼睑下降的睫毛画艺,暖红高饱和被 irisColorMask
@@ -662,33 +732,15 @@ struct PuppetMesh {
                 //     靠的是 mask 开口(顶点级复现不了),故保留裁线扫描、只把驱动量换成真实行程占比。
                 //   回归安全:全闭时 sweep=1 与旧 close=1 裁线一致(残留照样清零);睁眼稳态 close≤0.01 在
                 //     上方早退(逐字节零回归);lidTravelMax 失效(<3px,rig 无下降眼睑顶点)退回 close 驱动。
-                //   ⭐方向非对称(WE 录屏单周期内直接观测,同一时间锚 offset=9.3s 同时校准闭/睁两段):
-                //   - **闭合中**:虹膜可见度从行程一开始就按比例消退(sweep = r/0.9,r=行程占比)——
-                //     录屏 blink1 闭合段与本机制曲线逐点重合(0.48@t9.3 双方一致);
-                //   - **睁开中**:虹膜要等行程退回 ~90% 以下才开始出现、退到 ~50% 时已全露
-                //     (sweep = (r−0.5)/0.4)——同一 offset 下 WE 睁开段整体比「闭合公式」早 ~0.3-0.4s,
-                //     用对称公式睁开段中段恒慢半拍(即用户报的「出现速度不一致」)。
-                //   方向由 lidDesc 带死区的变化趋势判定(见 LidTravelCache.lastDesc)。
-                //   WP_EYE_SWEEP_SYM=1 退回对称公式(A/B 隔离)。
+                // ⭐2026-08-04 睁眼全程跟随真实开口：旧方向非对称公式在睁开行程 r=0.5 时就令
+                // sweep=0（虹膜全露），导致眼皮才抬到一半、整颗眼球突然出现；剩余一半行程只有眼皮继续动。
+                // 现在闭/睁统一使用 smoothstep(r/0.9)：闭拢点 r≥0.9 仍全藏，睁开后随眼睑行程
+                // 缓入缓出地连续释放，r=0 才全露。
+                // 这同时去掉依赖逐帧方向缓存的历史状态，随机跳帧/暂停恢复也不会误判方向后突变。
                 let travelMax = maxLidTravel(layers: layers, use3D: use3D, isIris: isIrisVert)
                 var sweep = close
                 if travelMax >= 3 {
-                    let key = layers.map { "\($0.animId)@\($0.rate)" }.joined(separator: "+")
-                    var dir: Float = -1
-                    if let last = lidTravelCache.lastDesc[key] {
-                        if abs(lidDesc - last.d) > 0.05 {
-                            dir = lidDesc > last.d ? 1 : -1
-                            lidTravelCache.lastDesc[key] = (lidDesc, dir)
-                        } else {
-                            dir = last.dir
-                        }
-                    } else {
-                        lidTravelCache.lastDesc[key] = (lidDesc, dir)
-                    }
-                    let r = lidDesc / travelMax
-                    let symmetric = WPEnv.vars["WP_EYE_SWEEP_SYM"] != nil
-                    sweep = (dir > 0 || symmetric) ? min(1, r / 0.9)
-                                                  : max(0, min(1, (r - 0.5) / 0.4))
+                    sweep = WEBlinkIrisOcclusion.sweep(travelRatio: lidDesc / travelMax)
                 }
                 let pad: Float = 2
                 var exempted = 0
@@ -705,11 +757,28 @@ struct PuppetMesh {
                     guard span.isFinite, span > 0.5 else { continue }
                     // 连续裁线:行程占比 0→1 把裁线从上沿上方扫到下沿下方(上眼睑先盖上半,虹膜从下往上藏)。
                     let clipY = top[bn] + pad - sweep * (span + 2 * pad)
-                    if skinned[i].y > clipY, skinned[i].y >= bot[bn] - pad, skinned[i].y <= top[bn] + pad {
-                        occluded.insert(i)
+                    if skinned[i].y >= bot[bn] - pad, skinned[i].y <= top[bn] + pad {
+                        // 旧逻辑在顶点越过 clipY 的一帧把整片相邻三角形切掉，肉眼看成眼球分块跳变。
+                        // 只在约 2px 的裁线边缘内插 alpha，主体仍是不透明的真实遮挡，不会变成整眼淡出。
+                        let feather = max(1.25, min(2.5, span * 0.06))
+                        eyeAlpha[i] = WEBlinkIrisOcclusion.featherAlpha(
+                            sampleY: skinned[i].y,
+                            clipY: clipY,
+                            halfWidth: feather
+                        )
+                        // 开口已基本闭拢时继续用 sentinel 硬裁，彻底清掉插值残边，避免闭眼色块/青边回归。
+                        if sweep >= 0.985, skinned[i].y > clipY {
+                            occluded.insert(i)
+                        }
                     }
                 }
-                if occDbgClip { Log.write("OCCLUDE(discard) close=\(String(format:"%.2f",close)) sweep=\(String(format:"%.2f",sweep)) irisHidden=\(occluded.count) exempt=\(exempted) lidDesc=\(String(format:"%.1f",lidDesc)) travelMax=\(String(format:"%.1f",travelMax))") }
+                if eyeAlpha.contains(where: { $0 < 0.999 }) {
+                    eyeOcclusionAlphaCache.value = eyeAlpha
+                }
+                if occDbgClip {
+                    let softened = eyeAlpha.reduce(into: 0) { if $1 < 0.999 { $0 += 1 } }
+                    Log.write("OCCLUDE(discard) close=\(String(format:"%.2f",close)) sweep=\(String(format:"%.2f",sweep)) irisHidden=\(occluded.count) softened=\(softened) exempt=\(exempted) lidDesc=\(String(format:"%.1f",lidDesc)) travelMax=\(String(format:"%.1f",travelMax))")
+                }
                 // 诊断探针(WP_EYE_GEOM_PROBE=1,仅日志):若裁线改用「当前帧真实下降上眼睑顶点的逐桶下缘弧」
                 // (几何耦合,非 close 线性合成),各帧会藏多少虹膜顶点——用来与 WE 录屏曲线对标定,不改渲染。
                 if WPEnv.vars["WP_EYE_GEOM_PROBE"] != nil {
@@ -1441,6 +1510,7 @@ struct PuppetMesh {
 
         if WPEnv.vars["WP_PUPPET_LOG"] != nil {
             Log.write("PUPPETPARSE mdls=\(mdlsRaw.map(String.init) ?? "nil") mdla=\(mdlaRaw.map(String.init) ?? "nil") bones=\(parent.count) anims=\(anims.count)[\(anims.map { $0.id })] idx=\(indices.count) size=\(Int(size.x))x\(Int(size.y))")
+            Log.write("  GROUPS " + drawGroups.enumerated().map { "#\($0.offset):id=\($0.element.id)@\($0.element.startIndex)+\($0.element.indexCount)" }.joined(separator: " "))
             for a in anims where a.boneAlpha != nil {
                 let mins = a.boneAlpha!.enumerated().compactMap { (bi, v) -> String? in let m = v.min() ?? 1; return m < 0.95 ? "b\(bi)→\(String(format: "%.2f", m))" : nil }
                 Log.write("  ALPHA anim\(a.id): 淡出骨 \(mins.joined(separator: " "))")
@@ -1508,6 +1578,12 @@ struct PuppetMesh {
                     Log.write("  v\(vi) uv=(\(String(format:"%.2f",uv[vi].x)),\(String(format:"%.2f",v))) pos=(\(Int(rawPos[vi].x)),\(Int(rawPos[vi].y))) \(parts)")
                 }
             }
+        }
+        let suppressedParts = sanitizeKnownStrayParts(size: size, indices: &indices,
+                                                       groups: drawGroups, rawPos: rawPos, uv: uv,
+                                                       boneCount: parent.count)
+        if !suppressedParts.isEmpty {
+            Log.write("PUPPET compatibility: suppressed stray parts \(suppressedParts)")
         }
         return PuppetMesh(size: size, indices: indices,
                           drawGroups: drawGroups, clippingMasks: clippingMasks,

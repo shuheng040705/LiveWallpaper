@@ -377,6 +377,75 @@ final class WEScript {
         return nil
     }
 
+    /// effect `constantshadervalues` 的脚本值可以是 float / Vec2 / Vec3 / Vec4。
+    /// 与 runVec3 相同地传入真正的 WE Vec 实例，避免脚本调用 value.copy()/multiply() 时因裸字典失败。
+    /// 返回 nil 表示脚本失败或分量数不受支持，调用方保留 pkg 的静态/关键帧 fallback。
+    func runFloats(current: [Float], simTime: Double? = nil, frametime: Double? = nil) -> [Float]? {
+        guard (1...4).contains(current.count) else { return nil }
+        didFail = false
+
+        let arg: Any
+        if current.count == 1 {
+            arg = Double(current[0])
+        } else {
+            context.setObject(current.map(Double.init),
+                              forKeyedSubscript: "__weCurrentVector" as NSString)
+            let components = (0..<current.count).map { "__weCurrentVector[\($0)]" }
+                .joined(separator: ",")
+            guard let vector = context.evaluateScript("new Vec\(current.count)(\(components))") else {
+                return nil
+            }
+            arg = vector
+        }
+
+        tickFrame(initArg: arg, simTime: simTime, frametime: frametime)
+        guard let fn = updateFn,
+              let ret = fn.call(withArguments: [arg]),
+              !didFail else {
+            reportException()
+            return nil
+        }
+        if ret.isNumber {
+            let value = ret.toDouble()
+            guard value.isFinite else { return nil }
+            return [Float](repeating: Float(value), count: current.count)
+        }
+        guard ret.isObject else { return nil }
+        let names = ["x", "y", "z", "w"]
+        var result = current
+        for index in result.indices {
+            guard let component = ret.objectForKeyedSubscript(names[index]),
+                  !component.isUndefined, !component.isNull else { continue }
+            let value = component.toDouble()
+            guard value.isFinite else { return nil }
+            result[index] = Float(value)
+        }
+        return result
+    }
+
+    /// 导出当前脚本 context 的 `shared` 快照，供同一 WE 对象上其它独立属性脚本使用。
+    /// 真 WE 的一个对象共享 BindScriptContext；我方每个字段各有 JSContext，因此必须显式桥接。
+    /// JSON.stringify 失败（循环引用等）时返回 "{}"，绝不让诊断/兼容桥影响主脚本。
+    func sharedJSON() -> String {
+        guard let value = context.evaluateScript("""
+        (function(){
+          try {
+            if (typeof shared === 'undefined' || !shared) return '{}';
+            var seen = [];
+            return JSON.stringify(shared, function(key, value) {
+              if (typeof value === 'function' || typeof value === 'undefined') return undefined;
+              if (value && typeof value === 'object') {
+                if (seen.indexOf(value) >= 0) return undefined;
+                seen.push(value);
+              }
+              return value;
+            }) || '{}';
+          } catch (e) { return '{}'; }
+        })()
+        """), value.isString else { return "{}" }
+        return value.toString() ?? "{}"
+    }
+
     /// 把外部(3D 单-context 宿主跑出的)`shared` 快照合并进本脚本的 context。
     /// 3D 场景:per-layer 2D 脚本各自独立 context、无 shared(读 shared.sun_D_real 等会抛错→文字空/位置错)。
     /// 引擎在建好层后,把宿主算出的 shared(324 键:行星位置/角度/dock 屏幕坐标)注入每层脚本 → 文字/位置算得出。

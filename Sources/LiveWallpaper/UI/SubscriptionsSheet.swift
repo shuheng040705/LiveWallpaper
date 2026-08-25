@@ -16,6 +16,10 @@ final class SubscriptionsModel: ObservableObject {
     @Published var rows: [Row] = []
     @Published var loading = true
     @Published var noData = false
+    @Published var isUnsubscribing = false
+    @Published var unsubscribeError: String?
+    private var pendingUnsubscribeCount = 0
+    private var unsubscribeFailures: [String] = []
 
     var selectedCount: Int { rows.filter { $0.selected }.count }
     var notInstalledCount: Int { rows.filter { !$0.isInstalled }.count }
@@ -87,28 +91,71 @@ final class SubscriptionsModel: ObservableObject {
         }
     }
 
-    /// 批量取消订阅 + 删除本地壁纸(危险操作,调用方须先二次确认)。
-    /// 对每个选中项:① 调 Steam 网页会话取消订阅(best-effort,失败不阻断)
-    /// ② 已安装的发 `.unsubscribeWallpaper` 通知,交 AppDelegate 处理(关掉正在播放的 + 移废纸篓 + 重扫库)
-    /// ③ 从本面板列表移除该行。
+    /// 批量取消订阅 + 卸载本地壁纸(危险操作,调用方须先二次确认)。
+    /// 每一项都必须先收到 Steam 退订成功，再通知 AppDelegate 移除本地文件并从列表删行；
+    /// 失败项保持原样，防止仍处于订阅状态的壁纸被 Steam 自动下载回来。
     func unsubscribeSelected() {
         let todo = rows.filter { $0.selected }
-        guard !todo.isEmpty else { return }
-        let ids = Set(todo.map { $0.id })
-        for r in todo {
-            // Steam 侧取消订阅(无论本地是否已下,都同步取消账号订阅)。
-            SteamSubscription.unsubscribe(id: r.id) { ok, msg in
-                Log.write("Unsubscribe \(r.id): \(ok ? "OK" : "fail") — \(msg)")
-            }
-            // 本地已下:交 AppDelegate 删除(处理正在播放/移废纸篓/库刷新),与右键删除同路径。
-            if r.isInstalled {
-                NotificationCenter.default.post(
-                    name: .unsubscribeWallpaper, object: nil, userInfo: ["id": r.id])
+        guard !todo.isEmpty, !isUnsubscribing else { return }
+        isUnsubscribing = true
+        pendingUnsubscribeCount = todo.count
+        unsubscribeFailures.removeAll()
+
+        SteamWebSession.shared.refresh { [weak self] authenticated in
+            guard let self else { return }
+            if authenticated {
+                self.performUnsubscribe(todo)
+            } else {
+                SteamWebLoginWindowController.shared.authorize { [weak self] authorized in
+                    guard let self else { return }
+                    if authorized {
+                        self.performUnsubscribe(todo)
+                    } else {
+                        self.unsubscribeFailures = ["未完成 Steam 网页订阅授权，未取消任何订阅。"]
+                        self.pendingUnsubscribeCount = 0
+                        self.isUnsubscribing = false
+                        self.unsubscribeError = self.unsubscribeFailures[0]
+                    }
+                }
             }
         }
-        // 从本面板列表移除已处理行。
-        rows.removeAll { ids.contains($0.id) }
-        noData = rows.isEmpty
+    }
+
+    private func performUnsubscribe(_ todo: [Row]) {
+        for r in todo {
+            SteamSubscription.unsubscribe(id: r.id) { [weak self] outcome in
+                guard let self else { return }
+                switch outcome {
+                case .success(let message):
+                    Log.write("Unsubscribe \(r.id): OK — \(message)")
+                    // 订阅已经在 Steam 侧取消，此通知只负责安全停止与本地卸载。
+                    if r.isInstalled {
+                        NotificationCenter.default.post(
+                            name: .unsubscribeWallpaper,
+                            object: nil,
+                            userInfo: ["id": r.id]
+                        )
+                    }
+                    self.rows.removeAll { $0.id == r.id }
+                    self.noData = self.rows.isEmpty
+                case .authenticationRequired:
+                    Log.write("Unsubscribe \(r.id): Steam web authorization expired")
+                    self.unsubscribeFailures.append("\(r.title)：Steam 网页授权已失效，请重新授权后重试")
+                    SteamWebSession.shared.clearAuthenticationCookies()
+                case .failure(let message):
+                    Log.write("Unsubscribe \(r.id): fail — \(message)")
+                    self.unsubscribeFailures.append("\(r.title)：\(message)")
+                }
+
+                self.pendingUnsubscribeCount -= 1
+                if self.pendingUnsubscribeCount == 0 {
+                    self.isUnsubscribing = false
+                    if !self.unsubscribeFailures.isEmpty {
+                        self.unsubscribeError = self.unsubscribeFailures.joined(separator: "\n")
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -191,11 +238,20 @@ struct SubscriptionsSheet: View {
                 Divider()
                 HStack {
                     Button(role: .destructive) {
-                        confirmUnsubscribe()
+                        // 批量删除也遵循“点击即执行”。每个条目仍由模型逐项先退订，
+                        // 只有 Steam 确认成功的项目才会清理本地文件。
+                        model.unsubscribeSelected()
                     } label: {
-                        Label("取消订阅并删除选中 (\(model.selectedCount))", systemImage: "trash")
+                        if model.isUnsubscribing {
+                            HStack {
+                                ProgressView().controlSize(.small)
+                                Text("正在取消订阅…")
+                            }
+                        } else {
+                            Label("取消订阅并卸载选中 (\(model.selectedCount))", systemImage: "trash")
+                        }
                     }
-                    .disabled(model.selectedCount == 0)
+                    .disabled(model.selectedCount == 0 || model.isUnsubscribing)
                     Spacer()
                     Button {
                         model.downloadSelected()
@@ -204,7 +260,7 @@ struct SubscriptionsSheet: View {
                         Text("下载选中 (\(model.selectedCount))")
                     }
                     .buttonStyle(.borderedProminent)
-                    .disabled(model.selectedCount == 0)
+                    .disabled(model.selectedCount == 0 || model.isUnsubscribing)
                 }
                 .padding(12)
             }
@@ -212,6 +268,17 @@ struct SubscriptionsSheet: View {
         .frame(minWidth: 420, idealWidth: 460, maxWidth: 1000,
                minHeight: 400, idealHeight: 560, maxHeight: .infinity)
         .task { if model.rows.isEmpty { model.load() } }
+        .alert(
+            "部分壁纸未能取消订阅",
+            isPresented: Binding(
+                get: { model.unsubscribeError != nil },
+                set: { if !$0 { model.unsubscribeError = nil } }
+            )
+        ) {
+            Button("知道了") { model.unsubscribeError = nil }
+        } message: {
+            Text((model.unsubscribeError ?? "") + "\n\n失败项目的本地文件均未删除。")
+        }
     }
 
     @ViewBuilder
@@ -226,22 +293,6 @@ struct SubscriptionsSheet: View {
         }
         .frame(width: 56, height: 32)
         .clipShape(RoundedRectangle(cornerRadius: 4))
-    }
-
-    /// 取消订阅前的二次确认(危险操作:会从 Steam 取消订阅并删除本地文件)。
-    private func confirmUnsubscribe() {
-        let n = model.selectedCount
-        guard n > 0 else { return }
-        let a = NSAlert()
-        a.alertStyle = .critical
-        a.messageText = "确定取消订阅并删除 \(n) 个壁纸?"
-        a.informativeText = "此操作会从 Steam 取消订阅这些创意工坊条目,并把已下载的本地壁纸移到废纸篓。"
-        a.addButton(withTitle: "取消订阅并删除")   // 第一个=默认(回车)
-        a.addButton(withTitle: "取消")
-        NSApp.activate(ignoringOtherApps: true)
-        if a.runModal() == .alertFirstButtonReturn {
-            model.unsubscribeSelected()
-        }
     }
 
     private func chooseSteamFolder() {

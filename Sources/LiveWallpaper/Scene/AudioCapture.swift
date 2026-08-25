@@ -1,5 +1,5 @@
 import Foundation
-import AVFoundation
+import CoreMedia
 import Accelerate
 import CoreAudio
 @preconcurrency import ScreenCaptureKit

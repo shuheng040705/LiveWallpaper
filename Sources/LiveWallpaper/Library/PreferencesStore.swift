@@ -153,9 +153,8 @@ final class PreferencesStore {
         set { d.set(newValue, forKey: "frameRateCap") }
     }
 
-    /// 音频反应(音频条/pulse 随系统音乐律动)。开=用 ScreenCaptureKit 采集系统音频做频谱;
-    /// 关=不采集 → 系统守护(replayd/coreaudiod)CPU 归零,音频条/pulse 不再随声音变化(但零开销)。
-    /// 默认开(保持现状)。关闭后切换/重载壁纸即生效(SceneRenderEngine 不再 acquire 采集)。
+    /// 音频反应总开关(音频条/pulse 随系统音乐律动)。实际采集还要求当前壁纸的“音频响应”
+    /// 被用户明确开启；默认使用 Core Audio 系统输出 tap，绝不使用摄像头/麦克风。
     var audioReactiveEnabled: Bool {
         get { d.object(forKey: "audioReactiveEnabled") == nil ? true : d.bool(forKey: "audioReactiveEnabled") }
         set { d.set(newValue, forKey: "audioReactiveEnabled") }
