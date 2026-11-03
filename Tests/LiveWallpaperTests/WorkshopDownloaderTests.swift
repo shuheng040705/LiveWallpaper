@@ -38,6 +38,7 @@ final class WorkshopDownloaderTests: XCTestCase {
           if [ "$1" = "+force_install_dir" ]; then shift; dest="$1"; fi
           shift
         done
+        touch "$base/boot.$$"
         echo 'Waiting for user info...OK'
         while read -r command app item; do
           if [ "$command" = 'quit' ]; then exit 0; fi
@@ -46,9 +47,10 @@ final class WorkshopDownloaderTests: XCTestCase {
           mkdir -p "$HOME/Library/Application Support/Steam/logs" "$dest/steamapps/workshop/downloads"
           chunks=1
           if [ "$item" = '1234567891' ]; then chunks=3; fi
-          echo 'Downloading 4 chunks for depot 431960' > "$HOME/Library/Application Support/Steam/logs/content_log.txt"
+          echo 'Downloading 4 chunks for depot 431960' >> "$HOME/Library/Application Support/Steam/logs/content_log.txt"
           echo "AppID 431960 update started : download $((chunks * 1024))/4096" >> "$HOME/Library/Application Support/Steam/logs/content_log.txt"
-          dd if=/dev/zero of="$dest/steamapps/workshop/downloads/state_431960_431960_$item.patch" bs=24 count="$chunks" 2>/dev/null
+          printf MO42 > "$dest/steamapps/workshop/downloads/state_431960_431960_$item.patch"
+          dd if=/dev/zero bs=20 count=1 >> "$dest/steamapps/workshop/downloads/state_431960_431960_$item.patch" 2>/dev/null
           touch "$base/started.$item.$$"
           while [ ! -f "$base/release.$item" ]; do sleep 0.05; done
           mkdir -p "$dest/steamapps/workshop/content/431960/$item"
@@ -90,7 +92,7 @@ final class WorkshopDownloaderTests: XCTestCase {
         var observation: AnyCancellable?
         var fulfilled = false
         observation = downloader.$jobs.removeDuplicates().sink { jobs in
-            if !fulfilled, ids.dropFirst().allSatisfy({ id in jobs.contains(where: { $0.id == id && $0.state == .done }) }) { fulfilled = true; completed.fulfill() }
+            if !fulfilled, jobs.contains(where: { $0.id == ids[0] && $0.state == .cancelled }), ids.dropFirst().allSatisfy({ id in jobs.contains(where: { $0.id == id && $0.state == .done }) }) { fulfilled = true; completed.fulfill() }
         }
         wait(for: [completed], timeout: 10)
         observation?.cancel()
@@ -111,8 +113,7 @@ final class WorkshopDownloaderTests: XCTestCase {
                   let first = jobs.first(where: { $0.id == "1234567890" }),
                   let second = jobs.first(where: { $0.id == "1234567891" }),
                   first.logTotal == 4096, second.logTotal == 4096,
-                  first.totalChunks == 4, second.totalChunks == 4,
-                  first.committedChunks == 1, second.committedChunks == 3 else { return }
+                  first.downloadedBytes == 1024, second.downloadedBytes == 3072 else { return }
             XCTAssertEqual(first.fraction, 0.25)
             XCTAssertEqual(second.fraction, 0.75)
             fulfilled = true; sampled.fulfill()
@@ -121,6 +122,77 @@ final class WorkshopDownloaderTests: XCTestCase {
         downloader.enqueue(id: "1234567891", title: "B", sizeBytes: 4096)
         wait(for: [sampled], timeout: 6)
         observation.cancel()
+    }
+
+    @MainActor
+    func testSixQueuedDownloadsReuseThreeAuthenticatedProcesses() throws {
+        let (downloader, root) = try makeDownloaderFixture()
+        defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
+        let ids = (0..<6).map { "123456789" + String($0) }
+        for id in ids { try Data().write(to: root.appendingPathComponent("release." + id)) }
+        let finished = expectation(description: "All queued jobs finish with pooled processes")
+        var fulfilled = false
+        let observation = downloader.$jobs.sink { jobs in
+            if !fulfilled, jobs.count == 6, jobs.allSatisfy({ $0.state == .done }) { fulfilled = true; finished.fulfill() }
+        }
+        for id in ids { downloader.enqueue(id: id, title: id) }
+        wait(for: [finished], timeout: 8)
+        observation.cancel()
+        let boots = try FileManager.default.contentsOfDirectory(atPath: root.path).filter { $0.hasPrefix("boot.") }
+        XCTAssertEqual(boots.count, 3, "A new wallpaper must reuse a healthy logged-in worker")
+    }
+
+    func testSteamDownloadRateParsingRejectsConnectionAdjustmentMessages() {
+        let job = WorkshopDownloader.Job(id: "1234567890", title: "Header only", totalBytes: 24_000_000)
+        XCTAssertNil(job.fraction)
+        XCTAssertEqual(job.effectiveDownloadedBytes, 0)
+        XCTAssertNil(WorkshopDownloader.parseDownloadRate("Increasing target number of download connections to 9 (rate was 0.000, now 18.912)"))
+        XCTAssertEqual(WorkshopDownloader.parseDownloadRate("[date] Current download rate: 8.389 Mbps")!, 1.0000467300415039, accuracy: 0.00001)
+        XCTAssertEqual(WorkshopDownloader.parseDownloadRate("Current download rate: 0.000 Mbps"), 0)
+    }
+
+    @MainActor
+    func testPositiveReportedTransferRateKeepsConstantHeaderDownloadAlive() throws {
+        let (downloader, root) = try makeDownloaderFixture(timeouts: .init(login: 2, commandStart: 1, noProgress: 0.8, retryDelay: 0.01))
+        defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("steamcmd-fixture")
+        var body = try String(contentsOf: script, encoding: .utf8)
+        body = body.replacingOccurrences(of: "while [ ! -f \"$base/release.$item\" ]; do sleep 0.05; done", with: "while [ ! -f \"$base/release.$item\" ]; do echo 'Current download rate: 8.389 Mbps' >> \"$HOME/Library/Application Support/Steam/logs/content_log.txt\"; sleep 0.1; done")
+        body = body.replacingOccurrences(of: "$((chunks * 1024))/4096", with: "0/4096")
+        try body.write(to: script, atomically: true, encoding: .utf8)
+        let id = "1234567890"
+        let completed = expectation(description: "Rate samples prevent a false stall restart")
+        var sawUnknownPercentage = false
+        var fulfilled = false
+        let observation = downloader.$jobs.sink { jobs in
+            if let job = jobs.first, job.state == .downloading, job.liveSpeedMBps > 0, job.downloadedBytes == 0, job.fraction == nil { sawUnknownPercentage = true }
+            if !fulfilled, jobs.first?.state == .done { fulfilled = true; completed.fulfill() }
+        }
+        downloader.enqueue(id: id, title: "Active transfer with a fixed header")
+        DispatchQueue.global().asyncAfter(deadline: .now() + 2.5) { try? Data().write(to: root.appendingPathComponent("release." + id)) }
+        wait(for: [completed], timeout: 6)
+        observation.cancel()
+        XCTAssertTrue(sawUnknownPercentage, "A constant 24B MO42 header must not appear as a completed chunk")
+        XCTAssertEqual(downloader.jobs.first?.attempt, 1)
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.path).filter { $0.hasPrefix("boot.") }.count, 1)
+    }
+
+    @MainActor
+    func testDiscardInSharedSlotPreservesAnotherItemsPartialFiles() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let folder = root.appendingPathComponent("Workers/0/Content/steamapps/workshop/downloads/431960")
+        for id in ["1234567890", "1234567891"] {
+            let path = folder.appendingPathComponent(id)
+            try FileManager.default.createDirectory(at: path, withIntermediateDirectories: true)
+            try Data("resumable".utf8).write(to: path.appendingPathComponent("partial.dat"))
+        }
+        let downloader = WorkshopDownloader(stagingDirectory: root)
+        let cleaned = expectation(description: "Only the unsubscribed item is removed")
+        downloader.discard(id: "1234567890") { cleaned.fulfill() }
+        wait(for: [cleaned], timeout: 3)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: folder.appendingPathComponent("1234567890").path))
+        XCTAssertTrue(FileManager.default.fileExists(atPath: folder.appendingPathComponent("1234567891/partial.dat").path))
     }
 
     @MainActor
@@ -174,6 +246,56 @@ final class WorkshopDownloaderTests: XCTestCase {
         for job in downloader.jobs { XCTAssertEqual(job.state, .done, job.title) }
         for id in titles.keys { XCTAssertTrue(LocalWallpaperProbe.isReady(at: library.appendingPathComponent(id))) }
         print("Parallel SteamCMD isolated artifacts: " + root.path)
+    }
+
+    @MainActor
+    func testLiveWarmSessionAvoidsSecondLogin() throws {
+        guard ProcessInfo.processInfo.environment["LW_STEAMCMD_SPEED_INTEGRATION"] == "1" else { throw XCTSkip("显式启用真实登录复用测速") }
+        let account = UserDefaults(suiteName: "com.a55555.livewallpaper")?.string(forKey: "steamAccount")
+        guard let account, !account.isEmpty else { throw XCTSkip("测速需要现有下载账号") }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("lw-speed-" + UUID().uuidString)
+        let library = root.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        let downloader = WorkshopDownloader(stagingDirectory: root, libraryDirectory: library, account: account)
+        defer { downloader.shutdown() }
+        let firstID = "3829782620", secondID = "3829799406"
+        let finished = expectation(description: "Two real downloads finish using the same authenticated process")
+        var scheduledSecond = false, fulfilled = false
+        var coldStart = Date(), secondStart: Date?
+        var coldInitialization: TimeInterval?, warmInitialization: TimeInterval?
+        let stderr = root.appendingPathComponent("Workers/0/home/Library/Application Support/Steam/logs/stderr.txt")
+        func processMarkers() -> Set<String> {
+            let text = (try? String(contentsOf: stderr, encoding: .utf8)) ?? ""
+            let regex = try! NSRegularExpression(pattern: #"objc\[(\d+)\]"#)
+            return Set(regex.matches(in: text, range: NSRange(text.startIndex..., in: text)).map { (text as NSString).substring(with: $0.range(at: 1)) })
+        }
+        var firstProcesses = Set<String>()
+        let observation = downloader.$jobs.sink { jobs in
+            for job in jobs where job.phase == .preparing || job.phase == .transferring {
+                if job.id == firstID, coldInitialization == nil { coldInitialization = Date().timeIntervalSince(coldStart) }
+                if job.id == secondID, warmInitialization == nil, let start = secondStart { warmInitialization = Date().timeIntervalSince(start) }
+            }
+            if jobs.contains(where: { $0.id == firstID && $0.state == .done }), !scheduledSecond {
+                scheduledSecond = true; firstProcesses = processMarkers()
+                // 给完成 worker 的收尾与槽位释放一个主队列轮次。
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                    secondStart = Date()
+                    downloader.enqueue(id: secondID, title: "MeiMei in Snowy Street")
+                }
+            }
+            if !fulfilled, scheduledSecond, jobs.count == 2, jobs.allSatisfy({ !WorkshopDownloader.isActive($0.state) }) { fulfilled = true; finished.fulfill() }
+            if !fulfilled, !scheduledSecond, jobs.contains(where: { if case .failed = $0.state { return true }; return false }) { fulfilled = true; finished.fulfill() }
+        }
+        coldStart = Date()
+        downloader.enqueue(id: firstID, title: "Still - Minimal Wallpaper for Your Focus")
+        wait(for: [finished], timeout: 480)
+        observation.cancel()
+        for job in downloader.jobs { XCTAssertEqual(job.state, .done, job.title) }
+        for id in [firstID, secondID] { XCTAssertTrue(LocalWallpaperProbe.isReady(at: library.appendingPathComponent(id))) }
+        XCTAssertNotNil(warmInitialization)
+        if let warmInitialization { XCTAssertLessThan(warmInitialization, 3, "The next item must not repeat Steam login") }
+        if !firstProcesses.isEmpty { XCTAssertEqual(processMarkers(), firstProcesses, "SteamCMD must reuse the actual process") }
+        print("SteamCMD speed benchmark: cold login=\(coldInitialization ?? -1)s, warm initialization=\(warmInitialization ?? -1)s, artifacts=\(root.path)")
     }
 
     func testResolvesCurrentHomebrewCaskWrapperToBinary() throws {

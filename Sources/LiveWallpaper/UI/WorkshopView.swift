@@ -249,7 +249,7 @@ struct WorkshopView: View {
             HStack(spacing: 12) {
                 Image(systemName: "arrow.down.circle.fill").font(.system(size: 23)).foregroundStyle(WorkshopStyle.accent)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("\(downloader.activeCount) 项正在并行 · \(downloader.queuedCount) 项等待中").font(.system(size: 11, weight: .semibold))
+                    Text("\(downloader.transferringCount) 项正在下载 · \(downloader.queuedCount + downloader.preparingCount) 项等待 / 准备").font(.system(size: 11, weight: .semibold))
                     Text("下载完成后自动加入壁纸库").font(.system(size: 10)).foregroundStyle(.secondary)
                 }
                 Spacer()

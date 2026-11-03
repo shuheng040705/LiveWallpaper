@@ -39,17 +39,13 @@ final class WorkshopDownloader: ObservableObject {
         var attempt = 1
         var elapsed: TimeInterval = 0   // 完成时的真实耗时
 
-        // 实时进度。主信号是临时目录里 .patch 文件按块(24B/块)的增长(每条目、高频、对大小文件都管用);
-        // content_log.txt 的真实字节更新太稀疏,只用来显示精确 MB/速度,以及拿总块数 N。
-        var committedChunks: Int = 0    // 已提交块数 = patch 文件大小 / 24
-        var totalChunks: Int = 0        // 总块数(content_log 的 "Downloading N chunks")
-        var downloadedBytes: Int64 = 0  // content_log 报的真实已下载字节(可能滞后)
-        var logTotal: Int64 = 0         // content_log 报的真实总字节(比网页值权威;并发时用来匹配任务)
-        var liveSpeedMBps: Double = 0   // 实时速度:由「有效已下载量」逐次轮询增量算 + EMA 平滑
-        var lastSampleBytes: Int64?     // 上次 content_log 字节采样(锁速度起点用,保留)
+        // 仅使用 Steam 自己报告的下载字节和速率；patch 的 24B 文件头不是一个下载块。
+        var downloadedBytes: Int64 = 0
+        var logTotal: Int64 = 0
+        var liveSpeedMBps: Double = 0
         var lastSampleTime: Date?
-        var lastSpeedBytes: Int64 = -1  // 上次算速度时的有效已下载字节(-1=未初始化)
-        var lastSpeedTime: Date?        // 上次算速度的时刻
+        var speedSampleTime: Date?
+        var phaseStartedAt: Date?
         var phase: Phase = .queued
         /// true 时先让当前库所属的 CrossOver Steam 接管；未接管/客户端退出才回退 SteamCMD。
         var preferSteamClient = false
@@ -62,6 +58,7 @@ final class WorkshopDownloader: ObservableObject {
             case waitingForSteamClient
             case steamClientDownloading
             case startingDownloader
+            case waitingForDownloader
             case authenticating
             case preparing
             case transferring
@@ -74,35 +71,15 @@ final class WorkshopDownloader: ObservableObject {
             guard elapsed > 0.1, totalBytes > 0 else { return 0 }
             return Double(totalBytes) / 1_048_576 / elapsed
         }
-        /// 真实总字节:优先用 content_log 的权威值,退回网页估算值。
-        var effectiveTotal: Int64 { logTotal > 0 ? logTotal : totalBytes }
-        /// 总块数:优先 content_log 的 N,退回按 ~1MB/块从总字节估算。
-        var effectiveTotalChunks: Int {
-            if totalChunks > 0 { return totalChunks }
-            if effectiveTotal > 0 { return max(1, Int((Double(effectiveTotal) / 1_048_576).rounded(.up))) }
-            return 0
-        }
-        /// 下载完成比例 0…1;还拿不到进度时返回 nil(UI 显示不确定进度条)。
-        /// **关键(修进度跳变)**:块进度(committedChunks/totalChunks)只在**真实 N(totalChunks)到手后**才用——
-        /// 那时分子分母同为「块」,精确高频。N 到手前**绝不**用「块数 ÷ (字节/1MB) 估算块数」当分母
-        /// (Steam 块 0.5–2MB 不均、估算分母错且非常数倍 → N 一到分母突变,百分比整段跳 23%→60%)。
-        /// N 未到时改用 content_log 的**字节比例**(与 N 后的块比例同源,切换平滑)。
+        var effectiveTotal: Int64 { state == .done ? totalBytes : (logTotal > 0 ? logTotal : totalBytes) }
+        /// Steam 日志没有报告字节进度时使用不确定进度，不从预分配文件或 patch 文件头猜百分比。
         var fraction: Double? {
-            if totalChunks > 0, committedChunks > 0 {
-                return min(0.99, Double(committedChunks) / Double(totalChunks))
-            }
-            if downloadedBytes > 0, effectiveTotal > 0 {
-                return min(0.99, Double(downloadedBytes) / Double(effectiveTotal))
-            }
-            return nil
+            guard downloadedBytes > 0, effectiveTotal > 0 else { return nil }
+            return min(0.99, Double(downloadedBytes) / Double(effectiveTotal))
         }
         var sizeMB: Double { Double(effectiveTotal) / 1_048_576 }
-        /// 有效已下载字节:与进度条同源(块进度 × 总大小);算速率/显示「已下载 MB」共用,保证一致平滑。
-        var effectiveDownloadedBytes: Int64 {
-            if let f = fraction { return Int64(f * Double(effectiveTotal)) }
-            return downloadedBytes
-        }
-        var downloadedMB: Double { Double(effectiveDownloadedBytes) / 1_048_576 }
+        var effectiveDownloadedBytes: Int64 { downloadedBytes }
+        var downloadedMB: Double { Double(downloadedBytes) / 1_048_576 }
 
         /// 首页 hero/卡片使用的短状态，避免准备阶段一律显示“下载中”造成假卡观感。
         var compactStatus: String {
@@ -116,6 +93,7 @@ final class WorkshopDownloader: ObservableObject {
                 case .waitingForSteamClient: return "等待 Steam"
                 case .steamClientDownloading: return "Steam 下载"
                 case .startingDownloader: return "启动服务"
+                case .waitingForDownloader: return "等待连接通道"
                 case .authenticating: return "Steam 登录"
                 case .preparing: return "连接 CDN"
                 case .transferring: return "准备传输"
@@ -166,7 +144,11 @@ final class WorkshopDownloader: ObservableObject {
         let slot: Int
         let group = DispatchGroup()
         let condition = NSCondition()
-        var process: Process?
+        private var storedProcess: Process?
+        var process: Process? {
+            get { condition.lock(); defer { condition.unlock() }; return storedProcess }
+            set { condition.lock(); storedProcess = newValue; condition.unlock() }
+        }
         var input: Pipe?
         var output = Data()
         var terminated = false
@@ -175,10 +157,31 @@ final class WorkshopDownloader: ObservableObject {
         var account: String?
         var outputHandle: FileHandle?
         var logsReady = false
+        var commandID: String?
+        var commandGeneration = UUID()
+        var logBaseline: UInt64 = 0
+        var lastActivityAt: Date?
+        var observedBytes: Int64 = 0
         init(slot: Int) { self.slot = slot }
     }
-    private var sessions: [String: Session] = [:] // lock 保护
-    private func itemRoot(_ id: String) -> URL { stagingRoot.appendingPathComponent("Items/" + id) }
+    private var sessions: [String: Session] = [:] // active item -> session，lock 保护
+    private var sessionPool: [Int: Session] = [:] // main 创建，shutdown/login 在 barrier 后访问
+    private var activeRoots: [String: URL] = [:] // lock 保护
+    private func retainedRoot(_ id: String) -> URL { stagingRoot.appendingPathComponent("Items/" + id) }
+    private func slotContentRoot(_ slot: Int) -> URL { workerRoot(slot).appendingPathComponent("Content") }
+    private func candidateRoots(_ id: String) -> [URL] {
+        [retainedRoot(id), stagingRoot] + (0..<maximumConcurrentDownloads).map(slotContentRoot)
+    }
+    private func itemRoot(_ id: String) -> URL {
+        lock.lock(); let active = activeRoots[id]; lock.unlock()
+        if let active { return active }
+        let fm = FileManager.default
+        return candidateRoots(id).first { root in
+            fm.fileExists(atPath: root.appendingPathComponent("steamapps/workshop/content/\(appID)/\(id)").path) ||
+            fm.fileExists(atPath: root.appendingPathComponent("steamapps/workshop/downloads/\(appID)/\(id)").path) ||
+            fm.fileExists(atPath: root.appendingPathComponent("steamapps/workshop/downloads/state_\(appID)_\(appID)_\(id).patch").path)
+        } ?? retainedRoot(id)
+    }
     private func workerRoot(_ slot: Int) -> URL { stagingRoot.appendingPathComponent("Workers/\(slot)") }
     private func workerHome(_ slot: Int) -> URL { workerRoot(slot).appendingPathComponent("home") }
 
@@ -259,6 +262,8 @@ final class WorkshopDownloader: ObservableObject {
 
     /// 未完成(排队/连接/下载中)的任务数,供工具栏角标显示。
     var activeCount: Int { jobs.filter { $0.state == .connecting || $0.state == .downloading }.count }
+    var transferringCount: Int { jobs.filter { $0.state == .downloading && $0.phase != .installing }.count }
+    var preparingCount: Int { jobs.filter { $0.state == .connecting || $0.phase == .installing }.count }
     var queuedCount: Int { jobs.filter { $0.state == .queued }.count }
 
     var pendingCount: Int {
@@ -371,10 +376,11 @@ final class WorkshopDownloader: ObservableObject {
 
     func shutdown() {
         lock.lock(); stopping = true
-        let active = Array(sessions.values)
+        let active = Array(sessionPool.values)
         let processes = Array(processes.values)
         lock.unlock()
         for p in processes where p.isRunning { p.terminate() }
+        for session in active { if let p = session.process, p.isRunning { p.terminate() } }
         for session in active { session.group.wait(); shutdownSession(session, graceful: false) }
     }
 
@@ -418,30 +424,45 @@ final class WorkshopDownloader: ObservableObject {
                 }
             }
         }
-        let log = home.appendingPathComponent("Library/Application Support/Steam/logs/content_log.txt")
-        try? fm.removeItem(at: log)
-        session.condition.lock(); session.logsReady = true; session.condition.unlock()
-        let item = itemRoot(id)
-        try fm.createDirectory(at: item, withIntermediateDirectories: true)
-        // 升级前的未完成内容迁入独立目录，保留可续传的块。
-        for kind in ["content", "downloads"] {
-            let relative = "steamapps/workshop/\(kind)/\(appID)/\(id)"
-            let old = stagingRoot.appendingPathComponent(relative), new = item.appendingPathComponent(relative)
-            if fm.fileExists(atPath: old.path), !fm.fileExists(atPath: new.path) {
-                try fm.createDirectory(at: new.deletingLastPathComponent(), withIntermediateDirectories: true)
-                try fm.moveItem(at: old, to: new)
-            }
-        }
-        let oldPatches = stagingRoot.appendingPathComponent("steamapps/workshop/downloads")
-        let newPatches = item.appendingPathComponent("steamapps/workshop/downloads")
-        if let files = try? fm.contentsOfDirectory(at: oldPatches, includingPropertiesForKeys: nil) {
-            for file in files where file.lastPathComponent.hasSuffix("_\(id).patch") {
-                try fm.createDirectory(at: newPatches, withIntermediateDirectories: true)
-                let target = newPatches.appendingPathComponent(file.lastPathComponent)
-                if !fm.fileExists(atPath: target.path) { try fm.moveItem(at: file, to: target) }
-            }
-        }
+        try fm.createDirectory(at: slotContentRoot(session.slot), withIntermediateDirectories: true)
         return executable
+    }
+
+    private func prepareItem(_ id: String, in session: Session) throws {
+        let fm = FileManager.default
+        let targetRoot = slotContentRoot(session.slot)
+        for source in candidateRoots(id) where source != targetRoot {
+            for kind in ["content", "downloads"] {
+                let relative = "steamapps/workshop/\(kind)/\(appID)/\(id)"
+                let old = source.appendingPathComponent(relative), new = targetRoot.appendingPathComponent(relative)
+                if fm.fileExists(atPath: old.path) {
+                    guard !fm.fileExists(atPath: new.path) else { continue } // 不覆盖可续传数据
+                    try fm.createDirectory(at: new.deletingLastPathComponent(), withIntermediateDirectories: true)
+                    try fm.moveItem(at: old, to: new)
+                }
+            }
+            let folder = source.appendingPathComponent("steamapps/workshop/downloads")
+            if let files = try? fm.contentsOfDirectory(at: folder, includingPropertiesForKeys: nil) {
+                for file in files where file.lastPathComponent.hasSuffix("_\(id).patch") {
+                    let destination = targetRoot.appendingPathComponent("steamapps/workshop/downloads/" + file.lastPathComponent)
+                    if !fm.fileExists(atPath: destination.path) {
+                        try fm.createDirectory(at: destination.deletingLastPathComponent(), withIntermediateDirectories: true)
+                        try fm.moveItem(at: file, to: destination)
+                    }
+                }
+            }
+        }
+    }
+
+    private func removeStagedItem(_ id: String) {
+        let fm = FileManager.default
+        for root in candidateRoots(id) {
+            for kind in ["content", "downloads"] {
+                try? fm.removeItem(at: root.appendingPathComponent("steamapps/workshop/\(kind)/\(appID)/\(id)"))
+            }
+        }
+        removePatchFiles(forID: id)
+        try? fm.removeItem(at: retainedRoot(id)) // 只有 Items/<id> 可整体删除；不能删除共享槽位目录
     }
 
     /// 异步补上网页抓到的目标大小(仅用于进度百分比估算)。下载已先行开始,**不需等它**。
@@ -461,18 +482,20 @@ final class WorkshopDownloader: ObservableObject {
 
     /// workerQueue 专用；仅为本条目建立会话，初始化与传输都可取消。
     private func ensureSessionReady(for id: String, session: Session) -> SessionReadyResult {
-        // 仅冷启动/登录串行，传输保持并行。macOS Steam IPC helper 在同时初始化时会竞争。
+        let wantedAccount = accountOverride ?? PreferencesStore.shared.steamAccount ?? "anonymous"
+        if isCancelled(id) { return .failure("用户取消下载") }
+        if session.ready, session.account == wantedAccount, session.process?.isRunning == true {
+            Log.write("WorkshopDownloader \(id): 复用槽位 \(session.slot) 的已登录会话")
+            return .success
+        }
+        setPhase(id, .waitingForDownloader, state: .connecting)
         while !startupLock.try() {
             if isCancelled(id) { return .failure("用户取消下载") }
             Thread.sleep(forTimeInterval: 0.1)
         }
         defer { startupLock.unlock() }
-        if isStopping { return .failure("下载服务正在退出") }
-        if isCancelled(id) { return .failure("用户取消下载") }
-        let wantedAccount = accountOverride ?? PreferencesStore.shared.steamAccount ?? "anonymous"
-        if session.ready, session.account == wantedAccount, session.process?.isRunning == true {
-            return .success
-        }
+        if isStopping || isCancelled(id) { return .failure("下载已取消或服务正在退出") }
+        setPhase(id, .authenticating, state: .connecting)
         shutdownSession(session, graceful: true)
 
         do {
@@ -483,8 +506,9 @@ final class WorkshopDownloader: ObservableObject {
         let executable: URL
         do { executable = try prepareWorker(session, id: id) }
         catch { return .failure("无法准备独立下载服务：\(error.localizedDescription)") }
+        if isCancelled(id) { return .failure("用户取消下载") }
         guard let p = makeSteamCMDProcess(arguments: [
-            "+force_install_dir", itemRoot(id).path,
+            "+force_install_dir", slotContentRoot(session.slot).path,
             "+login", wantedAccount
         ], executable: executable, home: workerHome(session.slot)) else {
             return .failure("未安装 SteamCMD")
@@ -671,7 +695,10 @@ final class WorkshopDownloader: ObservableObject {
             let id = jobs[i].id
             lock.lock(); let discarding = discardingIDs.contains(id); lock.unlock()
             if jobs[i].state == .queued, jobs[i].phase != .subscribing, !discarding, runningSlots[id] == nil {
-                let session = Session(slot: freeSlots.removeFirst())
+                let slot = freeSlots.removeFirst()
+                let session = sessionPool[slot] ?? Session(slot: slot)
+                lock.lock(); sessionPool[slot] = session; activeRoots[id] = slotContentRoot(slot); lock.unlock()
+                session.condition.lock(); session.logsReady = false; session.commandID = nil; session.condition.unlock()
                 runningSlots[id] = session.slot
                 session.group.enter()
                 lock.lock(); sessions[id] = session; lock.unlock()
@@ -680,8 +707,8 @@ final class WorkshopDownloader: ObservableObject {
                 jobs[i].startTime = Date()
                 workerQueue.async {
                     self.download(id: id, session: session)
-                    self.shutdownSession(session, graceful: true)
-                    self.lock.lock(); self.sessions.removeValue(forKey: id); self.lock.unlock()
+                    // 成功后保留登录与 CDN 连接；取消和真正超时已在命令处理路径中关闭。
+                    self.lock.lock(); self.sessions.removeValue(forKey: id); self.activeRoots.removeValue(forKey: id); self.lock.unlock()
                     session.group.leave()
                     DispatchQueue.main.async { self.runningSlots.removeValue(forKey: id); self.pump() }
                 }
@@ -712,6 +739,8 @@ final class WorkshopDownloader: ObservableObject {
         guard steamcmdPath != nil else {
             finish(id, .failed("Steam 客户端未接管，且未安装 SteamCMD")); return
         }
+        do { try prepareItem(id, in: session) }
+        catch { finish(id, .failed("恢复下载暂存失败：\(error.localizedDescription)")); return }
         let downloaded = itemRoot(id)
             .appendingPathComponent("steamapps/workshop/content/\(appID)/\(id)").path
         var lastOut = ""
@@ -719,7 +748,6 @@ final class WorkshopDownloader: ObservableObject {
         for retry in 1...2 {
             if isCancelled(id) { break }
             setPhase(id, retry == 1 ? .startingDownloader : .preparing, state: .connecting)
-            setPhase(id, .authenticating, state: .connecting)
             switch ensureSessionReady(for: id, session: session) {
             case .failure(let reason):
                 lastOut = reason
@@ -877,6 +905,12 @@ final class WorkshopDownloader: ObservableObject {
             return DownloadCommandResult(succeeded: false, output: "SteamCMD 会话未就绪")
         }
         resetSessionOutput(session)
+        let logURL = workerHome(session.slot).appendingPathComponent("Library/Application Support/Steam/logs/content_log.txt")
+        let baseline = (try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? NSNumber)?.uint64Value ?? 0
+        session.condition.lock()
+        session.commandID = id; session.commandGeneration = UUID(); session.logBaseline = baseline
+        session.observedBytes = 0; session.lastActivityAt = nil; session.logsReady = true
+        session.condition.unlock()
         setProcess(id, p)
         do {
             try input.fileHandleForWriting.write(contentsOf: command)
@@ -888,7 +922,7 @@ final class WorkshopDownloader: ObservableObject {
 
         let startedAt = Date()
         var lastProgressAt = startedAt
-        var lastChunks = committedChunks(forID: id)
+        var lastPatchSize = patchSize(forID: id)
         var sawCommandStart = false
         while !isCancelled(id) {
             let output = sessionSnapshot(session)
@@ -896,12 +930,12 @@ final class WorkshopDownloader: ObservableObject {
                 sawCommandStart = true
                 setPhase(id, .preparing, state: .connecting)
             }
-            let chunks = committedChunks(forID: id)
-            if chunks > lastChunks {
-                lastChunks = chunks
-                lastProgressAt = Date()
-                setPhase(id, .transferring, state: .downloading)
+            let patch = patchSize(forID: id)
+            if patch > 24, patch > lastPatchSize {
+                lastPatchSize = patch; lastProgressAt = Date()
             }
+            session.condition.lock(); let activity = session.lastActivityAt; session.condition.unlock()
+            if let activity, activity > lastProgressAt { lastProgressAt = activity }
             if Self.outputShowsDownloadSuccess(output, id: id) {
                 setProcess(id, nil)
                 return DownloadCommandResult(succeeded: true, output: output)
@@ -998,7 +1032,9 @@ final class WorkshopDownloader: ObservableObject {
             // 暂停调度并等现有任务收尾，再更新用户授权缓存。
             DispatchQueue.main.sync { self.authenticationInProgress = true }
             defer { DispatchQueue.main.async { self.authenticationInProgress = false; self.pump() } }
-            self.workerQueue.sync(flags: .barrier) {}
+            self.workerQueue.sync(flags: .barrier) {
+                for session in self.sessionPool.values { self.shutdownSession(session, graceful: true) }
+            }
             guard let p = self.makeSteamCMDProcess(arguments: ["+login", account, "+quit"]) else {
                 DispatchQueue.main.async { completion(false, false, "未安装 SteamCMD") }
                 return
@@ -1060,6 +1096,7 @@ final class WorkshopDownloader: ObservableObject {
     private func setPhase(_ id: String, _ phase: Job.Phase, state: Job.State? = nil) {
         DispatchQueue.main.async {
             guard let i = self.jobs.firstIndex(where: { $0.id == id }) else { return }
+            if self.jobs[i].phase != phase { self.jobs[i].phaseStartedAt = Date() }
             self.jobs[i].phase = phase
             if let state { self.jobs[i].state = state }
         }
@@ -1123,12 +1160,7 @@ final class WorkshopDownloader: ObservableObject {
         lock.unlock()
         if let process { DispatchQueue.global(qos: .utility).async { Self.killProcessTree(process) } }
         let cleanup = {
-            for kind in ["content", "downloads"] {
-                let folder = self.stagingRoot.appendingPathComponent("steamapps/workshop/\(kind)/\(self.appID)/\(id)")
-                try? FileManager.default.removeItem(at: folder)
-            }
-            try? FileManager.default.removeItem(at: self.itemRoot(id))
-            self.removePatchFiles(forID: id)
+            self.removeStagedItem(id)
             self.clearTracking(id)
             DispatchQueue.main.async {
                 self.jobs.removeAll { $0.id == id }
@@ -1161,7 +1193,7 @@ final class WorkshopDownloader: ObservableObject {
             if !keep || FileManager.default.fileExists(atPath: downloaded) {
                 try? FileManager.default.removeItem(atPath: downloaded)
             }
-            if !keep { try? FileManager.default.removeItem(at: self.itemRoot(id)) }
+            if !keep { self.removeStagedItem(id) }
             self.removePatchFiles(forID: id)
             self.clearTracking(id)
             DispatchQueue.main.async { self.jobs.removeAll { $0.id == id } }
@@ -1199,10 +1231,8 @@ final class WorkshopDownloader: ObservableObject {
         j.attempt = 1
         j.state = .queued; j.startTime = nil; j.elapsed = 0
         j.phase = waitForSubscription ? .subscribing : .queued
-        j.committedChunks = 0; j.totalChunks = 0
         j.downloadedBytes = 0; j.logTotal = 0
-        j.liveSpeedMBps = 0; j.lastSpeedBytes = -1; j.lastSpeedTime = nil
-        j.lastSampleBytes = nil; j.lastSampleTime = nil
+        j.liveSpeedMBps = 0; j.lastSampleTime = nil; j.speedSampleTime = nil; j.phaseStartedAt = nil
         jobs[i] = j
         lock.lock(); cancelledSet.remove(j.id); lock.unlock()
         if !waitForSubscription { configureClientRoute(for: j) }
@@ -1215,143 +1245,124 @@ final class WorkshopDownloader: ObservableObject {
     }
 
 
-    // MARK: - 真实下载进度
-    //
-    // steamcmd 的 workshop_download_item 不在 stdout 报进度,下载文件还是预分配+非稀疏的
-    // (du/文件大小会瞬间跳满),所以进度要从别处拿。两个信号配合:
-    //  1) 主信号——每条目临时目录里的 .patch 文件(downloads/state_<app>_<app>_<id>.patch)
-    //     每提交一块追加 24 字节,所以「已提交块数 = 文件大小/24」。它每条目独立、高频更新,
-    //     对大文件小文件都管用。总块数 N 从 content_log 的 "Downloading N chunks for depot 431960" 拿
-    //     (拿不到就按 ~1MB/块从总字节估算)。fraction = 已提交块 / 总块。
-    //  2) 辅助信号——content_log.txt 的 "update started : download <已下载>/<总>" 行有真实字节,
-    //     但更新很稀疏(~1-2 分钟一次),只用来显示精确的 已下载/总 MB 与实时速度。
-    // 每个 worker 的 HOME、content_log、下载暂存目录各自独立，日志按任务关联。
+    // MARK: - Steam 的真实字节与速率
 
     private let logQueue = DispatchQueue(label: "workshop.contentlog")
-    private var logTimer: DispatchSourceTimer?   // 仅主线程访问
+    private var logTimer: DispatchSourceTimer?
     private struct LogCursor { var offset: UInt64 = 0; var tail = "" }
-    private var logCursors: [String: LogCursor] = [:] // logQueue 专用
-
-    static func isActive(_ s: Job.State) -> Bool {
-        switch s { case .queued, .connecting, .downloading: return true; default: return false }
+    private var logCursors: [String: LogCursor] = [:]
+    private struct ProgressUpdate {
+        let id: String
+        let token: UUID
+        var samples: [(cur: Int64, tot: Int64)] = []
+        var rates: [Double] = []
+        var transferring = false
     }
 
-    /// 有活跃任务时开始轮询 content_log(已在跑则忽略)。主线程调用。
+    static func isActive(_ state: Job.State) -> Bool {
+        switch state { case .queued, .connecting, .downloading: return true; default: return false }
+    }
     private func ensureLogPolling() {
         guard logTimer == nil, jobs.contains(where: { Self.isActive($0.state) }) else { return }
         let timer = DispatchSource.makeTimerSource(queue: logQueue)
-        timer.schedule(deadline: .now() + 0.4, repeating: 0.4)
+        timer.schedule(deadline: .now() + 0.2, repeating: 0.4)
         timer.setEventHandler { [weak self] in self?.pollLog() }
-        logTimer = timer
-        timer.resume()
+        logTimer = timer; timer.resume()
     }
+    private func stopLogPolling() { logTimer?.cancel(); logTimer = nil }
 
-    private func stopLogPolling() {   // 主线程调用
-        logTimer?.cancel()
-        logTimer = nil
-    }
-
-    /// 每个会话只读自己的 HOME 下的日志，绝不按大小猜任务归属。
     private func pollLog() {
         lock.lock(); let active = sessions; lock.unlock()
-        var updates: [(String, [(cur: Int64, tot: Int64)], [Int])] = []
+        var updates: [ProgressUpdate] = []
+        var keys = Set<String>()
         for (id, session) in active {
             session.condition.lock()
-            let ready = session.logsReady, generation = session.generation
+            let ready = session.logsReady && session.commandID == id
+            let token = session.commandGeneration, baseline = session.logBaseline
             session.condition.unlock()
             guard ready else { continue }
-            let key = "\(id):\(generation)"
-            var cursor = logCursors[key] ?? LogCursor()
+            let key = "\(id):\(token)"; keys.insert(key)
+            var cursor = logCursors[key] ?? LogCursor(offset: baseline)
+            var update = ProgressUpdate(id: id, token: token)
             let url = workerHome(session.slot).appendingPathComponent("Library/Application Support/Steam/logs/content_log.txt")
-            var samples: [(cur: Int64, tot: Int64)] = []; var counts: [Int] = []
-            if let fh = try? FileHandle(forReadingFrom: url) {
-                defer { try? fh.close() }
-                let end = (try? fh.seekToEnd()) ?? 0
+            if let file = try? FileHandle(forReadingFrom: url) {
+                defer { try? file.close() }
+                let end = (try? file.seekToEnd()) ?? 0
                 if end < cursor.offset { cursor = LogCursor() }
                 if end > cursor.offset {
-                    try? fh.seek(toOffset: cursor.offset)
-                    let data = (try? fh.readToEnd()) ?? Data(); cursor.offset = end
+                    try? file.seek(toOffset: cursor.offset)
+                    let data = (try? file.readToEnd()) ?? Data(); cursor.offset = end
                     var lines = (cursor.tail + String(decoding: data, as: UTF8.self)).components(separatedBy: "\n")
                     cursor.tail = lines.popLast() ?? ""
                     for line in lines {
-                        if line.contains("AppID \(appID)"), let sample = Self.parseDownloadLine(line) { samples.append(sample) }
-                        if let n = Self.parseChunkCount(line, appID: appID) { counts.append(n) }
+                        if line.contains("AppID \(appID)"), let sample = Self.parseDownloadLine(line) { update.samples.append(sample) }
+                        if let rate = Self.parseDownloadRate(line) { update.rates.append(rate) }
+                        if line.contains("Downloading "), line.contains("chunks for depot \(appID)") { update.transferring = true }
                     }
                 }
             }
-            logCursors[key] = cursor
-            updates.append((id, samples, counts))
+            session.condition.lock()
+            if session.commandID == id, session.commandGeneration == token {
+                for sample in update.samples where sample.cur > session.observedBytes {
+                    session.observedBytes = sample.cur; session.lastActivityAt = Date()
+                }
+                if update.rates.contains(where: { $0 > 0 }) { session.lastActivityAt = Date() }
+            }
+            session.condition.unlock()
+            logCursors[key] = cursor; updates.append(update)
         }
-        let keys = Set(updates.map { $0.0 })
-        logCursors = logCursors.filter { keys.contains($0.key.components(separatedBy: ":")[0]) }
+        logCursors = logCursors.filter { keys.contains($0.key) }
         DispatchQueue.main.async { self.applyLogSamples(updates) }
     }
 
-    private func applyLogSamples(_ updates: [(String, [(cur: Int64, tot: Int64)], [Int])]) {
+    private func applyLogSamples(_ updates: [ProgressUpdate]) {
         let now = Date()
-        for (id, samples, counts) in updates {
-            guard let i = jobs.firstIndex(where: { $0.id == id && Self.isActive($0.state) }) else { continue }
-            if let n = counts.last { jobs[i].totalChunks = n }
-            for sample in samples {
+        for update in updates {
+            lock.lock(); let session = sessions[update.id]; lock.unlock()
+            guard let session else { continue }
+            session.condition.lock(); let current = session.commandID == update.id && session.commandGeneration == update.token; session.condition.unlock()
+            guard current, let i = jobs.firstIndex(where: { $0.id == update.id && Self.isActive($0.state) }) else { continue }
+            if update.transferring || update.rates.contains(where: { $0 > 0 }) {
+                if jobs[i].phase != .transferring { jobs[i].phaseStartedAt = now }
+                jobs[i].state = .downloading; jobs[i].phase = .transferring
+            }
+            for sample in update.samples {
                 jobs[i].logTotal = sample.tot
-                jobs[i].downloadedBytes = max(jobs[i].downloadedBytes, sample.cur)
-                jobs[i].lastSampleTime = now
-                if sample.cur > 0 { jobs[i].state = .downloading; jobs[i].phase = .transferring }
+                if sample.cur >= jobs[i].downloadedBytes {
+                    jobs[i].downloadedBytes = sample.cur; jobs[i].lastSampleTime = now
+                }
+            }
+            if let rate = update.rates.last {
+                jobs[i].liveSpeedMBps = rate; jobs[i].speedSampleTime = now
             }
         }
-        // 主信号:每个活跃任务查 .patch 块进度(单调),并按「有效已下载量」逐次增量算实时速率。
-        // patch 块数高频增长(每块即更新),所以速率不再依赖稀疏的 content_log 字节采样。
         for i in jobs.indices where Self.isActive(jobs[i].state) {
-            let c = committedChunks(forID: jobs[i].id)
-            if c > jobs[i].committedChunks {
-                jobs[i].committedChunks = c
-                jobs[i].state = .downloading
-                jobs[i].phase = .transferring
-            }
-            // 速率用**单调的块量**算(committedChunks × 真实平均块大小),不用会随分母切换突跳的 fraction →
-            // 速度无尖峰、无长时间不更新(修复3)。N 未到时按 1MB/块近似(仅影响极早期速度显示)。
-            let bytesPerChunk = jobs[i].totalChunks > 0
-                ? Double(jobs[i].effectiveTotal) / Double(jobs[i].totalChunks)
-                : 1_048_576.0
-            let eff = Int64(Double(jobs[i].committedChunks) * bytesPerChunk)
-            if jobs[i].lastSpeedBytes >= 0, let lt = jobs[i].lastSpeedTime {
-                let dt = now.timeIntervalSince(lt)
-                if dt >= 1.0 {   // 1s 窗口:平掉块提交的突发,速率更稳更准
-                    let inst = Double(eff - jobs[i].lastSpeedBytes) / 1_048_576 / dt
-                    if inst >= 0 {
-                        // EMA 平滑:新旧各半
-                        jobs[i].liveSpeedMBps = jobs[i].liveSpeedMBps > 0 ? jobs[i].liveSpeedMBps * 0.5 + inst * 0.5 : inst
-                    }
-                    jobs[i].lastSpeedBytes = eff
-                    jobs[i].lastSpeedTime = now
-                }
-            } else {
-                jobs[i].lastSpeedBytes = eff
-                jobs[i].lastSpeedTime = now
-            }
+            if let time = jobs[i].speedSampleTime, now.timeIntervalSince(time) > 90 { jobs[i].liveSpeedMBps = 0 }
         }
         if !jobs.contains(where: { Self.isActive($0.state) }) { stopLogPolling() }
     }
 
-    /// 读该任务临时目录里的 .patch 文件大小 → 已提交块数(每块 24 字节)。读不到返回 0。
-    private func committedChunks(forID id: String) -> Int {
-        let dir = itemRoot(id).appendingPathComponent("steamapps/workshop/downloads").path
-        guard let files = try? FileManager.default.contentsOfDirectory(atPath: dir),
-              let name = files.first(where: { $0.hasSuffix("_\(id).patch") }),
-              let attrs = try? FileManager.default.attributesOfItem(atPath: dir + "/" + name),
-              let size = (attrs[.size] as? NSNumber)?.intValue else { return 0 }
-        return size / 24
+    /// 只把超过固定文件头的增长当活动证据；不假设私有 patch 记录的布局。
+    private func patchSize(forID id: String) -> Int {
+        let directory = itemRoot(id).appendingPathComponent("steamapps/workshop/downloads")
+        guard let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil),
+              let file = files.first(where: { $0.lastPathComponent.hasSuffix("_\(id).patch") }),
+              let size = (try? FileManager.default.attributesOfItem(atPath: file.path)[.size]) as? NSNumber else { return 0 }
+        return size.intValue
     }
-
     private func removePatchFiles(forID id: String) {
-        let dir = stagingRoot.appendingPathComponent("steamapps/workshop/downloads")
-        guard let files = try? FileManager.default.contentsOfDirectory(
-            at: dir,
-            includingPropertiesForKeys: nil
-        ) else { return }
-        for file in files where file.lastPathComponent.hasSuffix("_\(id).patch") {
-            try? FileManager.default.removeItem(at: file)
+        for root in candidateRoots(id) {
+            let directory = root.appendingPathComponent("steamapps/workshop/downloads")
+            guard let files = try? FileManager.default.contentsOfDirectory(at: directory, includingPropertiesForKeys: nil) else { continue }
+            for file in files where file.lastPathComponent.hasSuffix("_\(id).patch") { try? FileManager.default.removeItem(at: file) }
         }
+    }
+    /// Steam 用十进制 Mbps；界面用 MiB/s。只接受明确的当前采样，不读连接数调节里的历史值。
+    static func parseDownloadRate(_ line: String) -> Double? {
+        guard let range = line.range(of: #"Current download rate: [0-9]+(?:\.[0-9]+)? Mbps"#, options: .regularExpression) else { return nil }
+        let value = line[range].dropFirst("Current download rate: ".count).dropLast(" Mbps".count)
+        guard let rate = Double(value), rate.isFinite, rate >= 0 else { return nil }
+        return rate * 1_000_000 / 8 / 1_048_576
     }
 
     /// 解析 "… : download <cur>/<tot>, …" 里的 (已下载, 总) 字节。非进度行返回 nil。

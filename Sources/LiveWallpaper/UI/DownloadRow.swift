@@ -51,7 +51,7 @@ struct DownloadRow: View {
         switch job.state {
         case .queued: return job.phase == .subscribing ? "正在同步订阅" : "等待空闲下载通道"
         case .connecting:
-            let elapsed = Int(job.startTime.map { max(0, now.timeIntervalSince($0)) } ?? 0)
+            let elapsed = Int((job.phaseStartedAt ?? job.startTime).map { max(0, now.timeIntervalSince($0)) } ?? 0)
             return job.compactStatus + " · \(elapsed) 秒" + (job.attempt > 1 ? " · 第 \(job.attempt) 次尝试" : "")
         case .downloading:
             if job.phase == .installing { return "下载完成，正在加入壁纸库" }

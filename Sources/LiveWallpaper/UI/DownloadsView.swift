@@ -13,8 +13,8 @@ struct DownloadsView: View {
         VStack(spacing: 0) {
             header
             HStack(spacing: 10) {
-                metric("并行下载", value: "\(downloader.activeCount)")
-                metric("等待中", value: "\(downloader.queuedCount)")
+                metric("并行下载", value: "\(downloader.transferringCount)")
+                metric("等待 / 准备", value: "\(downloader.queuedCount + downloader.preparingCount)")
                 metric("同时下载", value: "最多 \(downloader.maximumConcurrentDownloads) 项")
             }.padding(.horizontal, 18).padding(.bottom, 18)
             Divider().opacity(0.3)
