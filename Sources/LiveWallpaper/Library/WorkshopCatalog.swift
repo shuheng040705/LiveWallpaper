@@ -192,7 +192,7 @@ actor WorkshopCatalogService {
         for record in loaderRecords(html) {
             guard let declared = record["declaredTags"] as? [String: Any],
                   let rawGroups = declared["readytouse_tags"] as? [[String: Any]] else { continue }
-            let translated = ["Type": "壁纸类型", "Age Rating": "内容分级", "Genre": "题材",
+            let translated = ["Type": "壁纸类型", "Age Rating": "内容分级", "Genre": "题材", "Miscellaneous": "特性", "Asset Genre": "资源题材", "Script Type": "脚本类型",
                               "Resolution": "分辨率", "Category": "分类", "Asset Type": "资源类型"]
             return rawGroups.compactMap { group in
                 guard let name = group["name"] as? String, let raw = group["tags"] as? [[String: Any]] else { return nil }

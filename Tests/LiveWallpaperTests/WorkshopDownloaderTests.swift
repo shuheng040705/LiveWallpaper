@@ -26,6 +26,156 @@ final class WorkshopDownloaderTests: XCTestCase {
         wait(for: [done], timeout: 3)
     }
 
+    private func makeDownloaderFixture(timeouts: WorkshopDownloader.Timeouts = .init()) throws -> (WorkshopDownloader, URL) {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        let script = root.appendingPathComponent("steamcmd-fixture")
+        // Exercise the real scheduler, pipes, cancellation and installation with controllable processes.
+        let body = """
+        #!/bin/sh
+        base="\(root.path)"
+        while [ "$#" -gt 0 ]; do
+          if [ "$1" = "+force_install_dir" ]; then shift; dest="$1"; fi
+          shift
+        done
+        echo 'Waiting for user info...OK'
+        while read -r command app item; do
+          if [ "$command" = 'quit' ]; then exit 0; fi
+          if [ "$command" != 'workshop_download_item' ]; then continue; fi
+          echo "Downloading item $item ..."
+          mkdir -p "$HOME/Library/Application Support/Steam/logs" "$dest/steamapps/workshop/downloads"
+          chunks=1
+          if [ "$item" = '1234567891' ]; then chunks=3; fi
+          echo 'Downloading 4 chunks for depot 431960' > "$HOME/Library/Application Support/Steam/logs/content_log.txt"
+          echo "AppID 431960 update started : download $((chunks * 1024))/4096" >> "$HOME/Library/Application Support/Steam/logs/content_log.txt"
+          dd if=/dev/zero of="$dest/steamapps/workshop/downloads/state_431960_431960_$item.patch" bs=24 count="$chunks" 2>/dev/null
+          touch "$base/started.$item.$$"
+          while [ ! -f "$base/release.$item" ]; do sleep 0.05; done
+          mkdir -p "$dest/steamapps/workshop/content/431960/$item"
+          echo '{}' > "$dest/steamapps/workshop/content/431960/$item/project.json"
+          echo "Success. Downloaded item $item to destination (1024 bytes)"
+        done
+        """
+        try body.write(to: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+        let library = root.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        return (WorkshopDownloader(stagingDirectory: root.appendingPathComponent("cache"), executable: script,
+                                   libraryDirectory: library, account: "fixture", timeouts: timeouts), root)
+    }
+
+    @MainActor
+    func testThreeRealWorkersOverlapAndCancellingOneDoesNotCancelOthers() throws {
+        let (downloader, root) = try makeDownloaderFixture()
+        defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
+        let ids = ["1234567890", "1234567891", "1234567892", "1234567893"]
+        let started = expectation(description: "Three processes have received their commands")
+        for id in ids { downloader.enqueue(id: id, title: id) }
+        DispatchQueue.global().async {
+            let deadline = Date().addingTimeInterval(5)
+            while Date() < deadline {
+                let names = (try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []
+                if ids.prefix(3).allSatisfy({ id in names.contains(where: { $0.hasPrefix("started." + id + ".") }) }) {
+                    started.fulfill(); return
+                }
+                Thread.sleep(forTimeInterval: 0.02)
+            }
+        }
+        wait(for: [started], timeout: 6)
+        XCTAssertEqual(downloader.activeCount, 3)
+        XCTAssertEqual(downloader.jobs.first(where: { $0.id == ids[3] })?.state, .queued)
+        downloader.requestCancel(id: ids[0])
+        for id in ids.dropFirst() { try Data().write(to: root.appendingPathComponent("release." + id)) }
+        let completed = expectation(description: "Other workers finish and queued work starts")
+        var observation: AnyCancellable?
+        var fulfilled = false
+        observation = downloader.$jobs.removeDuplicates().sink { jobs in
+            if !fulfilled, ids.dropFirst().allSatisfy({ id in jobs.contains(where: { $0.id == id && $0.state == .done }) }) { fulfilled = true; completed.fulfill() }
+        }
+        wait(for: [completed], timeout: 10)
+        observation?.cancel()
+        XCTAssertEqual(downloader.jobs.first(where: { $0.id == ids[0] })?.state, .cancelled)
+        for id in ids.dropFirst() {
+            XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("library/" + id + "/project.json").path))
+        }
+    }
+
+    @MainActor
+    func testEqualSizedConcurrentDownloadsKeepIndependentProgress() throws {
+        let (downloader, root) = try makeDownloaderFixture()
+        defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
+        let sampled = expectation(description: "Progress from independent log files is attributed by item")
+        var fulfilled = false
+        let observation = downloader.$jobs.sink { jobs in
+            guard !fulfilled,
+                  let first = jobs.first(where: { $0.id == "1234567890" }),
+                  let second = jobs.first(where: { $0.id == "1234567891" }),
+                  first.logTotal == 4096, second.logTotal == 4096,
+                  first.totalChunks == 4, second.totalChunks == 4,
+                  first.committedChunks == 1, second.committedChunks == 3 else { return }
+            XCTAssertEqual(first.fraction, 0.25)
+            XCTAssertEqual(second.fraction, 0.75)
+            fulfilled = true; sampled.fulfill()
+        }
+        downloader.enqueue(id: "1234567890", title: "A", sizeBytes: 4096)
+        downloader.enqueue(id: "1234567891", title: "B", sizeBytes: 4096)
+        wait(for: [sampled], timeout: 6)
+        observation.cancel()
+    }
+
+    @MainActor
+    func testStalledWorkerRetriesAndReleasesSlotWhileOtherDownloadsComplete() throws {
+        let (downloader, root) = try makeDownloaderFixture(timeouts: .init(login: 2, commandStart: 0.4, noProgress: 0.4, retryDelay: 0.01))
+        defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
+        let stalled = "1234567890", healthy = "1234567891"
+        try Data().write(to: root.appendingPathComponent("release." + healthy))
+        let terminal = expectation(description: "Watchdog terminates instead of hanging forever")
+        var observation: AnyCancellable?
+        var fulfilled = false
+        observation = downloader.$jobs.removeDuplicates().sink { jobs in
+            guard jobs.contains(where: { $0.id == healthy && $0.state == .done }),
+                  let job = jobs.first(where: { $0.id == stalled }) else { return }
+            if case .failed = job.state, !fulfilled { fulfilled = true; terminal.fulfill() }
+        }
+        downloader.enqueue(id: stalled, title: "Stalled fixture")
+        downloader.enqueue(id: healthy, title: "Healthy fixture")
+        wait(for: [terminal], timeout: 12)
+        observation?.cancel()
+        let starts = try FileManager.default.contentsOfDirectory(atPath: root.path).filter { $0.hasPrefix("started." + stalled + ".") }
+        XCTAssertEqual(starts.count, 2, "A stalled transfer should restart once in a fresh process")
+        XCTAssertEqual(downloader.jobs.first(where: { $0.id == stalled })?.attempt, 2)
+    }
+
+    @MainActor
+    func testLiveParallelIsolatedSteamCMDDownloads() throws {
+        guard ProcessInfo.processInfo.environment["LW_PARALLEL_STEAMCMD_INTEGRATION"] == "1" else { throw XCTSkip("显式启用真实并发下载验收") }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("lw-parallel-" + UUID().uuidString)
+        let library = root.appendingPathComponent("library")
+        try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
+        let account = UserDefaults(suiteName: "com.a55555.livewallpaper")?.string(forKey: "steamAccount")
+        guard let account, !account.isEmpty else { throw XCTSkip("真实并发下载需要已登录的下载账号") }
+        let downloader = WorkshopDownloader(stagingDirectory: root, libraryDirectory: library, account: account)
+        defer { downloader.shutdown() }
+        let titles = ["3820975067": "Phoenix - Halloween", "3829799406": "MeiMei in Snowy Street"]
+        let finished = expectation(description: "Two independent SteamCMD downloads reach a terminal state")
+        var observation: AnyCancellable?
+        var terminalIDs = Set<String>()
+        var sawOverlap = false
+        var fulfilled = false
+        observation = downloader.$jobs.removeDuplicates().sink { jobs in
+            if jobs.filter({ $0.state == .connecting || $0.state == .downloading }).count == 2 { sawOverlap = true }
+            terminalIDs.formUnion(jobs.filter { !WorkshopDownloader.isActive($0.state) }.map(\.id))
+            if !fulfilled, terminalIDs.count == 2 { fulfilled = true; finished.fulfill() }
+        }
+        for (id, title) in titles { downloader.enqueue(id: id, title: title) }
+        wait(for: [finished], timeout: 480)
+        observation?.cancel()
+        XCTAssertTrue(sawOverlap)
+        for job in downloader.jobs { XCTAssertEqual(job.state, .done, job.title) }
+        for id in titles.keys { XCTAssertTrue(LocalWallpaperProbe.isReady(at: library.appendingPathComponent(id))) }
+        print("Parallel SteamCMD isolated artifacts: " + root.path)
+    }
+
     func testResolvesCurrentHomebrewCaskWrapperToBinary() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

@@ -3,7 +3,7 @@ import Foundation
 /// 所有“下载/订阅”入口共用的编排器。
 ///
 /// - CrossOver Steam 在线：先完成社区订阅，再让该客户端优先下载；
-/// - 20 秒没有接管：WorkshopDownloader 自动回退常驻 SteamCMD；
+/// - 20 秒没有接管：WorkshopDownloader 自动回退独立 SteamCMD；
 /// - Steam 不在线：SteamCMD 立即开始，订阅事务并行补齐；
 /// - 工坊网页已经确认订阅：不重复 POST，只选择下载后端。
 enum WorkshopAcquisition {

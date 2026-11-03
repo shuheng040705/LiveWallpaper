@@ -2,15 +2,22 @@ import SwiftUI
 
 /// 「下载管理」窗口内容:集中查看所有下载任务的进度,可取消、清除已完成。
 struct DownloadsView: View {
+    var embedded = false
+    @Environment(\.dismiss) private var dismiss
     @ObservedObject private var downloader = WorkshopDownloader.shared
-    private let accent = Color.accentColor
+    private let accent = Color(red: 0.35, green: 0.82, blue: 0.91)
 
     @State private var showLogin = false
 
     var body: some View {
         VStack(spacing: 0) {
             header
-            Divider().opacity(0.4)
+            HStack(spacing: 10) {
+                metric("并行下载", value: "\(downloader.activeCount)")
+                metric("等待中", value: "\(downloader.queuedCount)")
+                metric("同时下载", value: "最多 \(downloader.maximumConcurrentDownloads) 项")
+            }.padding(.horizontal, 18).padding(.bottom, 18)
+            Divider().opacity(0.3)
             if downloader.loginExpired { loginExpiredBanner }
             if downloader.jobs.isEmpty {
                 emptyState
@@ -24,7 +31,8 @@ struct DownloadsView: View {
             }
         }
         .frame(minWidth: 480, minHeight: 440)
-        .background(VisualEffectView(material: .underWindowBackground).ignoresSafeArea())
+        .background(Color(red: 0.055, green: 0.065, blue: 0.085).ignoresSafeArea())
+        .preferredColorScheme(.dark)
         .sheet(isPresented: $showLogin) {
             SteamLoginSheet(onDone: { downloader.loginExpired = false })
         }
@@ -55,7 +63,7 @@ struct DownloadsView: View {
         HStack(spacing: 11) {
             Image(systemName: "arrow.down.circle.fill").font(.system(size: 19)).foregroundStyle(accent)
             VStack(alignment: .leading, spacing: 1) {
-                Text("下载管理").font(.system(size: 15, weight: .bold))
+                Text("下载中心").font(.system(size: 21, weight: .bold, design: .rounded))
                 Text(statusLine).font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
@@ -67,6 +75,11 @@ struct DownloadsView: View {
                 .buttonStyle(.plain).foregroundStyle(.secondary)
                 .padding(.horizontal, 10).padding(.vertical, 5)
                 .background(RoundedRectangle(cornerRadius: 7).fill(.white.opacity(0.07)))
+            }
+            if embedded {
+                Button { dismiss() } label: { Image(systemName: "xmark").font(.system(size: 11)).frame(width: 26, height: 26)
+                        .background(.white.opacity(0.06), in: Circle()) }
+                    .buttonStyle(.plain).help("关闭下载中心").accessibilityLabel("关闭下载中心")
             }
         }
         .padding(.horizontal, 18).padding(.top, 18).padding(.bottom, 14)
@@ -85,10 +98,18 @@ struct DownloadsView: View {
         VStack(spacing: 12) {
             Image(systemName: "tray.and.arrow.down").font(.system(size: 40)).foregroundStyle(.tertiary)
             Text("暂无下载任务").font(.system(size: 13, weight: .medium)).foregroundStyle(.secondary)
-            Text("在创意工坊页进入壁纸详情,点「下载」即可添加").font(.system(size: 11)).foregroundStyle(.tertiary)
+            Text("在创意工坊点击「订阅」，即可开始并行下载").font(.system(size: 11)).foregroundStyle(.tertiary)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .padding(.bottom, 30)
+    }
+
+    private func metric(_ title: String, value: String) -> some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text(title).font(.system(size: 10)).foregroundStyle(.secondary)
+            Text(value).font(.system(size: 17, weight: .semibold, design: .rounded)).monospacedDigit()
+        }.frame(maxWidth: .infinity, alignment: .leading).padding(13)
+            .background(.white.opacity(0.035), in: RoundedRectangle(cornerRadius: 11))
     }
 
     private func isFinished(_ s: WorkshopDownloader.Job.State) -> Bool {
