@@ -34,7 +34,6 @@ final class SteamWebLoginWindowController: NSObject, NSWindowDelegate, WKNavigat
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .default()
         WebMediaCapturePolicy.install(into: config.userContentController)
-        WorkshopWebCompatibility.install(into: config.userContentController)
         let web = WKWebView(frame: .zero, configuration: config)
         web.navigationDelegate = self
         web.uiDelegate = self

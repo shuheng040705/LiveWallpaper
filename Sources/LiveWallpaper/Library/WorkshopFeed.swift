@@ -187,33 +187,15 @@ final class WorkshopFeed: ObservableObject {
     /// 拉取并解析。网络/解析失败返回 nil(调用方据此降级)。在后台执行,不阻塞主线程。
     private static func fetch(appID: String, sort: Sort, limit: Int,
                              session: URLSession) async -> [Item]? {
-        var comps = URLComponents(string: "https://steamcommunity.com/workshop/browse/")!
-        var query: [URLQueryItem] = [
-            .init(name: "appid", value: appID),
-            .init(name: "browsesort", value: sort.browseValue),
-            .init(name: "actualsort", value: sort.browseValue),
-            .init(name: "section", value: "readytouseitems"),
-            .init(name: "p", value: "1"),
-            .init(name: "numperpage", value: "30"),
-        ]
-        // 「本周最热」额外带时间窗 days=7(Steam 浏览页 trend 排序需要 days 才是「本周」)。
-        if let days = sort.browseDays {
-            query.append(.init(name: "days", value: String(days)))
-        }
-        comps.queryItems = query
-        guard let url = comps.url else { return nil }
-        var req = URLRequest(url: url)
-        // 真实浏览器 UA:Steam 对默认 URLSession UA 可能返回精简/空页。
-        req.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-                     forHTTPHeaderField: "User-Agent")
-        req.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
         do {
-            let (data, resp) = try await session.data(for: req)
-            guard let http = resp as? HTTPURLResponse, (200..<300).contains(http.statusCode),
-                  let html = String(data: data, encoding: .utf8) else { return nil }
-            return parse(html, limit: limit)
+            let query = WorkshopQuery(sort: sort.browseValue, tags: ["Everyone"], days: sort.browseDays ?? 7)
+            let page = try await WorkshopCatalogService.shared.browse(query)
+            return page.items.prefix(limit).compactMap { item in
+                guard let preview = item.previewURL else { return nil }
+                return Item(id: item.id, title: item.title, previewURL: preview)
+            }
         } catch {
-            Log.write("WorkshopFeed: 拉取失败 \(error.localizedDescription)")
+            Log.write("WorkshopFeed: 目录加载失败 \(error.localizedDescription)")
             return nil
         }
     }

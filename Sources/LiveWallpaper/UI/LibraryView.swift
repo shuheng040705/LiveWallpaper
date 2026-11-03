@@ -245,7 +245,7 @@ struct LibraryView: View {
         switch tab {
         case .home: homeView
         case .library: libraryBrowse
-        case .workshop: WorkshopView().background(WaifuTheme.background)
+        case .workshop: WorkshopView(library: library, actions: actions).background(WaifuTheme.background)
         }
     }
 

@@ -39,6 +39,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         SteamWebSession.shared.refresh()
         // 首页预览每次重启重新渲染一遍(清磁盘缓存),反映引擎最新改动(用户要求)。
         RenderedPreviewCache.shared.invalidateAllOnLaunch()
+        // UI 预览也使用完整的窗口/订阅事件连接，便于实测原生工坊交互。
+        observeDownloads()
         // UI 预览模式(WP_UI_PREVIEW=1,截图验证用):不启动桌面渲染/电源/轮换,
         // 只扫描库并打开主窗口 → 可对新 UI 截图,而不干扰正在运行的壁纸实例。
         if WPEnv.vars["WP_UI_PREVIEW"] != nil {
@@ -51,10 +53,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         WorkshopDownloader.shared.prewarm()   // 后台预热 steamcmd → 首次下载跳过冷启动等待
         library.scan { [weak self] in
             self?.restoreOrOpenLibrary()
+            if WPEnv.vars["WP_PREVIEW_TAB"] != nil { self?.openLibrary() }
             self?.rotation.reschedule()
         }
         startWatchingLibrary()
-        observeDownloads()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -71,6 +73,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self, selector: #selector(openSubscriptions), name: .showSubscriptions, object: nil)
         NotificationCenter.default.addObserver(
             self, selector: #selector(onUnsubscribeWallpaper(_:)), name: .unsubscribeWallpaper, object: nil)
+        NotificationCenter.default.addObserver(
+            self, selector: #selector(onWorkshopRemoveLocal(_:)), name: .workshopRemoveLocal, object: nil)
         WorkshopDownloader.shared.$jobs
             .receive(on: DispatchQueue.main)
             .sink { [weak self] jobs in
@@ -87,6 +91,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     /// 打开「我的 Steam 订阅」窗口(独立可拖拽改大小的 NSWindow,取代原 SwiftUI sheet)。
     @objc private func openSubscriptions() { subscriptionsWindow.show() }
+
+    /// 原生工坊已确认 Steam 退订、并等待本地下载退出；这里只卸载并回报最终结果。
+    @objc private func onWorkshopRemoveLocal(_ note: Notification) {
+        guard let id = note.userInfo?["id"] as? String,
+              let completion = note.userInfo?["completion"] as? (String?) -> Void,
+              WallpaperUninstallPolicy.isSteamWorkshopID(id) else { return }
+        guard !uninstallingIDs.contains(id) else { completion("该壁纸正在卸载，请稍后重试"); return }
+        let folder = PreferencesStore.shared.libraryRoot.appendingPathComponent(id, isDirectory: true)
+        guard FileManager.default.fileExists(atPath: folder.path) else { completion(nil); return }
+        uninstallingIDs.insert(id)
+        let item = library.item(id: id)
+        removeLocalWallpaper(id: id, title: item?.title ?? "创意工坊壁纸", folderURL: folder,
+                             restoreItem: item, subscriptionWasCancelled: true,
+                             downloadAlreadyDiscarded: true, completion: completion)
+    }
 
     /// Steam 网页已经取消订阅 → 只做本地卸载。此通知的前置条件是 Steam 操作已经成功，
     /// 所以不能再走一次网页退订，也不能误报成“无论成功都删”。
@@ -276,7 +295,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         title: String,
         folderURL: URL,
         restoreItem: WallpaperItem?,
-        subscriptionWasCancelled: Bool
+        subscriptionWasCancelled: Bool,
+        downloadAlreadyDiscarded: Bool = false,
+        completion: ((String?) -> Void)? = nil
     ) {
         guard WallpaperUninstallPolicy.isSafeLibraryChild(
             folderURL: folderURL,
@@ -284,6 +305,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ) else {
             uninstallingIDs.remove(id)
             Log.write("uninstall: refused unsafe path \(folderURL.path)")
+            if let completion { completion(WallpaperUninstallError.unsafePath.localizedDescription); return }
             showLocalRemovalFailure(
                 title: title,
                 subscriptionWasCancelled: subscriptionWasCancelled,
@@ -292,7 +314,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
 
-        WorkshopDownloader.shared.remove(id: id)
+        if !downloadAlreadyDiscarded { WorkshopDownloader.shared.remove(id: id) }
         RenderedPreviewCache.shared.cancel(id)
 
         let wasCurrent = desktop.currentID == id
@@ -308,6 +330,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             Log.write("uninstall: trashed \(id), steamCancelled=\(subscriptionWasCancelled)")
             uninstallingIDs.remove(id)
             library.scan()
+            completion?(nil)
         } catch {
             Log.write("uninstall: trash failed \(id): \(error)")
             uninstallingIDs.remove(id)
@@ -316,6 +339,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             } else if wasLastWallpaper {
                 PreferencesStore.shared.lastWallpaperID = id
             }
+            if let completion { completion(error.localizedDescription); return }
             showLocalRemovalFailure(
                 title: title,
                 subscriptionWasCancelled: subscriptionWasCancelled,

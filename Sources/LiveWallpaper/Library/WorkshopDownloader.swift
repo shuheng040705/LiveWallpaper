@@ -7,6 +7,8 @@ import Foundation
 /// 注意:依赖系统装有 steamcmd(brew install --cask steamcmd)。未装时给出提示。
 final class WorkshopDownloader: ObservableObject {
     static let shared = WorkshopDownloader()
+    private let stagingDirectoryOverride: URL?
+    init(stagingDirectory: URL? = nil) { stagingDirectoryOverride = stagingDirectory }
     private let appID = "431960"
     // WE 把下载交给一个常驻 Steam Client；SteamCMD 也必须复用单一会话。
     // 多开 SteamCMD 不是真正的“3 路下载”，它们会争抢同一份登录/config/content_log，
@@ -125,6 +127,7 @@ final class WorkshopDownloader: ObservableObject {
     private let lock = NSLock()
     private var processes: [String: Process] = [:]   // 进行中的 steamcmd(供取消)
     private var cancelledSet: Set<String> = []        // 已请求取消的 id
+    private var discardingIDs: Set<String> = []
     private var stopping = false
     private var isStopping: Bool {
         lock.lock(); defer { lock.unlock() }
@@ -152,6 +155,7 @@ final class WorkshopDownloader: ObservableObject {
     /// 稳定暂存目录：网络失败后保留 .patch/chunk，重试时 SteamCMD 可以续传。
     /// 旧实现每次 retry 都删 /tmp/lw_dl_<id>，任何断网都会从 0 开始。
     private lazy var stagingRoot: URL = {
+        if let stagingDirectoryOverride { return stagingDirectoryOverride }
         let base = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
         return base.appendingPathComponent("com.a55555.livewallpaper/SteamWorkshop", isDirectory: true)
     }()
@@ -950,6 +954,9 @@ final class WorkshopDownloader: ObservableObject {
     }
 
     private func finish(_ id: String, _ s: Job.State, bytes: Int64 = 0, elapsed: TimeInterval = 0) {
+        lock.lock(); let discarding = discardingIDs.contains(id); lock.unlock()
+        // 退订会主动丢弃下载，不弹“保留文件”询问；由 discard 等 worker 收尾后统一清理。
+        if discarding { return }
         clearTracking(id)
         DispatchQueue.main.async {
             if let i = self.jobs.firstIndex(where: { $0.id == id }) {
@@ -994,6 +1001,36 @@ final class WorkshopDownloader: ObservableObject {
             }
             self.pump()
         }
+    }
+
+    /// 退订的确定性收尾：先阻止安装，等本条目的 worker 退出后再清暂存并允许删除库目录。
+    /// 普通“取消下载”仍保留原先的保留/删除询问。
+    func discard(id: String, completion: @escaping () -> Void) {
+        precondition(Thread.isMainThread)
+        guard WallpaperUninstallPolicy.isSteamWorkshopID(id) else { completion(); return }
+        let active = jobs.first(where: { $0.id == id }).map { $0.state == .connecting || $0.state == .downloading } ?? false
+        lock.lock()
+        cancelledSet.insert(id)
+        discardingIDs.insert(id)
+        let process = processes[id]
+        lock.unlock()
+        if let process { DispatchQueue.global(qos: .utility).async { Self.killProcessTree(process) } }
+        let cleanup = {
+            for kind in ["content", "downloads"] {
+                let folder = self.stagingRoot.appendingPathComponent("steamapps/workshop/\(kind)/\(self.appID)/\(id)")
+                try? FileManager.default.removeItem(at: folder)
+            }
+            self.removePatchFiles(forID: id)
+            self.clearTracking(id)
+            DispatchQueue.main.async {
+                self.jobs.removeAll { $0.id == id }
+                self.lock.lock(); self.discardingIDs.remove(id); self.lock.unlock()
+                self.pump()
+                completion()
+            }
+        }
+        if active { workerQueue.async(execute: cleanup) }
+        else { DispatchQueue.global(qos: .utility).async(execute: cleanup) }
     }
 
     /// 取消后处理临时文件:keep=保留(若恰好已下完则入库),否则删除。最后移除任务。

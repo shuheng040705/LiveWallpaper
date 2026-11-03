@@ -3,6 +3,29 @@ import Combine
 @testable import LiveWallpaper
 
 final class WorkshopDownloaderTests: XCTestCase {
+    @MainActor
+    func testUnsubscribeDiscardRemovesPartialAndCommittedStagingWithoutTouchingAnotherItem() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let id = "1234567890"
+        let content = root.appendingPathComponent("steamapps/workshop/content/431960/\(id)")
+        let partial = root.appendingPathComponent("steamapps/workshop/downloads/431960/\(id)")
+        let other = root.appendingPathComponent("steamapps/workshop/downloads/431960/1234567891")
+        for folder in [content, partial, other] {
+            try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+            try Data("payload".utf8).write(to: folder.appendingPathComponent("test.dat"))
+        }
+        let done = expectation(description: "Discard finished")
+        let downloader = WorkshopDownloader(stagingDirectory: root)
+        downloader.discard(id: id) {
+            XCTAssertFalse(FileManager.default.fileExists(atPath: content.path))
+            XCTAssertFalse(FileManager.default.fileExists(atPath: partial.path))
+            XCTAssertTrue(FileManager.default.fileExists(atPath: other.appendingPathComponent("test.dat").path))
+            done.fulfill()
+        }
+        wait(for: [done], timeout: 3)
+    }
+
     func testResolvesCurrentHomebrewCaskWrapperToBinary() throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: root) }

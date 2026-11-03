@@ -12,15 +12,16 @@ struct SubscribedItem: Identifiable, Hashable {
 /// 都当订阅会让“仅下载”的壁纸在卸载时无意义地弹网页登录。客户端 VDF + 本记录共同构成证据。
 enum SteamSubscriptionRegistry {
     private static let key = "steam.confirmedSubscriptions.v1"
+    private static let removedKey = "steam.cancelledSubscriptions.v1"
     private static let lock = NSLock()
 
     static func markSubscribed(_ id: String) {
         guard WallpaperUninstallPolicy.isSteamWorkshopID(id) else { return }
-        mutate { $0.insert(id) }
+        mutate(id, subscribed: true)
     }
 
     static func markUnsubscribed(_ id: String) {
-        mutate { $0.remove(id) }
+        mutate(id, subscribed: false)
     }
 
     static func wasConfirmedByApp(_ id: String) -> Bool {
@@ -29,14 +30,27 @@ enum SteamSubscriptionRegistry {
     }
 
     static func isKnownSubscribed(_ id: String) -> Bool {
-        SteamSubscriptions.loadSubscriptions().contains { $0.id == id } || wasConfirmedByApp(id)
+        knownSubscribedIDs().contains(id)
     }
 
-    private static func mutate(_ change: (inout Set<String>) -> Void) {
+    static func knownSubscribedIDs() -> Set<String> {
+        let local = Set(SteamSubscriptions.loadSubscriptions().map(\.id))
         lock.lock(); defer { lock.unlock() }
+        let confirmed = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
+        let removed = Set(UserDefaults.standard.stringArray(forKey: removedKey) ?? [])
+        return local.union(confirmed).subtracting(removed)
+    }
+
+    private static func mutate(_ id: String, subscribed: Bool) {
+        lock.lock()
         var ids = Set(UserDefaults.standard.stringArray(forKey: key) ?? [])
-        change(&ids)
+        var removed = Set(UserDefaults.standard.stringArray(forKey: removedKey) ?? [])
+        if subscribed { ids.insert(id); removed.remove(id) }
+        else { ids.remove(id); removed.insert(id) }
         UserDefaults.standard.set(ids.sorted(), forKey: key)
+        UserDefaults.standard.set(removed.sorted(), forKey: removedKey)
+        lock.unlock()
+        DispatchQueue.main.async { NotificationCenter.default.post(name: .steamSubscriptionsDidChange, object: nil) }
     }
 }
 
