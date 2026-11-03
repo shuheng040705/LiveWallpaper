@@ -67,6 +67,116 @@ final class WorkshopDownloaderTests: XCTestCase {
     }
 
     @MainActor
+    private func waitForConnections(_ downloader: WorkshopDownloader, count: Int) {
+        let ready = expectation(description: "Authenticated idle pool is ready")
+        var fulfilled = false
+        let observation = downloader.$connectedSessionCount.sink { value in
+            if !fulfilled, value == count { fulfilled = true; ready.fulfill() }
+        }
+        wait(for: [ready], timeout: 6)
+        observation.cancel()
+    }
+
+    private func processBoots(at root: URL) -> Set<String> {
+        Set(((try? FileManager.default.contentsOfDirectory(atPath: root.path)) ?? []).filter { $0.hasPrefix("boot.") })
+    }
+
+    @MainActor
+    func testPrewarmConnectsWithoutJobsAndFirstDownloadReusesIdlePool() throws {
+        let (downloader, root) = try makeDownloaderFixture(timeouts: .init(connectionCheck: 0.05))
+        defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
+        for _ in 0..<5 { downloader.prewarm() }
+        waitForConnections(downloader, count: 3)
+        XCTAssertTrue(downloader.jobs.isEmpty, "Preconnecting must not subscribe or create download jobs")
+        let boots = processBoots(at: root)
+        XCTAssertEqual(boots.count, 3)
+        let id = "1234567890"
+        try Data().write(to: root.appendingPathComponent("release." + id))
+        let done = expectation(description: "First user download uses an idle authenticated worker")
+        var fulfilled = false
+        let observation = downloader.$jobs.sink { jobs in
+            if !fulfilled, jobs.first?.state == .done { fulfilled = true; done.fulfill() }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { downloader.enqueue(id: id, title: "First download") }
+        wait(for: [done], timeout: 6)
+        observation.cancel()
+        XCTAssertEqual(processBoots(at: root), boots, "Idle checks and repeated prewarm calls must not restart healthy processes")
+    }
+
+    @MainActor
+    func testIdleExitedSessionReconnectsBeforeAnotherDownload() throws {
+        let (downloader, root) = try makeDownloaderFixture(timeouts: .init(connectionCheck: 0.05, reconnectDelay: 0.1))
+        defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
+        downloader.prewarm()
+        waitForConnections(downloader, count: 3)
+        let original = processBoots(at: root)
+        let pid = try XCTUnwrap(original.first.flatMap { Int32($0.dropFirst("boot.".count)) })
+        XCTAssertEqual(kill(pid, SIGTERM), 0)
+        let reconnected = expectation(description: "Dead idle worker is replaced automatically")
+        var fulfilled = false
+        let observation = downloader.$connectedSessionCount.sink { count in
+            if !fulfilled, count == 3, self.processBoots(at: root).count == 4 {
+                fulfilled = true; reconnected.fulfill()
+            }
+        }
+        wait(for: [reconnected], timeout: 6)
+        observation.cancel()
+        XCTAssertTrue(downloader.jobs.isEmpty)
+        XCTAssertEqual(original.intersection(processBoots(at: root)).count, 3)
+    }
+
+    @MainActor
+    func testBackgroundConnectionFailureBacksOffAndShutdownStopsRetrying() throws {
+        let (downloader, root) = try makeDownloaderFixture(timeouts: .init(connectionCheck: 0.02, reconnectDelay: 1))
+        defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("steamcmd-fixture")
+        let body = try String(contentsOf: script, encoding: .utf8)
+            .replacingOccurrences(of: "echo 'Waiting for user info...OK'", with: "echo 'ERROR (Timeout)'; exit 1")
+        try body.write(to: script, atomically: true, encoding: .utf8)
+        downloader.prewarm()
+        let stopped = expectation(description: "Failed background connection remains in backoff")
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { stopped.fulfill() }
+        wait(for: [stopped], timeout: 3)
+        XCTAssertEqual(processBoots(at: root).count, 1, "An outage must not create a login retry storm across all slots")
+        downloader.shutdown()
+        let quiet = expectation(description: "Shutdown prevents delayed prewarm calls and retries")
+        downloader.prewarm()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) { quiet.fulfill() }
+        wait(for: [quiet], timeout: 3)
+        XCTAssertEqual(processBoots(at: root).count, 1)
+    }
+
+    func testIdleDisconnectDetectionIgnoresFailuresBeforeACompletedLogin() {
+        XCTAssertTrue(WorkshopDownloader.outputShowsSessionDisconnect("Waiting for user info...OK\nLogged off: No Connection"))
+        XCTAssertTrue(WorkshopDownloader.outputShowsSessionDisconnect("Logged in OK\nDisconnected from Steam"))
+        XCTAssertFalse(WorkshopDownloader.outputShowsSessionDisconnect("No Connection\nWaiting for user info...OK"))
+        XCTAssertFalse(WorkshopDownloader.outputShowsSessionDisconnect("Logged in OK\nERROR! Download item 0 failed (File Not Found)."))
+    }
+
+    @MainActor
+    func testDownloadsArrivingDuringPrewarmDoNotShareAnInitializingSlot() throws {
+        let (downloader, root) = try makeDownloaderFixture(timeouts: .init(connectionCheck: 0.05))
+        defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("steamcmd-fixture")
+        let body = try String(contentsOf: script, encoding: .utf8)
+            .replacingOccurrences(of: "echo 'Waiting for user info...OK'", with: "sleep 0.2; echo 'Waiting for user info...OK'")
+        try body.write(to: script, atomically: true, encoding: .utf8)
+        let ids = (0..<4).map { "123456789" + String($0) }
+        for id in ids { try Data().write(to: root.appendingPathComponent("release." + id)) }
+        let done = expectation(description: "Work arriving during background login completes without overlapping stdin commands")
+        var fulfilled = false
+        let observation = downloader.$jobs.sink { jobs in
+            if !fulfilled, jobs.count == 4, jobs.allSatisfy({ $0.state == .done }) { fulfilled = true; done.fulfill() }
+        }
+        downloader.prewarm()
+        for id in ids { downloader.enqueue(id: id, title: id) }
+        wait(for: [done], timeout: 8)
+        observation.cancel()
+        XCTAssertEqual(processBoots(at: root).count, 3)
+        for id in ids { XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("library/" + id + "/project.json").path)) }
+    }
+
+    @MainActor
     func testThreeRealWorkersOverlapAndCancellingOneDoesNotCancelOthers() throws {
         let (downloader, root) = try makeDownloaderFixture()
         defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
@@ -286,6 +396,21 @@ final class WorkshopDownloaderTests: XCTestCase {
             if !fulfilled, scheduledSecond, jobs.count == 2, jobs.allSatisfy({ !WorkshopDownloader.isActive($0.state) }) { fulfilled = true; finished.fulfill() }
             if !fulfilled, !scheduledSecond, jobs.contains(where: { if case .failed = $0.state { return true }; return false }) { fulfilled = true; finished.fulfill() }
         }
+        var prewarmElapsed: TimeInterval?
+        if ProcessInfo.processInfo.environment["LW_STEAMCMD_PREWARM_INTEGRATION"] == "1" {
+            let ready = expectation(description: "A real idle SteamCMD connection is ready before the first download")
+            var fulfilledReady = false
+            let readiness = downloader.$connectedSessionCount.sink { count in
+                if !fulfilledReady, count > 0 { fulfilledReady = true; ready.fulfill() }
+            }
+            let started = Date()
+            downloader.prewarm()
+            wait(for: [ready], timeout: 240)
+            prewarmElapsed = Date().timeIntervalSince(started)
+            readiness.cancel()
+            guard downloader.connectedSessionCount > 0 else { throw NSError(domain: "PrewarmIntegration", code: 1) }
+            XCTAssertTrue(downloader.jobs.isEmpty)
+        }
         coldStart = Date()
         downloader.enqueue(id: firstID, title: "Still - Minimal Wallpaper for Your Focus")
         wait(for: [finished], timeout: 480)
@@ -293,9 +418,10 @@ final class WorkshopDownloaderTests: XCTestCase {
         for job in downloader.jobs { XCTAssertEqual(job.state, .done, job.title) }
         for id in [firstID, secondID] { XCTAssertTrue(LocalWallpaperProbe.isReady(at: library.appendingPathComponent(id))) }
         XCTAssertNotNil(warmInitialization)
+        if prewarmElapsed != nil, let coldInitialization { XCTAssertLessThan(coldInitialization, 3, "The first item must also skip login after prewarm") }
         if let warmInitialization { XCTAssertLessThan(warmInitialization, 3, "The next item must not repeat Steam login") }
         if !firstProcesses.isEmpty { XCTAssertEqual(processMarkers(), firstProcesses, "SteamCMD must reuse the actual process") }
-        print("SteamCMD speed benchmark: cold login=\(coldInitialization ?? -1)s, warm initialization=\(warmInitialization ?? -1)s, artifacts=\(root.path)")
+        print("SteamCMD speed benchmark: prewarm=\(prewarmElapsed ?? -1)s, first initialization=\(coldInitialization ?? -1)s, second initialization=\(warmInitialization ?? -1)s, artifacts=\(root.path)")
     }
 
     func testResolvesCurrentHomebrewCaskWrapperToBinary() throws {

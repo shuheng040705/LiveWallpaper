@@ -16,6 +16,8 @@ final class WorkshopDownloader: ObservableObject {
         var commandStart: TimeInterval = 60
         var noProgress: TimeInterval = 180
         var retryDelay: TimeInterval = 2
+        var connectionCheck: TimeInterval = 15
+        var reconnectDelay: TimeInterval = 30
     }
     private let timeouts: Timeouts
     init(stagingDirectory: URL? = nil, executable: URL? = nil, libraryDirectory: URL? = nil, account: String? = nil,
@@ -115,6 +117,8 @@ final class WorkshopDownloader: ObservableObject {
 
     @Published private(set) var jobs: [Job] = []
     @Published var loginExpired = false   // 检测到账号登录失效 → UI 弹「重新登录」提醒
+    @Published private(set) var connectedSessionCount = 0
+    @Published private(set) var preparingConnection = false
 
     private let startupLock = NSLock()
     private let loginQueue = DispatchQueue(label: "workshop.login", qos: .utility)
@@ -122,6 +126,12 @@ final class WorkshopDownloader: ObservableObject {
     // 只在主线程调度；槽位在实际 worker 退出之后释放，终态通知不能提前释放。
     private var runningSlots: [String: Int] = [:]
     private var authenticationInProgress = false
+    // 主线程管理；预连接也占用槽位，不能与下载向同一 stdin 同时写命令。
+    private var maintainingSlots: Set<Int> = []
+    private var connectionTimer: DispatchSourceTimer?
+    private var keepsConnectionsAlive = false
+    private var connectionFailures = 0
+    private var nextConnectionAttempt = Date.distantPast
     private let lock = NSLock()
     private var processes: [String: Process] = [:]   // 进行中的 steamcmd(供取消)
     private var cancelledSet: Set<String> = []        // 已请求取消的 id
@@ -153,8 +163,16 @@ final class WorkshopDownloader: ObservableObject {
         var output = Data()
         var terminated = false
         var generation = UUID()
-        var ready = false
-        var account: String?
+        private var storedReady = false
+        var ready: Bool {
+            get { condition.lock(); defer { condition.unlock() }; return storedReady }
+            set { condition.lock(); storedReady = newValue; condition.unlock() }
+        }
+        private var storedAccount: String?
+        var account: String? {
+            get { condition.lock(); defer { condition.unlock() }; return storedAccount }
+            set { condition.lock(); storedAccount = newValue; condition.unlock() }
+        }
         var outputHandle: FileHandle?
         var logsReady = false
         var commandID: String?
@@ -372,20 +390,105 @@ final class WorkshopDownloader: ObservableObject {
         lock.unlock()
     }
 
-    func prewarm() { /* 各 worker 按需启动；不再占用全局 Steam IPC。 */ }
+    /// 应用运行期间保留三个登录会话。SteamCMD 自身维护网络心跳；这里修复退出/掉线的空闲槽位。
+    func prewarm() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.prewarm() }
+            return
+        }
+        guard !isStopping else { return }
+        keepsConnectionsAlive = true
+        if connectionTimer == nil {
+            let timer = DispatchSource.makeTimerSource(queue: .main)
+            timer.schedule(deadline: .now() + timeouts.connectionCheck,
+                           repeating: timeouts.connectionCheck)
+            timer.setEventHandler { [weak self] in self?.maintainConnections() }
+            connectionTimer = timer
+            timer.resume()
+        }
+        maintainConnections()
+    }
+
+    private var wantedAccount: String { accountOverride ?? PreferencesStore.shared.steamAccount ?? "anonymous" }
+
+    private func sessionIsUsable(_ session: Session) -> Bool {
+        session.ready && session.account == wantedAccount && !sessionDidTerminate(session) &&
+            !Self.outputShowsSessionDisconnect(sessionSnapshot(session))
+    }
+
+    private func refreshConnectionStatus() {
+        precondition(Thread.isMainThread)
+        let count = sessionPool.values.filter(sessionIsUsable).count
+        let preparing = !maintainingSlots.isEmpty
+        if connectedSessionCount != count { connectedSessionCount = count }
+        if preparingConnection != preparing { preparingConnection = preparing }
+    }
+
+    private func pooledSession(_ slot: Int) -> Session {
+        precondition(Thread.isMainThread)
+        if let session = sessionPool[slot] { return session }
+        let session = Session(slot: slot)
+        lock.lock(); sessionPool[slot] = session; lock.unlock()
+        return session
+    }
+
+    private func maintainConnections() {
+        precondition(Thread.isMainThread)
+        guard !isStopping else { return }
+        refreshConnectionStatus()
+        guard keepsConnectionsAlive, !authenticationInProgress, !loginExpired, isSteamCMDAvailable,
+              maintainingSlots.isEmpty, Date() >= nextConnectionAttempt else { return }
+        // 用户排队的下载优先；一次只预连接一个槽位，避免后台登录挤占初始化通道。
+        guard !jobs.contains(where: { $0.state == .queued && $0.phase != .subscribing }) else { return }
+        guard let slot = (0..<maximumConcurrentDownloads).first(where: {
+            !runningSlots.values.contains($0) && !(sessionPool[$0].map(sessionIsUsable) ?? false)
+        }) else { return }
+        let session = pooledSession(slot)
+        maintainingSlots.insert(slot)
+        refreshConnectionStatus()
+        session.group.enter()
+        workerQueue.async {
+            let result = self.ensureSessionReady(for: nil, session: session)
+            session.group.leave()
+            DispatchQueue.main.async {
+                self.maintainingSlots.remove(slot)
+                guard !self.isStopping else { return }
+                switch result {
+                case .success:
+                    self.connectionFailures = 0
+                    self.nextConnectionAttempt = .distantPast
+                    Log.write("WorkshopDownloader: 常驻槽位 \(slot) 已连接")
+                case .failure(let reason):
+                    self.connectionFailures += 1
+                    let delay = min(300, self.timeouts.reconnectDelay * pow(2, Double(min(self.connectionFailures - 1, 4))))
+                    self.nextConnectionAttempt = Date().addingTimeInterval(delay)
+                    Log.write("WorkshopDownloader: 常驻槽位 \(slot) 连接失败，\(Int(delay)) 秒后重试 — \(reason)")
+                }
+                self.refreshConnectionStatus()
+                self.pump()
+                self.maintainConnections()
+            }
+        }
+    }
 
     func shutdown() {
         lock.lock(); stopping = true
         let active = Array(sessionPool.values)
         let processes = Array(processes.values)
         lock.unlock()
+        DispatchQueue.main.async {
+            self.connectionTimer?.cancel()
+            self.connectionTimer = nil
+            self.connectedSessionCount = 0
+            self.preparingConnection = false
+        }
         for p in processes where p.isRunning { p.terminate() }
         for session in active { if let p = session.process, p.isRunning { p.terminate() } }
         for session in active { session.group.wait(); shutdownSession(session, graceful: false) }
     }
 
     /// 独立运行时只复制一次；各下载不能一起写 Homebrew 的 package/config 或默认 Steam 日志。
-    private func prepareWorker(_ session: Session, id: String) throws -> URL {
+    private func prepareWorker(_ session: Session) throws -> URL {
         let fm = FileManager.default
         guard let binary = steamcmdBinary else { throw CocoaError(.fileNoSuchFile) }
         let root = workerRoot(session.slot)
@@ -480,33 +583,35 @@ final class WorkshopDownloader: ObservableObject {
         case failure(String)
     }
 
-    /// workerQueue 专用；仅为本条目建立会话，初始化与传输都可取消。
-    private func ensureSessionReady(for id: String, session: Session) -> SessionReadyResult {
-        let wantedAccount = accountOverride ?? PreferencesStore.shared.steamAccount ?? "anonymous"
-        if isCancelled(id) { return .failure("用户取消下载") }
-        if session.ready, session.account == wantedAccount, session.process?.isRunning == true {
-            Log.write("WorkshopDownloader \(id): 复用槽位 \(session.slot) 的已登录会话")
+    /// workerQueue 专用；nil 表示后台预连接，不创建下载条目或安装任何内容。
+    private func ensureSessionReady(for id: String?, session: Session) -> SessionReadyResult {
+        let wantedAccount = self.wantedAccount
+        func cancelled() -> Bool { isStopping || id.map(isCancelled) == true }
+        func phase(_ value: Job.Phase) { if let id { setPhase(id, value, state: .connecting) } }
+        if cancelled() { return .failure("用户取消下载") }
+        if sessionIsUsable(session) {
+            Log.write("WorkshopDownloader \(id ?? "预连接"): 复用槽位 \(session.slot) 的已登录会话")
             return .success
         }
-        setPhase(id, .waitingForDownloader, state: .connecting)
+        phase(.waitingForDownloader)
         while !startupLock.try() {
-            if isCancelled(id) { return .failure("用户取消下载") }
+            if cancelled() { return .failure("用户取消下载") }
             Thread.sleep(forTimeInterval: 0.1)
         }
         defer { startupLock.unlock() }
-        if isStopping || isCancelled(id) { return .failure("下载已取消或服务正在退出") }
-        setPhase(id, .authenticating, state: .connecting)
+        if cancelled() { return .failure("下载已取消或服务正在退出") }
+        phase(.authenticating)
         shutdownSession(session, graceful: true)
 
         do {
-            try FileManager.default.createDirectory(at: itemRoot(id), withIntermediateDirectories: true)
+            if let id { try FileManager.default.createDirectory(at: itemRoot(id), withIntermediateDirectories: true) }
         } catch {
             return .failure("无法创建下载暂存目录：\(error.localizedDescription)")
         }
         let executable: URL
-        do { executable = try prepareWorker(session, id: id) }
+        do { executable = try prepareWorker(session) }
         catch { return .failure("无法准备独立下载服务：\(error.localizedDescription)") }
-        if isCancelled(id) { return .failure("用户取消下载") }
+        if cancelled() { return .failure("用户取消下载") }
         guard let p = makeSteamCMDProcess(arguments: [
             "+force_install_dir", slotContentRoot(session.slot).path,
             "+login", wantedAccount
@@ -569,8 +674,8 @@ final class WorkshopDownloader: ObservableObject {
         session.account = wantedAccount
         session.ready = false
         // 启动/登录同样属于任务，取消时必须能终止它，而不是等满 90 秒。
-        setProcess(id, p)
-        defer { setProcess(id, nil) }
+        if let id { setProcess(id, p) }
+        defer { if let id { setProcess(id, nil) } }
 
         let deadline = Date().addingTimeInterval(timeouts.login)
         while Date() < deadline {
@@ -578,14 +683,14 @@ final class WorkshopDownloader: ObservableObject {
                 shutdownSession(session, graceful: false)
                 return .failure("下载服务正在退出")
             }
-            if isCancelled(id) {
+            if cancelled() {
                 shutdownSession(session, graceful: false)
                 return .failure("用户取消下载")
             }
             let snapshot = sessionSnapshot(session)
-            if Self.outputShowsLoginSuccess(snapshot) {
+            if Self.outputShowsLoginSuccess(snapshot), !Self.outputShowsSessionDisconnect(snapshot) {
                 session.ready = true
-                DispatchQueue.main.async { self.loginExpired = false }
+                DispatchQueue.main.async { self.loginExpired = false; self.refreshConnectionStatus() }
                 return .success
             }
             if Self.outputShowsAuthenticationFailure(snapshot) {
@@ -628,6 +733,16 @@ final class WorkshopDownloader: ObservableObject {
         output.localizedCaseInsensitiveContains("No Connection") ||
         output.localizedCaseInsensitiveContains("Failed to get list of download sources") ||
         output.localizedCaseInsensitiveContains("ERROR (Timeout)")
+    }
+
+    static func outputShowsSessionDisconnect(_ output: String) -> Bool {
+        let text = output.lowercased()
+        let connected = ["waiting for user info...ok", "logged in ok"]
+            .compactMap { text.range(of: $0, options: .backwards)?.upperBound }.max() ?? text.startIndex
+        let recent = String(text[connected...])
+        return outputShowsAuthenticationFailure(recent) || outputShowsConnectionFailure(recent) ||
+            ["logged off", "logged out", "not logged on", "not logged in", "disconnected from steam"]
+                .contains(where: recent.contains)
     }
 
     private func resetSessionOutput(_ session: Session) {
@@ -689,15 +804,21 @@ final class WorkshopDownloader: ObservableObject {
     private func pump() {
         guard !isStopping else { return }
         guard !authenticationInProgress else { return }
-        var freeSlots = (0..<maximumConcurrentDownloads).filter { !runningSlots.values.contains($0) }
+        var freeSlots = (0..<maximumConcurrentDownloads).filter {
+            !runningSlots.values.contains($0) && !maintainingSlots.contains($0)
+        }.sorted {
+            let lhs = sessionPool[$0].map(sessionIsUsable) ?? false
+            let rhs = sessionPool[$1].map(sessionIsUsable) ?? false
+            return lhs == rhs ? $0 < $1 : lhs
+        }
         for i in jobs.indices {
             guard !freeSlots.isEmpty else { break }
             let id = jobs[i].id
             lock.lock(); let discarding = discardingIDs.contains(id); lock.unlock()
             if jobs[i].state == .queued, jobs[i].phase != .subscribing, !discarding, runningSlots[id] == nil {
                 let slot = freeSlots.removeFirst()
-                let session = sessionPool[slot] ?? Session(slot: slot)
-                lock.lock(); sessionPool[slot] = session; activeRoots[id] = slotContentRoot(slot); lock.unlock()
+                let session = pooledSession(slot)
+                lock.lock(); activeRoots[id] = slotContentRoot(slot); lock.unlock()
                 session.condition.lock(); session.logsReady = false; session.commandID = nil; session.condition.unlock()
                 runningSlots[id] = session.slot
                 session.group.enter()
@@ -710,7 +831,12 @@ final class WorkshopDownloader: ObservableObject {
                     // 成功后保留登录与 CDN 连接；取消和真正超时已在命令处理路径中关闭。
                     self.lock.lock(); self.sessions.removeValue(forKey: id); self.activeRoots.removeValue(forKey: id); self.lock.unlock()
                     session.group.leave()
-                    DispatchQueue.main.async { self.runningSlots.removeValue(forKey: id); self.pump() }
+                    DispatchQueue.main.async {
+                        self.runningSlots.removeValue(forKey: id)
+                        self.refreshConnectionStatus()
+                        self.pump()
+                        self.maintainConnections()
+                    }
                 }
             }
         }
@@ -1031,7 +1157,13 @@ final class WorkshopDownloader: ObservableObject {
         loginQueue.async {
             // 暂停调度并等现有任务收尾，再更新用户授权缓存。
             DispatchQueue.main.sync { self.authenticationInProgress = true }
-            defer { DispatchQueue.main.async { self.authenticationInProgress = false; self.pump() } }
+            defer {
+                DispatchQueue.main.async {
+                    self.authenticationInProgress = false
+                    self.pump()
+                    self.maintainConnections()
+                }
+            }
             self.workerQueue.sync(flags: .barrier) {
                 for session in self.sessionPool.values { self.shutdownSession(session, graceful: true) }
             }
@@ -1074,7 +1206,9 @@ final class WorkshopDownloader: ObservableObject {
                 if success {
                     PreferencesStore.shared.steamAccount = account
                     self.loginExpired = false
-
+                    self.connectionFailures = 0
+                    self.nextConnectionAttempt = .distantPast
+                    self.prewarm()
                 }
                 let msg: String
                 if success { msg = "登录成功" }

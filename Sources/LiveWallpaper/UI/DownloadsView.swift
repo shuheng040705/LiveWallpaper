@@ -16,7 +16,16 @@ struct DownloadsView: View {
                 metric("并行下载", value: "\(downloader.transferringCount)")
                 metric("等待 / 准备", value: "\(downloader.queuedCount + downloader.preparingCount)")
                 metric("同时下载", value: "最多 \(downloader.maximumConcurrentDownloads) 项")
-            }.padding(.horizontal, 18).padding(.bottom, 18)
+            }.padding(.horizontal, 18).padding(.bottom, 12)
+            HStack(spacing: 7) {
+                Circle().fill(downloader.connectedSessionCount > 0 ? accent : Color.secondary)
+                    .frame(width: 6, height: 6)
+                Text("常驻连接 \(downloader.connectedSessionCount)/\(downloader.maximumConcurrentDownloads)")
+                Spacer()
+                Text(downloader.preparingConnection ? "正在后台连接…" : "应用运行时保持连接")
+                    .foregroundStyle(.secondary)
+            }
+            .font(.system(size: 10)).padding(.horizontal, 20).padding(.bottom, 14)
             Divider().opacity(0.3)
             if downloader.loginExpired { loginExpiredBanner }
             if downloader.jobs.isEmpty {

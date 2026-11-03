@@ -47,10 +47,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             library.scan { [weak self] in self?.openLibrary() }
             return
         }
+        WorkshopDownloader.shared.prewarm()   // 启动立即连接，与桌面/壁纸库加载并行，不等首次下载
+        NSWorkspace.shared.notificationCenter.publisher(for: NSWorkspace.didWakeNotification)
+            .sink { _ in WorkshopDownloader.shared.prewarm() }
+            .store(in: &cancellables)
         desktop.start()
         power.start()
         NowPlayingProvider.shared.start()   // 系统正在播放的音乐(喂 Now Playing widget 歌名/艺术家)
-        WorkshopDownloader.shared.prewarm()   // 后台预热 steamcmd → 首次下载跳过冷启动等待
         library.scan { [weak self] in
             self?.restoreOrOpenLibrary()
             if WPEnv.vars["WP_PREVIEW_TAB"] != nil { self?.openLibrary() }
