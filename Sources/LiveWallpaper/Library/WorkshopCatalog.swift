@@ -1,6 +1,6 @@
 import Foundation
 
-struct WorkshopWallpaper: Identifiable, Equatable {
+struct WorkshopWallpaper: Identifiable, Equatable, Codable {
     let id: String
     var title: String
     var previewURL: URL?
@@ -14,8 +14,8 @@ struct WorkshopWallpaper: Identifiable, Equatable {
     var detailURL: URL { URL(string: "https://steamcommunity.com/sharedfiles/filedetails/?id=\(id)")! }
 }
 
-struct WorkshopTagGroup: Identifiable, Equatable {
-    struct Tag: Identifiable, Equatable {
+struct WorkshopTagGroup: Identifiable, Equatable, Codable {
+    struct Tag: Identifiable, Equatable, Codable {
         let id: String
         let title: String
     }
@@ -24,7 +24,14 @@ struct WorkshopTagGroup: Identifiable, Equatable {
     let tags: [Tag]
 }
 
-struct WorkshopQuery: Equatable {
+extension WorkshopTagGroup {
+    static let basic: [WorkshopTagGroup] = [
+        .init(id: "Type", title: "壁纸类型", tags: ["Scene", "Video", "Web", "Application"].map { .init(id: $0, title: $0) }),
+        .init(id: "Age Rating", title: "内容分级", tags: ["Everyone", "Questionable", "Mature"].map { .init(id: $0, title: $0) })
+    ]
+}
+
+struct WorkshopQuery: Equatable, Codable {
     var search = ""
     var sort = "trend"
     var tags: [String] = []
@@ -39,8 +46,8 @@ struct WorkshopQuery: Equatable {
     }
 }
 
-struct WorkshopPage {
-    let items: [WorkshopWallpaper]
+struct WorkshopPage: Codable {
+    var items: [WorkshopWallpaper]
     let page: Int
     let totalPages: Int
     let total: Int
@@ -64,27 +71,35 @@ actor WorkshopCatalogService {
     static let shared = WorkshopCatalogService()
     private let browseURL = URL(string: "https://steamcommunity.com/workshop/browse/?appid=431960&l=schinese")!
     private var actionID: String?
-    private var bootstrapTask: Task<(String, [WorkshopTagGroup]), Error>?
+    private var bootstrapTask: (id: UUID, task: Task<(String, [WorkshopTagGroup]), Error>)?
     private var groups: [WorkshopTagGroup] = []
-    private let session: URLSession
+    nonisolated let cache: WorkshopCatalogCache
+    typealias Transport = @Sendable (URLRequest) async throws -> (Data, URLResponse)
+    private let transport: Transport
+    private let retryDelayNanoseconds: UInt64
 
-    init(session: URLSession? = nil) {
+    init(session: URLSession? = nil, cache: WorkshopCatalogCache = .standard,
+         retryDelayNanoseconds: UInt64 = 350_000_000, transport: Transport? = nil) {
         let config = URLSessionConfiguration.ephemeral
-        config.timeoutIntervalForRequest = 25
-        config.timeoutIntervalForResource = 40
-        self.session = session ?? URLSession(configuration: config)
+        config.timeoutIntervalForRequest = 12
+        config.timeoutIntervalForResource = 20
+        let client = session ?? URLSession(configuration: config)
+        self.transport = transport ?? { request in try await client.data(for: request) }
+        self.cache = cache; self.retryDelayNanoseconds = retryDelayNanoseconds
+        self.actionID = cache.route()?.action
+        self.groups = cache.groups() ?? []
     }
 
     func tagGroups() async throws -> [WorkshopTagGroup] {
         try await prepare()
-        return groups
+        return groups.isEmpty ? WorkshopTagGroup.basic : groups
     }
 
     func browse(_ query: WorkshopQuery) async throws -> WorkshopPage {
         try await prepare()
         do { return try await requestPage(query) }
         catch WorkshopCatalogError.http(let status) where status == 400 || status == 404 {
-            actionID = nil
+            actionID = nil; cache.invalidateRoute()
             try await prepare()
             return try await requestPage(query)
         }
@@ -100,6 +115,7 @@ actor WorkshopCatalogService {
         request.setValue(browseURL.absoluteString, forHTTPHeaderField: "Referer")
         request.httpBody = try JSONSerialization.data(withJSONObject: [query.parameters])
         let result = try Self.parsePage(await fetch(request))
+        cache.save(result, query: query)
         Log.write("WorkshopCatalog: page \(result.page), \(result.items.count) items, total \(result.total)")
         return result
     }
@@ -129,35 +145,82 @@ actor WorkshopCatalogService {
         var request = original
         request.setValue("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 Version/18.0 Safari/605.1.15", forHTTPHeaderField: "User-Agent")
         request.setValue("zh-CN,zh;q=0.9,en;q=0.5", forHTTPHeaderField: "Accept-Language")
-        let (data, response) = try await session.data(for: request)
-        try Task.checkCancellation()
-        guard let http = response as? HTTPURLResponse else { throw WorkshopCatalogError.invalidResponse }
-        guard (200..<300).contains(http.statusCode) else { throw WorkshopCatalogError.http(http.statusCode) }
-        return data
+        // 本服务仅 GET 公开元数据，POST 也只是目录查询，可安全重试；订阅事务走另一服务。
+        for attempt in 0..<3 {
+            try Task.checkCancellation()
+            do {
+                let (data, response) = try await transport(request)
+                try Task.checkCancellation()
+                guard let http = response as? HTTPURLResponse else { throw WorkshopCatalogError.invalidResponse }
+                guard (200..<300).contains(http.statusCode) else { throw WorkshopCatalogError.http(http.statusCode) }
+                return data
+            } catch {
+                if Task.isCancelled || error is CancellationError { throw CancellationError() }
+                let url = request.url!
+                Log.write("WorkshopCatalog: \(request.httpMethod ?? "GET") \(url.host ?? "")/\(url.lastPathComponent), attempt=\(attempt + 1), \((error as NSError).domain):\((error as NSError).code)")
+                guard attempt < 2, Self.isTransient(error) else { throw error }
+                try await Task.sleep(nanoseconds: retryDelayNanoseconds * UInt64(attempt + 1))
+            }
+        }
+        throw WorkshopCatalogError.invalidResponse
+    }
+
+    static func isTransient(_ error: Error) -> Bool {
+        if case WorkshopCatalogError.http(let code) = error { return [500, 502, 503, 504].contains(code) }
+        let value = error as NSError
+        guard value.domain == NSURLErrorDomain else { return false }
+        return [URLError.networkConnectionLost, .timedOut, .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed, .notConnectedToInternet]
+            .contains(URLError.Code(rawValue: value.code))
+    }
+    static func userMessage(for error: Error) -> String {
+        let value = error as NSError
+        if value.domain == NSURLErrorDomain {
+            switch URLError.Code(rawValue: value.code) {
+            case .networkConnectionLost: return "Steam 连接暂时中断，已自动重试，请稍后刷新"
+            case .timedOut: return "Steam 响应超时，请稍后刷新"
+            case .cannotConnectToHost, .cannotFindHost, .dnsLookupFailed, .notConnectedToInternet:
+                return "暂时无法连接 Steam，请检查当前网络或代理节点"
+            default: break
+            }
+        }
+        return error.localizedDescription
     }
 
     private func prepare() async throws {
         guard actionID == nil else { return }
-        let task: Task<(String, [WorkshopTagGroup]), Error>
-        if let existing = bootstrapTask { task = existing }
+        let entry: (id: UUID, task: Task<(String, [WorkshopTagGroup]), Error>)
+        if let existing = bootstrapTask { entry = existing }
         else {
-            task = Task {
+            let task = Task<(String, [WorkshopTagGroup]), Error> {
                 let html = String(decoding: try await fetch(URLRequest(url: browseURL)), as: UTF8.self)
                 let groups = Self.parseTagGroups(html)
-                // Route bundle is last. Only official Steam script assets are eligible.
+                cache.saveGroups(groups) // 即使后续脚本短暂断连，也保留已经成功获得的筛选元数据。
+                var lastFailure: Error?
                 for url in Self.scriptURLs(html).reversed() {
-                    let script = String(decoding: try await fetch(URLRequest(url: url)), as: UTF8.self)
-                    if let action = Self.discoverBrowseAction(script) { return (action, groups) }
+                    do {
+                        let script = String(decoding: try await fetch(URLRequest(url: url)), as: UTF8.self)
+                        if let action = Self.discoverBrowseAction(script) {
+                            cache.saveRoute(action: action, sourceURL: url)
+                            return (action, groups)
+                        }
+                    } catch {
+                        if Task.isCancelled || error is CancellationError { throw CancellationError() }
+                        lastFailure = error
+                        // 脚本加载失败并不说明接口变更，保留明确的网络错误供界面提示。
+                        if Self.isTransient(error) { throw error }
+                    }
                 }
+                if let lastFailure { throw lastFailure }
                 throw WorkshopCatalogError.unsupportedPage
             }
-            bootstrapTask = task
+            entry = (UUID(), task); bootstrapTask = entry
         }
         do {
-            let (action, groups) = try await task.value
-            actionID = action; self.groups = groups; bootstrapTask = nil
+            let (action, groups) = try await entry.task.value
+            actionID = action; self.groups = groups
+            if bootstrapTask?.id == entry.id { bootstrapTask = nil }
         } catch {
-            bootstrapTask = nil
+            if bootstrapTask?.id == entry.id { bootstrapTask = nil }
             throw error
         }
     }

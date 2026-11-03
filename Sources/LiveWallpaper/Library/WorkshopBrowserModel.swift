@@ -12,6 +12,8 @@ final class WorkshopBrowserModel: ObservableObject {
     @Published private(set) var selection: WorkshopWallpaper?
     @Published private(set) var loading = false
     @Published private(set) var loadingDetail = false
+    @Published private(set) var usingCachedData = false
+    @Published private(set) var updatedAt: Date?
     @Published private(set) var error: String?
     @Published private(set) var detailError: String?
     @Published private(set) var total = 0
@@ -20,10 +22,26 @@ final class WorkshopBrowserModel: ObservableObject {
     private var loadTask: Task<Void, Never>?
     private var detailTask: Task<Void, Never>?
     private var generation = UUID()
+    private var displayedScope: WorkshopQuery?
+    private var didInitialLoad = false
+    private var lastLoadReset = true
     private let service: WorkshopCatalogService
 
-    init(service: WorkshopCatalogService = .shared) { self.service = service }
-    func loadIfNeeded() { if items.isEmpty && !loading { reload() } }
+    init(service: WorkshopCatalogService = .shared) {
+        self.service = service
+        groups = service.cache.groups() ?? WorkshopTagGroup.basic
+        let query = WorkshopQuery(tags: ["Everyone"])
+        displayedScope = query
+        if let cached = service.cache.page(query) { showCached(cached) }
+    }
+    func loadIfNeeded() {
+        if !loading, !didInitialLoad || error != nil { didInitialLoad = true; reload() }
+    }
+    func retryLastRequest() { load(reset: lastLoadReset) }
+    private func showCached(_ entry: WorkshopCatalogCache.Entry<WorkshopPage>) {
+        items = entry.value.items; page = entry.value.page; totalPages = entry.value.totalPages; total = entry.value.total
+        usingCachedData = true; updatedAt = entry.savedAt
+    }
     func searchSubmitted() {
         if let id = Self.itemID(from: search) { open(id: id) }
         else { reload() }
@@ -39,22 +57,33 @@ final class WorkshopBrowserModel: ObservableObject {
         let query = WorkshopQuery(search: search.trimmingCharacters(in: .whitespacesAndNewlines),
                                   sort: sort, tags: filters.values.filter { !$0.isEmpty }.sorted(),
                                   page: reset ? 1 : page + 1)
+        var scope = query; scope.page = 1
+        if reset, displayedScope != scope {
+            if let cached = service.cache.page(query) { showCached(cached) }
+            else { items = []; page = 0; total = 0; totalPages = 1; usingCachedData = false; updatedAt = nil }
+            displayedScope = scope
+        }
+        lastLoadReset = reset
         loading = true; error = nil
         loadTask = Task {
             do {
                 let groups = try await service.tagGroups()
-                let result = try await service.browse(query)
                 guard !Task.isCancelled, generation == token else { return }
                 self.groups = groups
+                let result = try await service.browse(query)
+                guard !Task.isCancelled, generation == token else { return }
                 if reset { items = result.items }
                 else {
                     let existing = Set(items.map(\.id))
                     items.append(contentsOf: result.items.filter { !existing.contains($0.id) })
                 }
                 page = result.page; totalPages = result.totalPages; total = result.total; loading = false
+                usingCachedData = false; updatedAt = Date()
             } catch {
                 guard !Task.isCancelled, generation == token else { return }
-                self.error = error.localizedDescription; loading = false
+                if let groups = service.cache.groups() { self.groups = groups }
+                usingCachedData = !items.isEmpty
+                self.error = WorkshopCatalogService.userMessage(for: error); loading = false
             }
         }
     }
@@ -88,7 +117,7 @@ final class WorkshopBrowserModel: ObservableObject {
                 selection = detail; loadingDetail = false
             } catch {
                 guard !Task.isCancelled else { return }
-                self.error = error.localizedDescription; loadingDetail = false
+                self.error = WorkshopCatalogService.userMessage(for: error); loadingDetail = false
             }
         }
     }

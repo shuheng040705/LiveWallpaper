@@ -183,8 +183,17 @@ struct WorkshopView: View {
                         Image(systemName: "wifi.exclamationmark").foregroundStyle(.orange)
                         Text(error).font(.callout)
                         Spacer()
-                        Button("重试") { browser.reload() }
+                        Button("重试") { browser.retryLastRequest() }
                     }.padding(14).background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
+                }
+                if browser.usingCachedData {
+                    HStack(spacing: 7) {
+                        Image(systemName: "clock.arrow.circlepath")
+                        Text("当前显示上次成功加载的壁纸")
+                        if let date = browser.updatedAt { Text(date, style: .relative); Text("前更新") }
+                        Spacer()
+                        if browser.loading { Text("正在重新连接 Steam…") }
+                    }.font(.system(size: 10)).foregroundStyle(.secondary)
                 }
                 if let first = browser.items.first, browser.search.isEmpty, browser.selection == nil {
                     featured(first)
