@@ -3,6 +3,57 @@ import Combine
 @testable import LiveWallpaper
 
 final class WorkshopDownloaderTests: XCTestCase {
+    func testResolvesCurrentHomebrewCaskWrapperToBinary() throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let wrapper = root.appendingPathComponent(".homebrew-command-wrappers/steamcmd")
+        let binary = root.appendingPathComponent("MacOS/steamcmd")
+        for file in [wrapper, binary] {
+            try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try Data("#!/bin/sh\n".utf8).write(to: file)
+            try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: file.path)
+        }
+        let symlink = root.appendingPathComponent("steamcmd")
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: wrapper)
+        XCTAssertEqual(WorkshopDownloader.resolveSteamCMDBinary(wrapper: symlink).path, binary.path)
+    }
+
+    func testConnectionFailureIsTerminalWithoutPretendingCredentialsExpired() {
+        let output = "Logging in user ...ERROR (No Connection)\nSteam>"
+        XCTAssertTrue(WorkshopDownloader.outputShowsConnectionFailure(output))
+        XCTAssertFalse(WorkshopDownloader.outputShowsAuthenticationFailure(output))
+        XCTAssertTrue(WorkshopDownloader.outputShowsDownloadFailure(output, id: "3458955634"))
+        XCTAssertFalse(WorkshopDownloader.outputShowsConnectionFailure("Retrying..."))
+        XCTAssertTrue(WorkshopDownloader.outputShowsAuthenticationFailure("Cached credentials not found.\npassword:"))
+    }
+
+    func testZeroProgressDownloadAlsoTimesOut() {
+        XCTAssertEqual(WorkshopDownloader.downloadTimeoutReason(sawCommandStart: true, elapsed: 601, idle: 601),
+                       "下载进度长时间未增长")
+        XCTAssertNil(WorkshopDownloader.downloadTimeoutReason(sawCommandStart: true, elapsed: 3600, idle: 5))
+        XCTAssertEqual(WorkshopDownloader.downloadTimeoutReason(sawCommandStart: false, elapsed: 121, idle: 121),
+                       "连接 Steam/CDN 超时")
+    }
+
+    func testItemIDPrefixDoesNotCompleteAnotherDownload() {
+        XCTAssertFalse(WorkshopDownloader.outputShowsDownloadSuccess(
+            "Success. Downloaded item 34589556340 to /tmp/item", id: "3458955634"))
+        XCTAssertFalse(WorkshopDownloader.outputShowsDownloadFailure(
+            "ERROR! Download item 9999999999 failed (File Not Found).", id: "3458955634"))
+    }
+
+    func testShutdownCancelsQueuedWorkBeforeStartingSteam() {
+        let downloader = WorkshopDownloader()
+        downloader.shutdown()
+        let updated = expectation(description: "Enqueue callback completed")
+        downloader.enqueue(id: "1234567890", title: "Shutdown regression")
+        DispatchQueue.main.async {
+            XCTAssertEqual(downloader.jobs.first?.state, .queued)
+            updated.fulfill()
+        }
+        wait(for: [updated], timeout: 2)
+    }
+
     func testPersistentSessionRecognizesOnlyMatchingSuccessfulItem() {
         let output = """
         Downloading item 3458955634 ...
@@ -42,18 +93,21 @@ final class WorkshopDownloaderTests: XCTestCase {
     }
 
     /// 手工/发布验收用的真实 SteamCMD 探针。默认跳过，避免普通单测依赖网络。
-    /// 使用一个已下架条目，只验证“常驻登录 → 接收命令 → 返回终态”，不会写入壁纸库。
+    /// 使用不可能存在的条目 0，只验证“常驻登录 → 接收命令 → 返回终态”，不会写入壁纸库。
     func testLivePersistentSessionAcceptsCommand() throws {
         guard ProcessInfo.processInfo.environment["LW_STEAMCMD_INTEGRATION"] == "1" else {
             throw XCTSkip("仅在 Release 验收时运行")
         }
 
         let downloader = WorkshopDownloader.shared
+        guard downloader.isSteamCMDAvailable else { throw XCTSkip("未安装 SteamCMD") }
+        defer { downloader.shutdown() }
+        let probeID = "0"
         let terminal = expectation(description: "SteamCMD command reaches a terminal state")
         var subscriptions = Set<AnyCancellable>()
         downloader.$jobs
             .sink { jobs in
-                guard let job = jobs.first(where: { $0.id == "3659146882" }) else { return }
+                guard let job = jobs.first(where: { $0.id == probeID }) else { return }
                 switch job.state {
                 case .failed, .done:
                     terminal.fulfill()
@@ -64,17 +118,19 @@ final class WorkshopDownloaderTests: XCTestCase {
             .store(in: &subscriptions)
 
         downloader.prewarm()
-        downloader.enqueue(id: "3659146882", title: "SteamCMD integration probe")
-        wait(for: [terminal], timeout: 45)
+        downloader.enqueue(id: probeID, title: "SteamCMD integration probe")
+        wait(for: [terminal], timeout: 120)
 
-        guard let job = downloader.jobs.first(where: { $0.id == "3659146882" }) else {
+        guard let job = downloader.jobs.first(where: { $0.id == probeID }) else {
             return XCTFail("探针任务没有保留终态")
         }
         if case .failed(let reason) = job.state {
+            if reason.contains("连接 Steam") || reason.contains("未登录 Steam") {
+                throw XCTSkip("Steam 网络或下载授权不可用：\(reason)")
+            }
             XCTAssertTrue(reason.contains("不存在") || reason.contains("下架"))
         } else if case .done = job.state {
-            XCTFail("已下架的探针条目不应被安装")
+            XCTFail("无效的探针条目不应被安装")
         }
-        downloader.shutdown()
     }
 }

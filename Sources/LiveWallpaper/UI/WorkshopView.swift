@@ -33,6 +33,15 @@ struct WorkshopView: View {
         VStack(spacing: 0) {
             toolbar
             infoBar
+            if let error = web.loadingError {
+                HStack(spacing: 8) {
+                    Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                    Text("创意工坊加载失败：\(error)").font(.system(size: 12))
+                    Spacer()
+                    Button("重试") { web.reload() }
+                }
+                .padding(12)
+            }
             if !downloader.jobs.isEmpty { downloadBar }
             WebViewRepresentable(controller: web, initialURL: workshopURL)
         }
@@ -133,13 +142,19 @@ struct WorkshopView: View {
         HStack(spacing: 6) {
             Image(systemName: downloader.isAnyDownloadBackendAvailable ? "info.circle.fill" : "exclamationmark.triangle.fill")
                 .font(.system(size: 10)).foregroundStyle(downloader.isAnyDownloadBackendAvailable ? .blue : .orange)
-            Text(downloader.isCrossOverSteamAvailable
+            Text(downloader.loginExpired && !downloader.isCrossOverSteamAvailable
+                 ? "SteamCMD 下载登录已失效，请重新登录；创意工坊网页登录与下载登录相互独立"
+                 : downloader.isCrossOverSteamAvailable
                  ? "下载会先交给当前 CrossOver Steam；20 秒未接管时自动回退 SteamCMD"
                  : (downloader.isSteamCMDAvailable
                     ? "当前 Steam 客户端未运行，使用已预热的 SteamCMD 直接下载"
                     : "请运行对应 CrossOver Steam，或安装 SteamCMD：brew install --cask steamcmd"))
                 .font(.system(size: 11)).foregroundStyle(.secondary)
             Spacer()
+            if downloader.loginExpired && !downloader.isCrossOverSteamAvailable {
+                Button("重新登录") { NotificationCenter.default.post(name: .showDownloads, object: nil) }
+                    .font(.system(size: 11))
+            }
         }
         .padding(.horizontal, 16).padding(.bottom, 8)
     }
@@ -264,6 +279,8 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
     @Published var isLoading = false
     @Published var host = ""
     @Published var currentURL: URL?   // @Published:URL 变化驱动「下载」按钮显隐
+    @Published private(set) var loadingError: String?
+    private var failedURL: URL?
     var pageTitle = ""
 
     let wkWebView: WKWebView           // 注意:不能叫 webView,会和 WKNavigationDelegate 方法名冲突
@@ -274,6 +291,7 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
         cfg.websiteDataStore = .default()   // 保留 Steam 登录态
         let ucc = WKUserContentController()
         WebMediaCapturePolicy.install(into: ucc)
+        WorkshopWebCompatibility.install(into: ucc)
         ucc.addUserScript(WKUserScript(source: Self.subscribeHookJS, injectionTime: .atDocumentStart, forMainFrameOnly: false))
         cfg.userContentController = ucc
         wkWebView = WKWebView(frame: .zero, configuration: cfg)
@@ -356,7 +374,10 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
 
     func goBack() { wkWebView.goBack() }
     func goForward() { wkWebView.goForward() }
-    func reload() { wkWebView.reload() }
+    func reload() {
+        if let failedURL { load(failedURL) }
+        else { wkWebView.reload() }
+    }
     func goHome() {
         if let u = URL(string: "https://steamcommunity.com/app/431960/workshop/") {
             wkWebView.load(URLRequest(url: u))
@@ -393,13 +414,46 @@ final class WebController: NSObject, ObservableObject, WKNavigationDelegate, WKS
         decisionHandler(.deny)
     }
 
-    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) { sync(loading: true) }
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        loadingError = nil
+        failedURL = nil
+        sync(loading: true)
+    }
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         sync(loading: false)
         SteamWebSession.shared.refresh()
     }
-    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) { sync(loading: false) }
-    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) { sync(loading: false) }
+    func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        navigationFailed(error)
+    }
+    func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+        navigationFailed(error)
+    }
+
+    private func navigationFailed(_ error: Error) {
+        let nsError = error as NSError
+        guard !(nsError.domain == NSURLErrorDomain && nsError.code == NSURLErrorCancelled) else { return }
+        sync(loading: false)
+        loadingError = error.localizedDescription
+        failedURL = (nsError.userInfo[NSURLErrorFailingURLErrorKey] as? URL) ?? wkWebView.url
+        Log.write("WorkshopView: 页面加载失败 — \(error.localizedDescription)")
+    }
+
+    func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        sync(loading: false)
+        loadingError = "网页进程已退出，请重试"
+        failedURL = webView.url
+    }
+
+    // Steam 的部分详情/登录入口使用新窗口；复用当前页，避免点击没有响应。
+    func webView(_ webView: WKWebView, createWebViewWith configuration: WKWebViewConfiguration,
+                 for navigationAction: WKNavigationAction, windowFeatures: WKWindowFeatures) -> WKWebView? {
+        if navigationAction.targetFrame == nil, let url = navigationAction.request.url {
+            if url.scheme == "steam" { NSWorkspace.shared.open(url) }
+            else if url.scheme == "https" || url.scheme == "http" { webView.load(navigationAction.request) }
+        }
+        return nil
+    }
 
     /// steam:// 协议(订阅唤起 Steam 客户端)交给系统处理,不在 WebView 里加载。
     func webView(_ webView: WKWebView, decidePolicyFor navigationAction: WKNavigationAction,

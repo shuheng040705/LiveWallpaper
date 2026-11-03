@@ -125,6 +125,11 @@ final class WorkshopDownloader: ObservableObject {
     private let lock = NSLock()
     private var processes: [String: Process] = [:]   // 进行中的 steamcmd(供取消)
     private var cancelledSet: Set<String> = []        // 已请求取消的 id
+    private var stopping = false
+    private var isStopping: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return stopping
+    }
     private struct ClientRoute {
         let context: CrossOverSteamClient.Context
         let processIdentifier: pid_t
@@ -140,6 +145,7 @@ final class WorkshopDownloader: ObservableObject {
     private var sessionInput: Pipe?
     private var sessionOutput = Data()
     private var sessionTerminated = false
+    private var sessionGeneration = UUID()
     private var sessionReady = false
     private var sessionAccount: String?
 
@@ -176,11 +182,21 @@ final class WorkshopDownloader: ObservableObject {
     /// 真正送到下载进程，而不是只杀掉外层脚本后留下继续耗带宽的孙进程。
     private var steamcmdBinary: URL? {
         guard let wrapper = steamcmdPath else { return nil }
-        let resolved = URL(fileURLWithPath: wrapper).resolvingSymlinksInPath()
-        let direct = resolved.deletingLastPathComponent()
-            .appendingPathComponent("MacOS/steamcmd")
-        if FileManager.default.isExecutableFile(atPath: direct.path) { return direct }
-        return URL(fileURLWithPath: wrapper)
+        return Self.resolveSteamCMDBinary(wrapper: URL(fileURLWithPath: wrapper))
+    }
+
+    static func resolveSteamCMDBinary(wrapper: URL, fileManager: FileManager = .default) -> URL {
+        let resolved = wrapper.resolvingSymlinksInPath()
+        let directory = resolved.deletingLastPathComponent()
+        // 新版 cask 把 wrapper 放在 .homebrew-command-wrappers/ 中，与 MacOS/ 同级。
+        let candidates = [
+            directory.appendingPathComponent("MacOS/steamcmd"),
+            directory.deletingLastPathComponent().appendingPathComponent("MacOS/steamcmd"),
+        ]
+        if let binary = candidates.first(where: { fileManager.isExecutableFile(atPath: $0.path) }) {
+            return binary
+        }
+        return resolved
     }
 
     private func makeSteamCMDProcess(arguments: [String]) -> Process? {
@@ -335,6 +351,7 @@ final class WorkshopDownloader: ObservableObject {
 
     /// App 退出时关闭常驻子进程，避免 SteamCMD 成为孤儿进程。
     func shutdown() {
+        lock.lock(); stopping = true; lock.unlock()
         // 若正处于长下载，先从调用线程打断最终二进制；否则 sync 会等任务自然结束。
         if let p = sessionProcess, p.isRunning { p.terminate() }
         workerQueue.sync { shutdownSession(graceful: false) }
@@ -356,7 +373,9 @@ final class WorkshopDownloader: ObservableObject {
     }
 
     /// workerQueue 专用：启动一次 SteamCMD 并保持 stdin 打开，后续任务直接向同一会话写命令。
-    private func ensureSessionReady() -> SessionReadyResult {
+    private func ensureSessionReady(for id: String? = nil) -> SessionReadyResult {
+        if isStopping { return .failure("下载服务正在退出") }
+        if let id, isCancelled(id) { return .failure("用户取消下载") }
         let wantedAccount = PreferencesStore.shared.steamAccount ?? "anonymous"
         if sessionReady, sessionAccount == wantedAccount, sessionProcess?.isRunning == true {
             return .success
@@ -384,6 +403,8 @@ final class WorkshopDownloader: ObservableObject {
         sessionCondition.lock()
         sessionOutput.removeAll(keepingCapacity: true)
         sessionTerminated = false
+        let generation = UUID()
+        sessionGeneration = generation
         sessionCondition.unlock()
 
         let outputHandle = output.fileHandleForReading
@@ -391,6 +412,11 @@ final class WorkshopDownloader: ObservableObject {
             guard let self else { return }
             let data = handle.availableData
             self.sessionCondition.lock()
+            guard self.sessionGeneration == generation else {
+                self.sessionCondition.unlock()
+                handle.readabilityHandler = nil
+                return
+            }
             if data.isEmpty {
                 handle.readabilityHandler = nil
                 self.sessionTerminated = true
@@ -403,6 +429,10 @@ final class WorkshopDownloader: ObservableObject {
         p.terminationHandler = { [weak self] _ in
             guard let self else { return }
             self.sessionCondition.lock()
+            guard self.sessionGeneration == generation else {
+                self.sessionCondition.unlock()
+                return
+            }
             self.sessionTerminated = true
             self.sessionCondition.broadcast()
             self.sessionCondition.unlock()
@@ -418,9 +448,20 @@ final class WorkshopDownloader: ObservableObject {
         sessionInput = input
         sessionAccount = wantedAccount
         sessionReady = false
+        // 启动/登录同样属于任务，取消时必须能终止它，而不是等满 90 秒。
+        if let id { setProcess(id, p) }
+        defer { if let id { setProcess(id, nil) } }
 
         let deadline = Date().addingTimeInterval(90)
         while Date() < deadline {
+            if isStopping {
+                shutdownSession(graceful: false)
+                return .failure("下载服务正在退出")
+            }
+            if let id, isCancelled(id) {
+                shutdownSession(graceful: false)
+                return .failure("用户取消下载")
+            }
             let snapshot = sessionSnapshot()
             if Self.outputShowsLoginSuccess(snapshot) {
                 sessionReady = true
@@ -433,6 +474,10 @@ final class WorkshopDownloader: ObservableObject {
                 return .failure(wantedAccount == "anonymous"
                     ? "匿名 Steam 会话登录失败"
                     : "SteamCMD 登录已失效，请在设置中重新登录")
+            }
+            if Self.outputShowsConnectionFailure(snapshot) {
+                shutdownSession(graceful: false)
+                return .failure("连接 Steam/CDN 失败，请检查网络或代理后重试")
             }
             if sessionDidTerminate() {
                 let suffix = String(snapshot.suffix(500))
@@ -449,13 +494,20 @@ final class WorkshopDownloader: ObservableObject {
         output.contains("Waiting for user info...OK") || output.contains("Logged in OK")
     }
 
-    private static func outputShowsAuthenticationFailure(_ output: String) -> Bool {
+    static func outputShowsAuthenticationFailure(_ output: String) -> Bool {
         output.localizedCaseInsensitiveContains("Invalid Password") ||
         output.localizedCaseInsensitiveContains("FAILED login") ||
         output.localizedCaseInsensitiveContains("Login Failure") ||
         output.localizedCaseInsensitiveContains("Steam Guard") ||
         output.localizedCaseInsensitiveContains("two-factor") ||
-        output.localizedCaseInsensitiveContains("password:")
+        output.localizedCaseInsensitiveContains("password:") ||
+        output.localizedCaseInsensitiveContains("Cached credentials not found")
+    }
+
+    static func outputShowsConnectionFailure(_ output: String) -> Bool {
+        output.localizedCaseInsensitiveContains("No Connection") ||
+        output.localizedCaseInsensitiveContains("Failed to get list of download sources") ||
+        output.localizedCaseInsensitiveContains("ERROR (Timeout)")
     }
 
     private func resetSessionOutput() {
@@ -504,6 +556,7 @@ final class WorkshopDownloader: ObservableObject {
         sessionReady = false
         sessionAccount = nil
         sessionCondition.lock()
+        sessionGeneration = UUID()
         sessionTerminated = true
         sessionCondition.broadcast()
         sessionCondition.unlock()
@@ -511,6 +564,7 @@ final class WorkshopDownloader: ObservableObject {
 
     /// 在 main 线程调:把空闲并发槽位填上排队任务。
     private func pump() {
+        guard !isStopping else { return }
         let active = jobs.filter { $0.state == .connecting || $0.state == .downloading }.count
         var slots = maxConcurrent - active
         guard slots > 0 else { return }
@@ -557,7 +611,7 @@ final class WorkshopDownloader: ObservableObject {
             if isCancelled(id) { break }
             setPhase(id, retry == 1 ? .startingDownloader : .preparing, state: .connecting)
             setPhase(id, .authenticating, state: .connecting)
-            switch ensureSessionReady() {
+            switch ensureSessionReady(for: id) {
             case .failure(let reason):
                 lastOut = reason
                 break
@@ -601,11 +655,11 @@ final class WorkshopDownloader: ObservableObject {
             } else if loginIssue && hasAccount {
                 reason = "Steam 账号登录已失效,请重新登录后重试"
                 DispatchQueue.main.async { self.loginExpired = true }   // 触发 UI 重新登录提醒
+            } else if connectionIssue || Self.outputShowsConnectionFailure(out) || out.contains("连接 Steam/CDN 失败") {
+                reason = "连接 Steam CDN 失败，请检查网络或代理后重试（暂存进度已保留）"
             } else if !hasAccount {
                 reason = "未登录 Steam,新壁纸需先登录账号"
                 DispatchQueue.main.async { self.loginExpired = true }
-            } else if connectionIssue {
-                reason = "连接 Steam CDN 失败，请检查网络或代理后重试（暂存进度已保留）"
             } else {
                 reason = "下载失败(已重试),请检查网络后再试"
             }
@@ -637,7 +691,8 @@ final class WorkshopDownloader: ObservableObject {
         setPhase(id, .waitingForSteamClient, state: .connecting)
         let claimDeadline = Date().addingTimeInterval(20)
         let ownedDeadline = Date().addingTimeInterval(30 * 60)
-        var claimed = route.initialManifest.isKnown
+        // 历史清单里有记录不代表客户端接管了本次下载。必须观察本次日志或清单变化。
+        var claimed = false
         var consecutiveComplete = 0
 
         while !isCancelled(id) {
@@ -656,9 +711,7 @@ final class WorkshopDownloader: ObservableObject {
                 consecutiveComplete = 0
             }
 
-            let manifestChanged = observation.manifestState != route.initialManifest
-            if !claimed, observation.targetMentionedAfterBaseline ||
-                (manifestChanged && observation.manifestState.isKnown) {
+            if !claimed, observation.hasTakenOver(since: route.initialManifest) {
                 claimed = true
                 Log.write("WorkshopDownloader \(id): CrossOver Steam 已识别该订阅")
             }
@@ -723,7 +776,7 @@ final class WorkshopDownloader: ObservableObject {
         var sawCommandStart = false
         while !isCancelled(id) {
             let output = sessionSnapshot()
-            if output.contains("Downloading item \(id)") {
+            if !sawCommandStart, output.contains("Downloading item \(id)") {
                 sawCommandStart = true
                 setPhase(id, .preparing, state: .connecting)
             }
@@ -749,11 +802,11 @@ final class WorkshopDownloader: ObservableObject {
             // “有日志”不代表有下载。SteamCMD 遇到代理/CDN 故障会持续打印 Retrying，
             // 旧版因此永远碰不到 10 分钟静默超时。现在按真正的 patch 块是否增长判断。
             let now = Date()
-            let noStartTooLong = !sawCommandStart && now.timeIntervalSince(startedAt) > 120
-            let noProgressTooLong = sawCommandStart && lastChunks > 0 &&
-                now.timeIntervalSince(lastProgressAt) > Self.steamcmdSilenceTimeout
-            if noStartTooLong || noProgressTooLong {
-                let reason = noStartTooLong ? "连接 Steam/CDN 超时" : "下载进度长时间未增长"
+            if let reason = Self.downloadTimeoutReason(
+                sawCommandStart: sawCommandStart,
+                elapsed: now.timeIntervalSince(startedAt),
+                idle: now.timeIntervalSince(lastProgressAt)
+            ) {
                 Log.write("WorkshopDownloader \(id): \(reason)，重启常驻会话")
                 setProcess(id, nil)
                 shutdownSession(graceful: false)
@@ -768,13 +821,19 @@ final class WorkshopDownloader: ObservableObject {
     }
 
     static func outputShowsDownloadSuccess(_ output: String, id: String) -> Bool {
-        output.contains("Success. Downloaded item \(id)")
+        output.contains("Success. Downloaded item \(id) ")
     }
 
     static func outputShowsDownloadFailure(_ output: String, id: String) -> Bool {
         output.contains("ERROR! Download item \(id) failed") ||
-        output.contains("File Not Found") ||
-        outputShowsAuthenticationFailure(output)
+        outputShowsAuthenticationFailure(output) || outputShowsConnectionFailure(output)
+    }
+
+    static func downloadTimeoutReason(sawCommandStart: Bool, elapsed: TimeInterval, idle: TimeInterval) -> String? {
+        if !sawCommandStart, elapsed > 120 { return "连接 Steam/CDN 超时" }
+        // 第一块一直未到也必须超时；原来 lastChunks > 0 会让零进度任务永远卡住。
+        if sawCommandStart, idle > steamcmdSilenceTimeout { return "下载进度长时间未增长" }
+        return nil
     }
 
     /// 把下载好的目录移入壁纸库(正常完成与「取消但保留」共用)。纯文件操作,任意线程可调。
@@ -805,6 +864,16 @@ final class WorkshopDownloader: ObservableObject {
 
     /// 用账号+密码登录一次 steamcmd(让它缓存凭据,后续下载免密)。
     /// 返回 (成功, 是否需要 Steam Guard 验证码, 提示)。在后台线程调用。
+    private final class LoginOutput {
+        private let lock = NSLock()
+        private var data = Data()
+        func store(_ value: Data) { lock.lock(); data = value; lock.unlock() }
+        func text() -> String {
+            lock.lock(); defer { lock.unlock() }
+            return String(decoding: data, as: UTF8.self)
+        }
+    }
+
     func login(account: String, password: String, guardCode: String?,
                completion: @escaping (Bool, Bool, String) -> Void) {
         guard steamcmdPath != nil else { completion(false, false, "未安装 SteamCMD"); return }
@@ -830,8 +899,20 @@ final class WorkshopDownloader: ObservableObject {
             if let g = guardCode, !g.isEmpty { feed += g + "\n" }   // 令牌提示紧随密码之后
             if let d = feed.data(using: .utf8) { inPipe.fileHandleForWriting.write(d) }
             try? inPipe.fileHandleForWriting.close()   // 必须关,否则 steamcmd 会一直等输入
-            let out = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-            p.waitUntilExit()
+            // 读输出不能无限等 EOF：网络无响应时，登录弹窗以前会一直转圈。
+            let captured = LoginOutput()
+            let readComplete = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .utility).async {
+                captured.store(pipe.fileHandleForReading.readDataToEndOfFile())
+                readComplete.signal()
+            }
+            let timedOut = readComplete.wait(timeout: .now() + 120) == .timedOut
+            if timedOut {
+                if p.isRunning { Self.killProcessTree(p) }
+                _ = readComplete.wait(timeout: .now() + 5)
+            }
+            _ = Self.waitExit(p, timeout: 5)
+            let out = captured.text()
             let success = out.contains("Waiting for user info...OK") || out.contains("Logged in OK")
             let needGuard = out.contains("Steam Guard") || out.contains("two-factor") || out.contains("Two-factor")
             DispatchQueue.main.async {
@@ -843,7 +924,12 @@ final class WorkshopDownloader: ObservableObject {
                         _ = self.ensureSessionReady()
                     }
                 }
-                let msg = success ? "登录成功" : (needGuard ? "需要 Steam 令牌验证码" : "登录失败,请检查账号密码")
+                let msg: String
+                if success { msg = "登录成功" }
+                else if timedOut || Self.outputShowsConnectionFailure(out) {
+                    msg = "连接 Steam 超时或失败，请检查网络或代理后重试"
+                } else if needGuard { msg = "需要 Steam 令牌验证码" }
+                else { msg = "登录失败,请检查账号密码" }
                 completion(success, needGuard, msg)
             }
         }
@@ -1174,7 +1260,7 @@ final class WorkshopDownloader: ObservableObject {
         lock.lock(); if let p { processes[id] = p } else { processes.removeValue(forKey: id) }; lock.unlock()
     }
     private func isCancelled(_ id: String) -> Bool {
-        lock.lock(); defer { lock.unlock() }; return cancelledSet.contains(id)
+        lock.lock(); defer { lock.unlock() }; return stopping || cancelledSet.contains(id)
     }
     private func clearTracking(_ id: String) {
         lock.lock()

@@ -55,8 +55,8 @@ enum CrossOverSteamClient {
             guard let expected = manifestState.installedSize, expected > 0 else { return true }
             return contentSize == expected
         }
-        var hasTakenOver: Bool {
-            manifestState.isKnown || targetMentionedAfterBaseline
+        func hasTakenOver(since initialManifest: ManifestItemState) -> Bool {
+            targetMentionedAfterBaseline || (manifestState.isKnown && manifestState != initialManifest)
         }
     }
 

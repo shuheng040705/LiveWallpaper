@@ -3,6 +3,12 @@
 set -e
 cd "$(dirname "$0")"
 
+# 完整 Xcode 带有 SwiftUI 宏插件；系统选中 Command Line Tools 时可能缺插件而无法构建。
+# 仅对本次构建选择工具链，保留调用方显式指定的 DEVELOPER_DIR。
+if [ -z "${DEVELOPER_DIR:-}" ] && [ -d /Applications/Xcode.app/Contents/Developer ]; then
+  export DEVELOPER_DIR=/Applications/Xcode.app/Contents/Developer
+fi
+
 CONFIG="${1:-release}"   # ./build.sh debug 出调试版
 APP="LiveWallpaper.app"
 

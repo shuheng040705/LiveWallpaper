@@ -2,6 +2,18 @@ import XCTest
 @testable import LiveWallpaper
 
 final class CrossOverSteamClientTests: XCTestCase {
+    func testHistoricalManifestDoesNotClaimNewDownload() {
+        let old = CrossOverSteamClient.ManifestItemState(isKnown: true, latestManifest: "10")
+        let unchanged = CrossOverSteamClient.Observation(manifestState: old)
+        XCTAssertFalse(unchanged.hasTakenOver(since: old))
+        XCTAssertTrue(CrossOverSteamClient.Observation(
+            manifestState: old, targetMentionedAfterBaseline: true
+        ).hasTakenOver(since: old))
+        XCTAssertTrue(CrossOverSteamClient.Observation(
+            manifestState: .init(isKnown: true, latestManifest: "11")
+        ).hasTakenOver(since: old))
+    }
+
     private var temporaryURLs: [URL] = []
 
     override func tearDown() {
