@@ -67,6 +67,55 @@ final class WorkshopDownloaderTests: XCTestCase {
     }
 
     @MainActor
+    func testSteamCanFinishInWorkshopLogAfterConsoleTimeout() throws {
+        let (downloader, root) = try makeDownloaderFixture(timeouts: .init(login: 2, commandStart: 1, noProgress: 2))
+        defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("steamcmd-fixture")
+        let original = try String(contentsOf: script, encoding: .utf8)
+        let replacement = """
+        log="$HOME/Library/Application Support/Steam/logs/workshop_log.txt"
+        mkdir -p "$(dirname "$log")"
+        echo "[AppID 431960] Download item $item requested by app" >> "$log"
+        echo "ERROR! Timeout downloading item $item"
+        """
+        let body = original
+            .replacingOccurrences(of: #"echo "Downloading item $item ...""#, with: replacement)
+            .replacingOccurrences(of: #"echo "Success. Downloaded item $item to destination (1024 bytes)""#,
+                                  with: #"echo "[AppID 431960] Download item $item result : OK" >> "$log""#)
+        try body.write(to: script, atomically: true, encoding: .utf8)
+        let id = "1234567890"
+        try Data().write(to: root.appendingPathComponent("release." + id))
+        let done = expectation(description: "Log confirms commit despite a console timeout")
+        let observation = downloader.$jobs.first { $0.first?.state == .done }.sink { _ in done.fulfill() }
+        downloader.enqueue(id: id, title: id)
+        wait(for: [done], timeout: 5)
+        observation.cancel()
+        XCTAssertEqual(downloader.jobs.first?.attempt, 1)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("library/\(id)/project.json").path))
+    }
+
+    func testWorkshopLogAcceptsOnlyFreshCompleteLinesForThisRequest() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: url) }
+        let request = "[AppID 431960] Download item 123 requested by app\r\n"
+        let success = "[AppID 431960] Download item 123 result : OK\r\n"
+        try (request + success).write(to: url, atomically: true, encoding: .utf8)
+        var log = WorkshopCommandLog(url: url, app: "431960", item: "123")
+        let writer = try FileHandle(forWritingTo: url)
+        defer { try? writer.close() }
+        try writer.seekToEnd()
+        try writer.write(contentsOf: Data((success + request + "[AppID 431960] Download item 1234 result : OK\n" +
+            "[AppID 431960] Update canceled: (File Not Found) (Missing game files)\n" +
+            "[AppID 431960] Download item 123 result : Fail").utf8))
+        log.poll()
+        XCTAssertTrue(log.requested)
+        XCTAssertNil(log.outcome)
+        try writer.write(contentsOf: Data("ure\r\n".utf8))
+        log.poll()
+        XCTAssertEqual(log.outcome, .failed("Missing game files"))
+    }
+
+    @MainActor
     private func waitForConnections(_ downloader: WorkshopDownloader, count: Int) {
         let ready = expectation(description: "Authenticated idle pool is ready")
         var fulfilled = false
@@ -133,10 +182,14 @@ final class WorkshopDownloaderTests: XCTestCase {
         let body = try String(contentsOf: script, encoding: .utf8)
             .replacingOccurrences(of: "echo 'Waiting for user info...OK'", with: "echo 'ERROR (Timeout)'; exit 1")
         try body.write(to: script, atomically: true, encoding: .utf8)
-        downloader.prewarm()
         let stopped = expectation(description: "Failed background connection remains in backoff")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { stopped.fulfill() }
-        wait(for: [stopped], timeout: 3)
+        let attempt = downloader.$preparingConnection
+            .drop(while: { !$0 }).first(where: { !$0 }).sink { _ in
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) { stopped.fulfill() }
+            }
+        downloader.prewarm()
+        wait(for: [stopped], timeout: 5)
+        attempt.cancel()
         XCTAssertEqual(processBoots(at: root).count, 1, "An outage must not create a login retry storm across all slots")
         downloader.shutdown()
         let quiet = expectation(description: "Shutdown prevents delayed prewarm calls and retries")
@@ -172,6 +225,9 @@ final class WorkshopDownloaderTests: XCTestCase {
         for id in ids { downloader.enqueue(id: id, title: id) }
         wait(for: [done], timeout: 8)
         observation.cancel()
+        let firstPayload = root.appendingPathComponent("cache/Workers/0/Content/steamapps/workshop/content/431960/" + ids[0] + "/project.json")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: firstPayload.path),
+                      "The first queued download must take the session already logging in at startup")
         XCTAssertEqual(processBoots(at: root).count, 3)
         for id in ids { XCTAssertTrue(FileManager.default.fileExists(atPath: root.appendingPathComponent("library/" + id + "/project.json").path)) }
     }

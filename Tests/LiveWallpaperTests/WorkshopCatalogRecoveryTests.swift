@@ -7,6 +7,7 @@ private actor CatalogTestServer {
     var failQueries = false
     var failPageTwo = false
     var calls: [String: Int] = [:]
+    var pageRequests: [Int] = []
     func configure(disconnectedScripts: Int = 0, failQueries: Bool = false, failPageTwo: Bool = false) {
         self.disconnectedScripts = disconnectedScripts; self.failQueries = failQueries; self.failPageTwo = failPageTwo
     }
@@ -30,8 +31,9 @@ private actor CatalogTestServer {
         if request.value(forHTTPHeaderField: "x-valve-action-type") == "expired_action:Browse" { return result("expired", status: 404) }
         let json = try JSONSerialization.jsonObject(with: request.httpBody!) as! [[String: Any]]
         let page = json[0]["page"] as? Int ?? 1
+        pageRequests.append(page)
         if failQueries || (failPageTwo && page == 2) { throw URLError(.networkConnectionLost) }
-        return result("{\"eresult\":1,\"current_page\":\(page),\"total_pages\":2,\"total_count\":2,\"results\":[{\"publishedfileid\":\"123456789\(page)\",\"consumer_appid\":431960,\"title\":\"Page \(page)\"}]}")
+        return result("{\"eresult\":1,\"current_page\":\(page),\"total_pages\":12,\"total_count\":12,\"results\":[{\"publishedfileid\":\"123456789\(page)\",\"consumer_appid\":431960,\"title\":\"Page \(page)\"}]}")
     }
 }
 
@@ -132,19 +134,59 @@ final class WorkshopCatalogRecoveryTests: XCTestCase {
     }
 
     @MainActor
-    func testRetryAfterPaginationDisconnectRequestsTheFailedPageAndPreservesExistingItems() async {
+    func testRetryAfterPaginationDisconnectKeepsVisiblePageUntilReplacementArrives() async {
         let cache = makeCache(); defer { try? FileManager.default.removeItem(at: cache.directory) }
         cache.saveRoute(action: "current_action_123", sourceURL: routeURL)
         let server = CatalogTestServer()
         let model = WorkshopBrowserModel(service: service(cache, server))
         await load(model) { model.reload() }
         await server.configure(failPageTwo: true)
-        await load(model) { model.loadMore() }
+        await load(model) { model.goToPage(2) }
         XCTAssertEqual(model.page, 1); XCTAssertEqual(model.items.count, 1)
         await server.configure()
         await load(model) { model.retryLastRequest() }
         XCTAssertEqual(model.page, 2)
-        XCTAssertEqual(model.items.map(\.title), ["Page 1", "Page 2"])
+        XCTAssertEqual(model.items.map(\.title), ["Page 2"])
         XCTAssertFalse(model.usingCachedData); XCTAssertNil(model.error)
+    }
+
+    @MainActor
+    func testJumpFetchesOnlySelectedPageAndUsesTheSubmittedSearch() async {
+        let cache = makeCache(); defer { try? FileManager.default.removeItem(at: cache.directory) }
+        let server = CatalogTestServer()
+        let model = WorkshopBrowserModel(service: service(cache, server))
+        model.search = "ocean"
+        model.filters["Type"] = "Video"
+        await load(model) { model.searchSubmitted() }
+        model.search = "unsent draft"
+        await load(model) { model.goToPage(9) }
+        XCTAssertEqual(model.page, 9)
+        XCTAssertEqual(model.items.map(\.title), ["Page 9"])
+        XCTAssertNotNil(cache.page(WorkshopQuery(search: "ocean", tags: ["Everyone", "Video"], page: 9)))
+        model.goToPage(0)
+        model.goToPage(13)
+        model.goToPage(9)
+        XCTAssertFalse(model.loading)
+        await load(model) { model.goToPage(8) }
+        XCTAssertEqual(model.page, 8)
+        await load(model) { model.searchSubmitted() }
+        XCTAssertEqual(model.page, 1)
+        let requests = await server.pageRequests
+        XCTAssertEqual(requests, [1, 9, 8, 1])
+    }
+
+    @MainActor
+    func testJumpBackOfflineDisplaysRequestedCachedPage() async {
+        let cache = makeCache(); defer { try? FileManager.default.removeItem(at: cache.directory) }
+        let server = CatalogTestServer()
+        let model = WorkshopBrowserModel(service: service(cache, server))
+        await load(model) { model.reload() }
+        await load(model) { model.goToPage(5) }
+        await server.configure(failQueries: true)
+        await load(model) { model.goToPage(1) }
+        XCTAssertEqual(model.page, 1)
+        XCTAssertEqual(model.items.map(\.title), ["Page 1"])
+        XCTAssertTrue(model.usingCachedData)
+        XCTAssertNotNil(model.error)
     }
 }

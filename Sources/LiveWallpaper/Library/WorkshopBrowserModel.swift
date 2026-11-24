@@ -22,22 +22,21 @@ final class WorkshopBrowserModel: ObservableObject {
     private var loadTask: Task<Void, Never>?
     private var detailTask: Task<Void, Never>?
     private var generation = UUID()
-    private var displayedScope: WorkshopQuery?
+    private var lastRequest = WorkshopQuery(tags: ["Everyone"])
     private var didInitialLoad = false
-    private var lastLoadReset = true
     private let service: WorkshopCatalogService
 
     init(service: WorkshopCatalogService = .shared) {
         self.service = service
         groups = service.cache.groups() ?? WorkshopTagGroup.basic
-        let query = WorkshopQuery(tags: ["Everyone"])
-        displayedScope = query
-        if let cached = service.cache.page(query) { showCached(cached) }
+        if let cached = service.cache.page(lastRequest) { showCached(cached) }
     }
+    var isShowingSearchResults: Bool { !lastRequest.search.isEmpty }
+
     func loadIfNeeded() {
-        if !loading, !didInitialLoad || error != nil { didInitialLoad = true; reload() }
+        if !loading, !didInitialLoad || error != nil { retryLastRequest() }
     }
-    func retryLastRequest() { load(reset: lastLoadReset) }
+    func retryLastRequest() { load(lastRequest) }
     private func showCached(_ entry: WorkshopCatalogCache.Entry<WorkshopPage>) {
         items = entry.value.items; page = entry.value.page; totalPages = entry.value.totalPages; total = entry.value.total
         usingCachedData = true; updatedAt = entry.savedAt
@@ -46,24 +45,35 @@ final class WorkshopBrowserModel: ObservableObject {
         if let id = Self.itemID(from: search) { open(id: id) }
         else { reload() }
     }
-    func reload() { load(reset: true) }
-    func loadMore() { if !loading, page < totalPages { load(reset: false) } }
+    func reload() {
+        load(WorkshopQuery(search: search.trimmingCharacters(in: .whitespacesAndNewlines),
+                           sort: sort, tags: filters.values.filter { !$0.isEmpty }.sorted()))
+    }
+    func goToPage(_ target: Int) {
+        guard target >= 1, target <= totalPages, target != page else { return }
+        var query = lastRequest
+        query.page = target
+        load(query)
+    }
     func resetFilters() {
         filters = ["Age Rating": "Everyone"]; search = ""; sort = "trend"; reload()
     }
-    private func load(reset: Bool) {
+    private func load(_ query: WorkshopQuery) {
+        didInitialLoad = true
         loadTask?.cancel()
         let token = UUID(); generation = token
-        let query = WorkshopQuery(search: search.trimmingCharacters(in: .whitespacesAndNewlines),
-                                  sort: sort, tags: filters.values.filter { !$0.isEmpty }.sorted(),
-                                  page: reset ? 1 : page + 1)
-        var scope = query; scope.page = 1
-        if reset, displayedScope != scope {
-            if let cached = service.cache.page(query) { showCached(cached) }
-            else { items = []; page = 0; total = 0; totalPages = 1; usingCachedData = false; updatedAt = nil }
-            displayedScope = scope
+        var previous = lastRequest
+        previous.page = query.page
+        let scopeChanged = previous != query
+        if scopeChanged || query.page != page {
+            closeDetail()
+            if let cached = service.cache.page(query) {
+                showCached(cached)
+            } else if scopeChanged {
+                items = []; page = 0; total = 0; totalPages = 1; usingCachedData = false; updatedAt = nil
+            }
         }
-        lastLoadReset = reset
+        lastRequest = query
         loading = true; error = nil
         loadTask = Task {
             do {
@@ -72,18 +82,16 @@ final class WorkshopBrowserModel: ObservableObject {
                 self.groups = groups
                 let result = try await service.browse(query)
                 guard !Task.isCancelled, generation == token else { return }
-                if reset { items = result.items }
-                else {
-                    let existing = Set(items.map(\.id))
-                    items.append(contentsOf: result.items.filter { !existing.contains($0.id) })
-                }
+                items = result.items
                 page = result.page; totalPages = result.totalPages; total = result.total; loading = false
                 usingCachedData = false; updatedAt = Date()
             } catch {
                 guard !Task.isCancelled, generation == token else { return }
                 if let groups = service.cache.groups() { self.groups = groups }
                 usingCachedData = !items.isEmpty
-                self.error = WorkshopCatalogService.userMessage(for: error); loading = false
+                let reason = WorkshopCatalogService.userMessage(for: error)
+                self.error = query.page != page && page > 0 ? "第 \(query.page) 页加载失败。\(reason)" : reason
+                loading = false
             }
         }
     }

@@ -28,7 +28,21 @@ struct WorkshopView: View {
                     }
                     VStack(spacing: 0) {
                         sortBar
-                        catalog
+                        if let error = browser.error {
+                            HStack(spacing: 10) {
+                                Image(systemName: "wifi.exclamationmark").foregroundStyle(.orange)
+                                Text(error).font(.callout)
+                                Spacer()
+                                Button("重试") { browser.retryLastRequest() }
+                            }.padding(12).background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 10))
+                                .padding(.horizontal, 22).padding(.bottom, 8)
+                        }
+                        catalog.id(browser.page)
+                        if browser.page > 0 && browser.totalPages > 1 {
+                            WorkshopPageNavigator(page: browser.page, totalPages: browser.totalPages,
+                                                  select: browser.goToPage)
+                                .disabled(browser.loading)
+                        }
                         if downloader.pendingCount > 0 { transferShelf }
                     }.frame(maxWidth: .infinity, maxHeight: .infinity)
                     if let item = browser.selection {
@@ -103,7 +117,7 @@ struct WorkshopView: View {
             Button { showFilters.toggle() } label: { Image(systemName: "line.3.horizontal.decrease") }
                 .buttonStyle(.plain).foregroundStyle(showFilters ? WorkshopStyle.accent : .secondary).help("显示或隐藏筛选")
                 .padding(.horizontal, 5)
-            Button { browser.reload(); subscriptions.refresh() } label: { Image(systemName: "arrow.clockwise") }
+            Button { browser.retryLastRequest(); subscriptions.refresh() } label: { Image(systemName: "arrow.clockwise") }
                 .buttonStyle(.plain).foregroundStyle(.secondary).help("刷新创意工坊")
         }.padding(.horizontal, 22).padding(.bottom, 16)
     }
@@ -178,14 +192,6 @@ struct WorkshopView: View {
     private var catalog: some View {
         ScrollView {
             VStack(alignment: .leading, spacing: 20) {
-                if let error = browser.error {
-                    HStack(spacing: 10) {
-                        Image(systemName: "wifi.exclamationmark").foregroundStyle(.orange)
-                        Text(error).font(.callout)
-                        Spacer()
-                        Button("重试") { browser.retryLastRequest() }
-                    }.padding(14).background(.orange.opacity(0.08), in: RoundedRectangle(cornerRadius: 12))
-                }
                 if browser.usingCachedData {
                     HStack(spacing: 7) {
                         Image(systemName: "clock.arrow.circlepath")
@@ -195,11 +201,11 @@ struct WorkshopView: View {
                         if browser.loading { Text("正在重新连接 Steam…") }
                     }.font(.system(size: 10)).foregroundStyle(.secondary)
                 }
-                if let first = browser.items.first, browser.search.isEmpty, browser.selection == nil {
+                if let first = browser.items.first, !browser.isShowingSearchResults, browser.selection == nil {
                     featured(first)
                 }
                 HStack(alignment: .firstTextBaseline) {
-                    Text(browser.search.isEmpty ? "探索壁纸" : "搜索结果").font(.system(size: 16, weight: .bold))
+                    Text(browser.isShowingSearchResults ? "搜索结果" : "探索壁纸").font(.system(size: 16, weight: .bold))
                     Text(browser.total > 0 ? browser.total.formatted() + " 个作品" : "来自全球创作者")
                         .font(.system(size: 10)).foregroundStyle(.secondary)
                     Spacer()
@@ -218,16 +224,6 @@ struct WorkshopView: View {
                         Text("换个关键词，或试试其他筛选条件").font(.caption).foregroundStyle(.secondary)
                         Button("清除筛选") { browser.resetFilters() }
                     }.frame(maxWidth: .infinity).padding(.vertical, 65)
-                }
-                if browser.page < browser.totalPages && !browser.items.isEmpty {
-                    HStack {
-                        Spacer()
-                        Button(browser.loading ? "正在加载…" : "发现更多壁纸") { browser.loadMore() }
-                            .buttonStyle(.plain).font(.system(size: 12, weight: .medium))
-                            .padding(.horizontal, 28).padding(.vertical, 12)
-                            .background(.white.opacity(0.045), in: Capsule()).disabled(browser.loading)
-                        Spacer()
-                    }.padding(.top, 8)
                 }
             }.padding(.horizontal, 24).padding(.bottom, 24)
         }
@@ -321,6 +317,44 @@ struct WorkshopView: View {
             Text(title).font(.system(size: 9)).foregroundStyle(.secondary)
             Text(value).font(.system(size: 12, weight: .semibold)).monospacedDigit()
         }
+    }
+}
+
+private struct WorkshopPageNavigator: View {
+    let page: Int
+    let totalPages: Int
+    let select: (Int) -> Void
+    @State private var draft = ""
+
+    private var target: Int? {
+        guard let number = Int(draft.trimmingCharacters(in: .whitespacesAndNewlines)),
+              (1...totalPages).contains(number), number != page else { return nil }
+        return number
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Divider()
+            HStack(spacing: 10) {
+                Button { select(page - 1) } label: { Image(systemName: "chevron.left") }
+                    .disabled(page <= 1).help("上一页").accessibilityLabel("上一页")
+                Text("第 \(page.formatted()) / \(totalPages.formatted()) 页")
+                    .monospacedDigit().fixedSize()
+                Button { select(page + 1) } label: { Image(systemName: "chevron.right") }
+                    .disabled(page >= totalPages).help("下一页").accessibilityLabel("下一页")
+                Spacer(minLength: 8)
+                TextField("页码", text: $draft)
+                    .textFieldStyle(.roundedBorder).frame(width: 55)
+                    .accessibilityLabel("跳转到页码").help("输入 1 至 \(totalPages) 的页码，按回车跳转")
+                    .onSubmit { submit() }
+                Button("跳转", action: submit).disabled(target == nil)
+            }
+            .controlSize(.small).font(.caption)
+            .padding(.horizontal, 16).padding(.vertical, 9)
+        }.onChange(of: page) { _ in draft = "" }
+    }
+    private func submit() {
+        if let target { select(target) }
     }
 }
 

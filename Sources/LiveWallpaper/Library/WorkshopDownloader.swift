@@ -1,7 +1,7 @@
 import Foundation
 
 /// 用 SteamCMD 下载 Wallpaper Engine(appid 431960)的创意工坊壁纸。
-/// 实测:匿名即可下载大多数老壁纸、内容为明文、force_install_dir 可控落点。下完移动到
+/// 实测:匿名即可下载大多数老壁纸、内容为明文、force_install_dir 可控落点。下完安装到
 /// 壁纸库目录,FolderWatcher 自动刷新进库。支持并发(最多同时 maxConcurrent 个)。
 ///
 /// 注意:依赖系统装有 steamcmd(brew install --cask steamcmd)。未装时给出提示。
@@ -60,6 +60,7 @@ final class WorkshopDownloader: ObservableObject {
             case waitingForSteamClient
             case steamClientDownloading
             case startingDownloader
+            case updatingDownloader
             case waitingForDownloader
             case authenticating
             case preparing
@@ -95,6 +96,7 @@ final class WorkshopDownloader: ObservableObject {
                 case .waitingForSteamClient: return "等待 Steam"
                 case .steamClientDownloading: return "Steam 下载"
                 case .startingDownloader: return "启动服务"
+                case .updatingDownloader: return "更新 SteamCMD"
                 case .waitingForDownloader: return "等待连接通道"
                 case .authenticating: return "Steam 登录"
                 case .preparing: return "连接 CDN"
@@ -527,7 +529,9 @@ final class WorkshopDownloader: ObservableObject {
                 }
             }
         }
-        try fm.createDirectory(at: slotContentRoot(session.slot), withIntermediateDirectories: true)
+        let contentRoot = slotContentRoot(session.slot)
+        try fm.createDirectory(at: contentRoot, withIntermediateDirectories: true)
+        try WorkshopInstallCache.repairManifest(in: contentRoot, appID: appID)
         return executable
     }
 
@@ -535,7 +539,10 @@ final class WorkshopDownloader: ObservableObject {
         let fm = FileManager.default
         let targetRoot = slotContentRoot(session.slot)
         for source in candidateRoots(id) where source != targetRoot {
-            for kind in ["content", "downloads"] {
+            // A committed directory is Steam's source for future delta updates in its own slot.
+            // Only the legacy locations and per-item backup are safe to move wholesale.
+            let kinds = source == stagingRoot || source == retainedRoot(id) ? ["content", "downloads"] : ["downloads"]
+            for kind in kinds {
                 let relative = "steamapps/workshop/\(kind)/\(appID)/\(id)"
                 let old = source.appendingPathComponent(relative), new = targetRoot.appendingPathComponent(relative)
                 if fm.fileExists(atPath: old.path) {
@@ -600,7 +607,6 @@ final class WorkshopDownloader: ObservableObject {
         }
         defer { startupLock.unlock() }
         if cancelled() { return .failure("下载已取消或服务正在退出") }
-        phase(.authenticating)
         shutdownSession(session, graceful: true)
 
         do {
@@ -612,6 +618,15 @@ final class WorkshopDownloader: ObservableObject {
         do { executable = try prepareWorker(session) }
         catch { return .failure("无法准备独立下载服务：\(error.localizedDescription)") }
         if cancelled() { return .failure("用户取消下载") }
+        return launchSteamCMD(executable, account: wantedAccount, id: id, session: session, allowUpdateRelaunch: true)
+    }
+
+    private func launchSteamCMD(_ executable: URL, account wantedAccount: String, id: String?,
+                                session: Session, allowUpdateRelaunch: Bool) -> SessionReadyResult {
+        if isStopping || id.map(isCancelled) == true { return .failure("用户取消下载") }
+        if let id { setPhase(id, .authenticating, state: .connecting) }
+        let log = workerHome(session.slot).appendingPathComponent("Library/Application Support/Steam/logs/bootstrap_log.txt")
+        var update = SteamBootstrapUpdate(log: log, start: Date(), idleWindow: timeouts.login)
         guard let p = makeSteamCMDProcess(arguments: [
             "+force_install_dir", slotContentRoot(session.slot).path,
             "+login", wantedAccount
@@ -677,13 +692,17 @@ final class WorkshopDownloader: ObservableObject {
         if let id { setProcess(id, p) }
         defer { if let id { setProcess(id, nil) } }
 
-        let deadline = Date().addingTimeInterval(timeouts.login)
-        while Date() < deadline {
+        while true {
+            let wasUpdating = update.updating
+            update.poll(now: Date())
+            if !wasUpdating, update.updating, let id {
+                setPhase(id, .updatingDownloader, state: .connecting)
+            }
             if isStopping {
                 shutdownSession(session, graceful: false)
                 return .failure("下载服务正在退出")
             }
-            if cancelled() {
+            if id.map(isCancelled) == true {
                 shutdownSession(session, graceful: false)
                 return .failure("用户取消下载")
             }
@@ -705,14 +724,25 @@ final class WorkshopDownloader: ObservableObject {
                 return .failure("连接 Steam/CDN 失败，请检查网络或代理后重试")
             }
             if sessionDidTerminate(session) {
+                // EOF may arrive just before Foundation observes the process exit.
+                let exited = Self.waitExit(p, timeout: 0.3)
+                update.poll(now: Date())
+                if allowUpdateRelaunch, exited, p.terminationReason == .exit,
+                   update.needsRelaunch(afterExit: p.terminationStatus) {
+                    shutdownSession(session, graceful: false)
+                    Log.write("WorkshopDownloader: SteamCMD 已完成自更新，继续登录")
+                    return launchSteamCMD(executable, account: wantedAccount, id: id,
+                                          session: session, allowUpdateRelaunch: false)
+                }
                 let suffix = String(snapshot.suffix(500))
                 shutdownSession(session, graceful: false)
                 return .failure("SteamCMD 初始化时退出\(suffix.isEmpty ? "" : "：\(suffix)")")
             }
-            waitForSessionOutput(session, until: min(deadline, Date().addingTimeInterval(0.25)))
+            guard Date() < update.deadline else { break }
+            waitForSessionOutput(session, until: min(update.deadline, Date().addingTimeInterval(0.25)))
         }
         shutdownSession(session, graceful: false)
-        return .failure("SteamCMD 登录超时，请检查网络或代理设置")
+        return .failure(update.updating ? "SteamCMD 更新超时，请检查网络或代理设置" : "SteamCMD 登录超时，请检查网络或代理设置")
     }
 
     private static func outputShowsLoginSuccess(_ output: String) -> Bool {
@@ -755,7 +785,7 @@ final class WorkshopDownloader: ObservableObject {
         session.condition.lock()
         let data = session.output
         session.condition.unlock()
-        return String(data: data, encoding: .utf8) ?? ""
+        return String(decoding: data, as: UTF8.self)
     }
 
     private func sessionDidTerminate(_ session: Session) -> Bool {
@@ -816,6 +846,12 @@ final class WorkshopDownloader: ObservableObject {
             let id = jobs[i].id
             lock.lock(); let discarding = discardingIDs.contains(id); lock.unlock()
             if jobs[i].state == .queued, jobs[i].phase != .subscribing, !discarding, runningSlots[id] == nil {
+                // During background login a second cold slot cannot initialize until the first
+                // releases startupLock. Leave the job queued so that first session can take it.
+                if !maintainingSlots.isEmpty, clientRoute(for: id) == nil,
+                   sessionPool[freeSlots[0]].map(sessionIsUsable) != true {
+                    continue
+                }
                 let slot = freeSlots.removeFirst()
                 let session = pooledSession(slot)
                 lock.lock(); activeRoots[id] = slotContentRoot(slot); lock.unlock()
@@ -936,7 +972,7 @@ final class WorkshopDownloader: ObservableObject {
             finish(id, .failed(reason)); return
         }
 
-        // 移动到壁纸库目录(「旧的让位→移入→失败回滚」防两头空,理由见 installDownloaded 注释)。
+        // Steam 的已提交文件仍需保留，供它校验和更新；壁纸库接收独立副本。
         do {
             setPhase(id, .installing, state: .downloading)
             guard !isCancelled(id) else { finish(id, .cancelled); return }
@@ -944,7 +980,7 @@ final class WorkshopDownloader: ObservableObject {
             Log.write("WorkshopDownloader \(id): done → \((libraryDirectoryOverride ?? PreferencesStore.shared.libraryRoot).appendingPathComponent(id).path)")
             finish(id, .done, bytes: Self.parseBytes(lastOut), elapsed: Date().timeIntervalSince(t0))
         } catch {
-            finish(id, .failed("移动文件失败: \(error.localizedDescription)"))
+            finish(id, .failed("安装壁纸失败: \(error.localizedDescription)"))
         }
     }
 
@@ -1032,6 +1068,9 @@ final class WorkshopDownloader: ObservableObject {
         }
         resetSessionOutput(session)
         let logURL = workerHome(session.slot).appendingPathComponent("Library/Application Support/Steam/logs/content_log.txt")
+        var workshopLog = WorkshopCommandLog(url: logURL.deletingLastPathComponent().appendingPathComponent("workshop_log.txt"),
+                                            app: appID, item: id)
+        let installedItem = slotContentRoot(session.slot).appendingPathComponent("steamapps/workshop/content/\(appID)/\(id)")
         let baseline = (try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? NSNumber)?.uint64Value ?? 0
         session.condition.lock()
         session.commandID = id; session.commandGeneration = UUID(); session.logBaseline = baseline
@@ -1052,16 +1091,30 @@ final class WorkshopDownloader: ObservableObject {
         var sawCommandStart = false
         while !isCancelled(id) {
             let output = sessionSnapshot(session)
-            if !sawCommandStart, output.contains("Downloading item \(id)") {
+            workshopLog.poll()
+            switch workshopLog.outcome {
+            case .installed where FileManager.default.fileExists(atPath: installedItem.appendingPathComponent("project.json").path):
+                setProcess(id, nil)
+                return DownloadCommandResult(succeeded: true, output: output)
+            case .failed(let reason):
+                setProcess(id, nil)
+                let detail = reason == "Missing game files" ? reason : output + "\n" + reason
+                return DownloadCommandResult(succeeded: false, output: detail)
+            default: break
+            }
+            if !sawCommandStart, workshopLog.requested || output.contains("Downloading item \(id)") {
                 sawCommandStart = true
                 setPhase(id, .preparing, state: .connecting)
             }
             let patch = patchSize(forID: id)
             if patch > 24, patch > lastPatchSize {
-                lastPatchSize = patch; lastProgressAt = Date()
+                lastPatchSize = patch; lastProgressAt = Date(); sawCommandStart = true
             }
             session.condition.lock(); let activity = session.lastActivityAt; session.condition.unlock()
-            if let activity, activity > lastProgressAt { lastProgressAt = activity }
+            if let activity {
+                sawCommandStart = true
+                lastProgressAt = max(activity, lastProgressAt)
+            }
             if Self.outputShowsDownloadSuccess(output, id: id) {
                 setProcess(id, nil)
                 return DownloadCommandResult(succeeded: true, output: output)
@@ -1113,14 +1166,14 @@ final class WorkshopDownloader: ObservableObject {
         return nil
     }
 
-    /// 把下载好的目录移入壁纸库(正常完成与「取消但保留」共用)。纯文件操作,任意线程可调。
-    /// ⚠ 不能「先删旧再移动」:removeItem 成功而 moveItem 失败(磁盘满 / 目标卷是用户自选的外置盘
-    ///   且已卸载或无权限)时,旧壁纸已被**直接删除**(非废纸篓)且新的没落地 → 两头皆空、不可恢复。
-    ///   改成「旧的先改名让位 → 移入新的 → 成功才删旧;任何一步失败就把旧的改回来」。
+    /// 先在目标卷准备完整副本，再切换库目录。失败时恢复用户原有的壁纸。
     private func installDownloaded(from downloaded: String, id: String) throws {
         let dest = (libraryDirectoryOverride ?? PreferencesStore.shared.libraryRoot).appendingPathComponent(id)
         let fm = FileManager.default
-        var parked: URL?          // 旧壁纸的临时让位路径
+        let pending = dest.deletingLastPathComponent().appendingPathComponent(".installing-" + UUID().uuidString)
+        defer { try? fm.removeItem(at: pending) }
+        try WorkshopInstallCache.copyToLibrary(from: downloaded, to: pending)
+        var parked: URL?
         do {
             if fm.fileExists(atPath: dest.path) {
                 let p = dest.deletingLastPathComponent()
@@ -1128,7 +1181,7 @@ final class WorkshopDownloader: ObservableObject {
                 try fm.moveItem(at: dest, to: p)
                 parked = p
             }
-            try fm.moveItem(atPath: downloaded, toPath: dest.path)
+            try fm.moveItem(at: pending, to: dest)
             if let p = parked { try? fm.removeItem(at: p) }   // 新的已就位,旧的可以删了
         } catch {
             // 回滚:把让位的旧壁纸放回原处,保证失败后用户仍有原来那份可用。
@@ -1314,17 +1367,19 @@ final class WorkshopDownloader: ObservableObject {
             session?.group.wait()
             let downloaded = self.itemRoot(id)
                 .appendingPathComponent("steamapps/workshop/content/\(self.appID)/\(id)").path
+            var installed = false
             if keep, FileManager.default.fileExists(atPath: downloaded + "/project.json") {
                 // 与正常完成路径共用 installDownloaded 的让位/回滚:旧代码在这里直接 removeItem(dest)
                 // 再 move,move 一失败(磁盘满/权限)旧壁纸已被永久删掉、两头皆空。
                 do {
                     try self.installDownloaded(from: downloaded, id: id)
+                    installed = true
                     Log.write("WorkshopDownloader \(id): cancelled-but-kept (was complete)")
                 } catch {
                     Log.write("WorkshopDownloader \(id): cancelled-but-kept 入库失败: \(error.localizedDescription)(旧壁纸未受影响)")
                 }
             }
-            if !keep || FileManager.default.fileExists(atPath: downloaded) {
+            if !installed {
                 try? FileManager.default.removeItem(atPath: downloaded)
             }
             if !keep { self.removeStagedItem(id) }
