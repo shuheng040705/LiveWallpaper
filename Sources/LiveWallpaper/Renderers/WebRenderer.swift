@@ -91,6 +91,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         rootURL = item.folderURL
         loadedItem = item
         documentReady = false
+        desktopInput?.invalidateHotspots()
         // 经自定义 scheme 加载入口页:lwwp://wp/<index.html>
         var comps = URLComponents()
         comps.scheme = Self.scheme
@@ -105,6 +106,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     func start() {}
 
     func reloadInPlace() {
+        desktopInput?.invalidateHotspots()
         applyProperties()
         applyMediaVolume()
     }
@@ -129,6 +131,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     func pause() {
         guard !hostPaused else { return }
         hostPaused = true
+        desktopInput?.invalidateHotspots()
         if let webView { notifyPagePaused(in: webView) }
     }
 
@@ -194,6 +197,11 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
                  decisionHandler: @escaping (WKPermissionDecision) -> Void) {
         Log.write("WebRenderer: denied camera/microphone request from web wallpaper (host=\(origin.host), type=\(type.rawValue))")
         decisionHandler(.deny)
+    }
+
+    func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        documentReady = false
+        desktopInput?.invalidateHotspots()
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {

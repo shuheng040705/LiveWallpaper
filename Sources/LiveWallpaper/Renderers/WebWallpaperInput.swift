@@ -1,29 +1,133 @@
 import AppKit
 import WebKit
 
-/// Observe completed primary clicks on the exposed desktop. Finder still receives the
-/// original events, and the wallpaper window never takes focus or handles system input.
+/// Desktop clicks are observed in the normal desktop. Stage Manager requires a real
+/// nonactivating event recipient over each hotspot before the mouse goes down.
 final class WebWallpaperInput {
     private weak var webView: WKWebView?
     private let isEnabled: () -> Bool
     private var monitor: Any?
+    private var localMovement: Any?
     private var press: CGPoint?
+    private var timer: Timer?
+    private var panels: [WebWallpaperHotspotPanel] = []
+    private var generation = 0
+    private var reading = false
+    private var nextRead = 0.0
+    private var nextHoverCheck = 0.0
+
+    static var stageManagerEnabled: Bool {
+        CFPreferencesGetAppBooleanValue("GloballyEnabled" as CFString, "com.apple.WindowManager" as CFString, nil)
+    }
 
     init(webView: WKWebView, isEnabled: @escaping () -> Bool) {
         self.webView = webView
         self.isEnabled = isEnabled
-        monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged]) { [weak self] in
-            self?.handle($0)
+        monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged, .mouseMoved]) { [weak self] event in
+            if event.type == .mouseMoved { self?.hoverChanged(event) }
+            else { self?.handle(event) }
         }
+        localMovement = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .flagsChanged]) { [weak self] event in
+            self?.hoverChanged(event)
+            return event
+        }
+        let timer = Timer(timeInterval: 0.12, repeats: true) { [weak self] _ in self?.refresh() }
+        timer.tolerance = 0.025
+        RunLoop.main.add(timer, forMode: .common)
+        self.timer = timer
     }
 
     func stop() {
         if let monitor { NSEvent.removeMonitor(monitor) }
+        if let localMovement { NSEvent.removeMonitor(localMovement) }
         monitor = nil
+        localMovement = nil
         press = nil
+        timer?.invalidate()
+        timer = nil
+        invalidateHotspots()
     }
 
     deinit { stop() }
+
+    func invalidateHotspots() {
+        generation &+= 1
+        reading = false
+        nextRead = 0
+        panels.forEach { $0.close() }
+        panels.removeAll()
+    }
+
+    private var usesHotspots: Bool {
+        guard Self.stageManagerEnabled, isEnabled(), let webView, let window = webView.window,
+              window.isVisible, window.isOnActiveSpace,
+              webView.url?.scheme == WebRenderer.scheme, webView.url?.host == "wp" else { return false }
+        return true
+    }
+
+    private func refresh() {
+        guard usesHotspots, let webView, let window = webView.window else {
+            if reading || !panels.isEmpty { invalidateHotspots() }
+            return
+        }
+        // A moving mesh must not move or replace the window between mouse down and up.
+        guard NSEvent.pressedMouseButtons == 0 else { return }
+        updatePanelVisibility()
+        let now = ProcessInfo.processInfo.systemUptime
+        guard !reading, now >= nextRead else { return }
+        let revision = generation
+        reading = true
+        WebWallpaperHotspots.read(in: webView) { [weak self, weak webView, weak window] rects in
+            guard let self, self.generation == revision else { return }
+            self.reading = false
+            guard self.usesHotspots, let webView, let window, let screen = window.screen else {
+                self.invalidateHotspots()
+                return
+            }
+            guard NSEvent.pressedMouseButtons == 0 else { return }
+            let frames = rects.compactMap { normalized -> CGRect? in
+                let bounds = webView.bounds
+                let y = webView.isFlipped ? normalized.minY : 1 - normalized.maxY
+                let rect = CGRect(x: bounds.minX + normalized.minX * bounds.width,
+                                  y: bounds.minY + y * bounds.height,
+                                  width: normalized.width * bounds.width, height: normalized.height * bounds.height)
+                let frame = window.convertToScreen(webView.convert(rect, to: nil)).intersection(screen.visibleFrame)
+                return frame.isEmpty ? nil : frame
+            }
+            self.nextRead = ProcessInfo.processInfo.systemUptime + (frames.isEmpty ? 0.75 : 0.12)
+            while self.panels.count > frames.count { self.panels.removeLast().close() }
+            for (index, frame) in frames.enumerated() {
+                if index < self.panels.count {
+                    self.panels[index].update(frame: frame)
+                } else {
+                    self.panels.append(WebWallpaperHotspotPanel(frame: frame) { [weak self] point in
+                        guard let self, self.usesHotspots else { return }
+                        self.click(at: point)
+                    })
+                }
+            }
+            self.updatePanelVisibility()
+        }
+    }
+
+    private func updatePanelVisibility() {
+        guard !panels.isEmpty else { return }
+        let pointer = NSEvent.mouseLocation
+        let overHotspot = panels.contains { $0.frame.contains(pointer) }
+        let modifiers = NSEvent.modifierFlags.intersection([.shift, .option, .control, .command])
+        let mayOrder = overHotspot && modifiers.isEmpty &&
+            Self.canRoute(at: pointer, placingPanels: Set(panels.filter(\.isVisible).map(\.windowNumber)))
+        for panel in panels {
+            panel.setReceivingClicks(modifiers.isEmpty && (!panel.frame.contains(pointer) || mayOrder))
+        }
+    }
+
+    private func hoverChanged(_ event: NSEvent) {
+        guard !panels.isEmpty, NSEvent.pressedMouseButtons == 0 else { return }
+        guard event.type == .flagsChanged || event.timestamp >= nextHoverCheck else { return }
+        nextHoverCheck = event.timestamp + 0.025
+        updatePanelVisibility()
+    }
 
     private func handle(_ event: NSEvent) {
         if event.type == .leftMouseDragged {
@@ -32,8 +136,8 @@ final class WebWallpaperInput {
         }
         let start = press
         press = nil
-        guard event.type == .leftMouseDown || start != nil,
-              isEnabled(), let webView, let window = webView.window as? DesktopWindow,
+        guard !Self.stageManagerEnabled, event.type == .leftMouseDown || start != nil,
+              isEnabled(), let window = webView?.window as? DesktopWindow,
               window.isVisible, window.isOnActiveSpace, let screen = window.screen,
               event.modifierFlags.intersection([.control, .shift, .option, .command]).isEmpty,
               event.clickCount == 1, let cgEvent = event.cgEvent else { return }
@@ -41,13 +145,19 @@ final class WebWallpaperInput {
         // Quartz uses the main display's top-left origin even with another display above it.
         let quartzPoint = cgEvent.location
         let point = CGPoint(x: quartzPoint.x, y: CGDisplayBounds(CGMainDisplayID()).height - quartzPoint.y)
-        guard screen.visibleFrame.contains(point), Self.isDesktop(at: point, event: cgEvent) else { return }
+        let target = pid_t(clamping: cgEvent.getIntegerValueField(.eventTargetUnixProcessID))
+        guard screen.visibleFrame.contains(point), Self.canRoute(at: point, target: target) else { return }
         if event.type == .leftMouseDown {
             press = point
             return
         }
 
         guard let start, hypot(point.x - start.x, point.y - start.y) <= 4 else { return }
+        click(at: point)
+    }
+
+    private func click(at point: CGPoint) {
+        guard let webView, let window = webView.window else { return }
         let local = webView.convert(window.convertPoint(fromScreen: point), from: nil)
         if let location = Self.normalizedPoint(local, in: webView.bounds, flipped: webView.isFlipped) {
             Self.dispatchClick(at: location, in: webView)
@@ -60,11 +170,16 @@ final class WebWallpaperInput {
                        y: (flipped ? point.y - bounds.minY : bounds.maxY - point.y) / bounds.height)
     }
 
-    private static func isDesktop(at point: CGPoint, event: CGEvent) -> Bool {
+    private static func canRoute(at point: CGPoint, target: pid_t = 0, placingPanels panels: Set<Int>? = nil) -> Bool {
         // Use WindowServer's hit test rather than bounding boxes. A covered wallpaper or an
         // interactive desktop widget, menu, Dock or regular Finder window must not get clicks.
-        let hit = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
-        let target = pid_t(clamping: event.getIntegerValueField(.eventTargetUnixProcessID))
+        var hit = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
+        if let panels {
+            var skipped = Set<Int>()
+            while panels.contains(hit), skipped.insert(hit).inserted {
+                hit = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: hit)
+            }
+        }
         let desktopOwners = ["com.apple.finder", "com.apple.dock", "com.apple.WindowManager"]
         if hit == 0 {
             // Some versions report no window at all for background clicks.
@@ -83,6 +198,9 @@ final class WebWallpaperInput {
         }
         let icons = Int(CGWindowLevelForKey(.desktopIconWindow))
         let background = Int(CGWindowLevelForKey(.desktopWindow))
+        // App windows, Dock and Stage Manager thumbnails already outrank our panels.
+        // Keep the panels ready underneath them when the pointer returns to the desktop.
+        if panels != nil && level > icons + 1 { return true }
         if level <= background && ["com.apple.dock", "com.apple.WindowManager"].contains(bundle) { return true }
         guard level == icons else { return false }
         if bundle == "com.apple.WindowManager" {
@@ -95,14 +213,15 @@ final class WebWallpaperInput {
         // Older Finder versions expose one window for both icons and empty space. Refine
         // that hit when Accessibility is already available; native icon clicks still work
         // without it since this monitor neither consumes events nor activates the wallpaper.
-        guard AXIsProcessTrusted() else { return true }
+        guard AXIsProcessTrusted() else { return panels == nil }
         var element: AXUIElement?
+        let quartzY = CGDisplayBounds(CGMainDisplayID()).height - point.y
         let result = AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(),
-                                                     Float(event.location.x), Float(event.location.y), &element)
-        guard result == .success, let element else { return true }
+                                                     Float(point.x), Float(quartzY), &element)
+        guard result == .success, let element else { return panels == nil }
         var role: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
-              let role = role as? String else { return true }
+              let role = role as? String else { return panels == nil }
         return [kAXScrollAreaRole, kAXListRole, kAXWindowRole].contains(role)
     }
 
