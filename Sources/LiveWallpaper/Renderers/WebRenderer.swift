@@ -16,8 +16,14 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     static let scheme = "lwwp"          // Live Wallpaper Web Project
 
     private var webView: WKWebView?
+    private var desktopInput: WebWallpaperInput?
+    private var hostPaused = false
+    private var mediaSuspended = false
+    private var masterMuted = PreferencesStore.shared.isMuted
+    private var masterVolume = PreferencesStore.shared.volume
     private var rootURL: URL?           // 壁纸文件夹(资源根)
-    private var properties: [String: Any] = [:]   // project.json general.properties(传给 WE shim)
+    private var loadedItem: WallpaperItem?
+    private var documentReady = false
 
     /// 审计修复(#7):进行中的 scheme task 集合 + 已取消标记。WKWebView 在 stop()/导航中断时会调
     ///   webView(_:stop:) 取消进行中的 task;此后再调该 task 的 didReceive/didFinish 会崩。
@@ -43,6 +49,8 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         config.mediaTypesRequiringUserActionForPlayback = []   // 允许自动播放
         config.setURLSchemeHandler(self, forURLScheme: Self.scheme)
         WebMediaCapturePolicy.install(into: config.userContentController)
+        config.userContentController.addUserScript(WKUserScript(source: WebWallpaperMedia.script,
+            injectionTime: .atDocumentStart, forMainFrameOnly: true))
 
         // 注入最小 Wallpaper Engine 运行时垫片:很多 WE 网页壁纸在 wallpaperPropertyListener
         // 被调用(applyUserProperties)后才设置背景/初始化,WE 启动时会调一次。这里在文档开始
@@ -69,13 +77,20 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         wv.setValue(false, forKey: "drawsBackground")          // 透明背景(失败也无妨)
         host.addSubview(wv)
         webView = wv
+        if host.window is DesktopWindow {
+            desktopInput = WebWallpaperInput(webView: wv) { [weak self] in
+                guard let self else { return false }
+                return self.documentReady && !self.hostPaused
+            }
+        }
         Log.write("WebRenderer.attach: webView added bounds=\(NSStringFromRect(host.bounds)) window=\(host.window == nil ? "nil" : "ok")")
     }
 
     func load(_ item: WallpaperItem) {
         guard let entry = item.fileName, !entry.isEmpty else { Log.write("WebRenderer.load: no entry file"); return }
         rootURL = item.folderURL
-        properties = Self.defaultProperties(folder: item.folderURL)
+        loadedItem = item
+        documentReady = false
         // 经自定义 scheme 加载入口页:lwwp://wp/<index.html>
         var comps = URLComponents()
         comps.scheme = Self.scheme
@@ -89,24 +104,84 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
 
     func start() {}
 
+    func reloadInPlace() {
+        applyProperties()
+        applyMediaVolume()
+    }
+
     func stop() {
+        desktopInput?.stop()
+        desktopInput = nil
         webView?.stopLoading()
         webView?.navigationDelegate = nil
         webView?.uiDelegate = nil
         webView?.removeFromSuperview()
         webView = nil
         rootURL = nil
+        loadedItem = nil
+        documentReady = false
+        hostPaused = false
+        mediaSuspended = false
         // 审计修复(#7):清空活跃 task 登记。停止后即使 WebKit 漏调 stop:,任何残留回调也会因不在集合里被跳过。
         taskLock.lock(); activeTasks.removeAll(); taskLock.unlock()
     }
 
     func pause() {
-        // 多数 WE 网页壁纸监听可见性/焦点来暂停动画。
-        webView?.evaluateJavaScript("try{document.dispatchEvent(new Event('visibilitychange'));window.dispatchEvent(new Event('blur'))}catch(e){}", completionHandler: nil)
+        guard !hostPaused else { return }
+        hostPaused = true
+        if let webView { notifyPagePaused(in: webView) }
     }
 
     func resume() {
-        webView?.evaluateJavaScript("try{window.dispatchEvent(new Event('focus'))}catch(e){}", completionHandler: nil)
+        guard hostPaused else { return }
+        hostPaused = false
+        guard let webView else { return }
+        if mediaSuspended {
+            mediaSuspended = false
+            webView.setAllMediaPlaybackSuspended(false) { [weak self, weak webView] in
+                guard let self, let webView, self.webView === webView, !self.hostPaused else { return }
+                self.notifyPagePaused(in: webView)
+            }
+        } else {
+            notifyPagePaused(in: webView)
+        }
+    }
+
+    private func notifyPagePaused(in view: WKWebView) {
+        let paused = hostPaused
+        let js = """
+        (() => {
+            const listener = window.wallpaperPropertyListener;
+            if (typeof listener?.setPaused === 'function') listener.setPaused(\(paused));
+            else {
+                document.dispatchEvent(new Event('visibilitychange'));
+                window.dispatchEvent(new Event('\(paused ? "blur" : "focus")'));
+            }
+        })()
+        """
+        view.evaluateJavaScript(js) { [weak self, weak view] _, _ in
+            guard let self, let view, self.webView === view,
+                  paused, self.hostPaused, !self.mediaSuspended else { return }
+            // Let the wallpaper remember which voice was playing before WebKit suspends it.
+            self.mediaSuspended = true
+            view.setAllMediaPlaybackSuspended(true, completionHandler: nil)
+        }
+    }
+
+    func setMuted(_ muted: Bool) {
+        masterMuted = muted
+        applyMediaVolume()
+    }
+
+    func setVolume(_ v: Double) {
+        masterVolume = v
+        applyMediaVolume()
+    }
+
+    private func applyMediaVolume() {
+        let localVolume = loadedItem.map { GeneralWallpaperSettings.shared.volume($0.id) / 100 } ?? 1
+        let gain = masterMuted ? 0 : min(1, max(0, masterVolume * localVolume))
+        webView?.evaluateJavaScript("window.__lwSetMediaGain?.(\(gain))", completionHandler: nil)
     }
 
     // MARK: - WKNavigationDelegate
@@ -122,8 +197,11 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        documentReady = true
         Log.write("WebRenderer: didFinish \(webView.url?.absoluteString ?? "nil")")
         applyProperties()
+        applyMediaVolume()
+        if hostPaused { notifyPagePaused(in: webView) }
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
@@ -134,31 +212,36 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         Log.write("WebRenderer: didFailProvisional \(error.localizedDescription)")
     }
 
-    /// 派发一次 WE 默认属性(模拟 WE 启动时调用 applyUserProperties),让壁纸初始化背景/参数。
+    /// 首次派发完整属性，之后只派发变化的项。切换预设或恢复默认无需重新加载网页。
     private func applyProperties() {
-        guard let data = try? JSONSerialization.data(withJSONObject: properties),
-              let json = String(data: data, encoding: .utf8) else { return }
-        let js = "try{ if(window.wallpaperPropertyListener && window.wallpaperPropertyListener.applyUserProperties){ window.wallpaperPropertyListener.applyUserProperties(\(json)); } }catch(e){ console.error('applyUserProperties failed', e); }"
-        webView?.evaluateJavaScript(js, completionHandler: nil)
-    }
-
-    /// 从 project.json 的 general.properties 构造 WE 风格属性对象 { name: {value: ...}, ... }。
-    private static func defaultProperties(folder: URL) -> [String: Any] {
-        guard let data = try? Data(contentsOf: folder.appendingPathComponent("project.json")),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let general = json["general"] as? [String: Any],
-              let props = general["properties"] as? [String: Any]
-        else { return [:] }
-        var out: [String: Any] = [:]
-        for (key, raw) in props {
-            guard let entry = raw as? [String: Any] else { continue }
-            // WE 把每个属性以 { value: ... } 形式传给监听器(保留 value/type 字段)。
-            var item: [String: Any] = [:]
-            if let v = entry["value"] { item["value"] = v }
-            if let t = entry["type"] { item["type"] = t }
-            out[key] = item
+        guard documentReady, let item = loadedItem, let webView else { return }
+        let properties = WallpaperPropertyStore.shared.webProperties(for: item)
+        webView.callAsyncJavaScript("""
+            const state = window.__lwUserPropertyState ??= { revision: 0 };
+            const revision = ++state.revision;
+            // 有些项目会等资源准备好才注册回调。在等待期间发生的修改由最新调用接管。
+            for (const delay of [0, 50, 150, 400, 1000, 2500, 5000, 10000, 20000]) {
+                if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+                if (revision !== state.revision) return;
+                const listener = window.wallpaperPropertyListener;
+                if (typeof listener?.applyUserProperties !== 'function') continue;
+                const first = state.listener !== listener;
+                const values = Object.create(null);
+                const changes = [];
+                for (const [key, prop] of Object.entries(properties)) {
+                    values[key] = JSON.stringify([prop.type, prop.value]);
+                    if (first || state.values[key] !== values[key]) changes.push([key, prop]);
+                }
+                if (first || changes.length) listener.applyUserProperties(Object.fromEntries(changes));
+                state.listener = listener;
+                state.values = values;
+                return;
+            }
+            """, arguments: ["properties": properties], in: nil, in: .page) { result in
+            if case .failure(let error) = result {
+                Log.write("WebRenderer: applyUserProperties failed: \(error.localizedDescription)")
+            }
         }
-        return out
     }
 
     // MARK: - WKURLSchemeHandler (经自定义 scheme 直接喂本地文件,XHR/fetch 可用)
@@ -240,7 +323,8 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         case "svg":         return "image/svg+xml"
         case "mp4":         return "video/mp4"
         case "webm":        return "video/webm"
-        case "ogg", "ogv":  return "video/ogg"
+        case "ogg", "oga":  return "audio/ogg"
+        case "ogv":         return "video/ogg"
         case "mp3":         return "audio/mpeg"
         case "wav":         return "audio/wav"
         case "wasm":        return "application/wasm"

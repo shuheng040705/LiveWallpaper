@@ -15,11 +15,12 @@ protocol WallpaperRenderer: AnyObject {
     func stop()
     func pause()
     func resume()
-    /// 视频壁纸的静音/音量/填充控制;其它渲染器忽略。
+    /// 壁纸媒体的静音和音量。
     func setMuted(_ muted: Bool)
     func setVolume(_ v: Double)
+    /// 视频的画面填充模式。
     func setFillMode(_ fill: Bool)
-    /// 属性改动后就地重载(不重建视图,无黑屏);仅 scene 实现,其它忽略。
+    /// 就地应用属性变化，保留当前渲染视图。
     func reloadInPlace()
     /// 本次加载的渲染缺口(没能正确渲染的项,供 UI 弹窗指明)。仅 scene 实现;其它渲染器无缺口=空。
     var renderGaps: [String] { get }

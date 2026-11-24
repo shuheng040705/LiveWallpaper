@@ -150,7 +150,7 @@ final class WallpaperPropertyStore: ObservableObject {
     /// 其后的属性都归该组,直到下一个 group 标记;首个 group 之前的属性是顶层(group=nil)。
     /// pkg 没有 group 标记 → 全部顶层 → 面板扁平(满足「pkg 没分类我们也不分类」)。
     /// type=None 的 HTML 文本(作者头/分节说明)保留为 isText 标签显示;纯分隔条/图片横幅跳过。
-    func properties(forID id: String, folderURL: URL) -> [WallpaperProperty] {
+    func properties(forID id: String, folderURL: URL, wallpaperType: WallpaperType? = nil) -> [WallpaperProperty] {
         let props = cachedProps(folderURL)
         guard !props.isEmpty else { return [] }
         // 壁纸自带的本地化译文表(可能为空)。属性 text 若是本地化 KEY 且表里命中 → 用译文。
@@ -226,7 +226,8 @@ final class WallpaperPropertyStore: ObservableObject {
             var prop = WallpaperProperty(id: e.key, type: kind, label: label, order: e.order)
             prop.group = currentGroup
             prop.condition = (p["condition"] as? String) ?? ""
-            prop.supported = Self.isSupported(key: e.key, kind: kind, label: label)
+            // 网页壁纸由作者的 JavaScript 实现属性，场景引擎的支持列表不适用。
+            prop.supported = wallpaperType == .web || Self.isSupported(key: e.key, kind: kind, label: label)
             if kind == .slider {
                 prop.sliderMin = (p["min"] as? NSNumber)?.doubleValue ?? 0
                 prop.sliderMax = (p["max"] as? NSNumber)?.doubleValue ?? 1
@@ -382,6 +383,37 @@ final class WallpaperPropertyStore: ObservableObject {
         case .label:
             return .string("")
         }
+    }
+
+    /// 按 Wallpaper Engine 的格式组合项目默认值和本机设置。
+    func webProperties(for item: WallpaperItem) -> [String: [String: Any]] {
+        var result: [String: [String: Any]] = [:]
+        for (key, raw) in cachedProps(item.folderURL) {
+            guard let entry = raw as? [String: Any] else { continue }
+            var property = entry.filter { $0.key == "value" || $0.key == "type" }
+            let overrideKey = storeKey(item.id, key)
+            if let saved = d.object(forKey: overrideKey) {
+                switch entry["type"] as? String {
+                case "combo":
+                    // 选择器以字符串保存选项 ID，页面接收作者声明的原始 JSON 类型。
+                    let options = entry["options"] as? [[String: Any]] ?? []
+                    if let value = options.compactMap({ $0["value"] }).first(where: {
+                        Self.anyAsString($0) == Self.anyAsString(saved)
+                    }) {
+                        property["value"] = value
+                    }
+                case "bool":
+                    property["value"] = d.bool(forKey: overrideKey)
+                case "slider":
+                    property["value"] = d.double(forKey: overrideKey)
+                case "color", "textinput":
+                    if let value = d.string(forKey: overrideKey) { property["value"] = value }
+                default: break
+                }
+            }
+            result[key] = property
+        }
+        return result
     }
 
     /// 写入覆盖值。

@@ -302,7 +302,7 @@ struct SettingsForm: View {
                 PreferencesStore.shared.audioReactiveEnabled = $0
                 actions.onAssetsPathChanged()   // 重载壁纸:开→重新采集,关→停采集(replayd/coreaudiod 闲置)
             }
-            toggleRow("静音视频壁纸", "视频壁纸不发出声音", $muted) { actions.onMuteChanged($0) }
+            toggleRow("壁纸静音", "关闭壁纸的媒体声音，包括点击时播放的语音", $muted) { actions.onMuteChanged($0) }
             row("音量") {
                 HStack(spacing: 8) {
                     Slider(value: $volume, in: 0...1).frame(width: 170)

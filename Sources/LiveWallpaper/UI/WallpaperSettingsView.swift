@@ -26,7 +26,7 @@ struct WallpaperSettingsPanel: View {
 
     /// 直接从 item 派生,绝不为空/失步(修「时全时空」)。
     private var allProperties: [WallpaperProperty] {
-        store.properties(forID: item.id, folderURL: item.folderURL)
+        store.properties(forID: item.id, folderURL: item.folderURL, wallpaperType: item.type)
     }
     /// 按 condition 过滤后实际显示的(condition 依赖当前值,version 变就重算)。
     private var visibleProperties: [WallpaperProperty] {
@@ -413,10 +413,12 @@ struct GeneralPropertiesSection: View {
                 }
             }
 
-            if supportsMediaControls {
+            if supportsMediaControls || item.type == .web {
                 sliderRow(label: "音量", value: Binding(get: { g.volume(item.id) },
                                                       set: { g.setVolume($0, item.id); onChange() }),
                           range: 0...100, format: "%.0f")
+            }
+            if supportsMediaControls {
                 sliderRow(label: "播放速度", value: Binding(get: { g.playbackSpeed(item.id) },
                                                          set: { g.setPlaybackSpeed($0, item.id); onChange() }),
                           range: 0...100, format: "%.0f")
@@ -708,7 +710,7 @@ struct WallpaperSettingsView: View {
         }
         .frame(width: 440, height: 560)
         .background(VisualEffectView(material: .windowBackground).ignoresSafeArea())
-        .onAppear { properties = store.properties(forID: item.id, folderURL: item.folderURL) }
+        .onAppear { properties = store.properties(forID: item.id, folderURL: item.folderURL, wallpaperType: item.type) }
     }
 
     private var header: some View {
