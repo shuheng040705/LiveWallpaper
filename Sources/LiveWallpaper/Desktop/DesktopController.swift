@@ -2,7 +2,26 @@ import AppKit
 
 /// 管理每块屏幕的桌面窗口,以及当前壁纸的渲染器集合。
 final class DesktopController {
+    /// 壁纸覆盖整个屏幕。台前调度过场可能只改变 Dock 占用的 visibleFrame，
+    /// 此时要沿用正在播放的渲染器和桌面窗口。
+    private struct DisplayTarget: Equatable {
+        let id: CGDirectDisplayID?
+        let frame: CGRect
+        let scale: CGFloat
+        let mode: Int32?
+        let maximumFPS: Int
+
+        init(_ screen: NSScreen) {
+            id = (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+            frame = screen.frame
+            scale = screen.backingScaleFactor
+            mode = id.flatMap { CGDisplayCopyDisplayMode($0)?.ioDisplayModeID }
+            maximumFPS = screen.maximumFramesPerSecond
+        }
+    }
+
     private var windows: [DesktopWindow] = []
+    private var displayTargets: [DisplayTarget] = []
     /// 渲染器 + 它所在屏幕的 frame。⚠ 必须成对存,不能靠下标与 windows 对齐:
     /// apply() 里 RendererFactory.make 失败会 `continue`,下标就错位了。
     /// 有了屏幕 frame 才能做**按屏**暂停(见 applyOcclusion)。
@@ -16,7 +35,7 @@ final class DesktopController {
     private var applyGeneration = 0
 
     func start() {
-        rebuildWindows()
+        refreshDesktopWindows()
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(screensChanged),
@@ -28,33 +47,32 @@ final class DesktopController {
     @objc private func screensChanged() {
         // 审计修复(#6):防抖——取消上一次 pending,延迟 0.3s 合并连发的通知,只在最后真正 rebuild 一次。
         screenChangeWork?.cancel()
-        let work = DispatchWorkItem { [weak self] in
-            guard let self = self else { return }
-            self.rebuildWindows()
-            if let c = self.current { self.apply(c) }   // 屏幕变化后在新窗口上重建渲染
-        }
+        let work = DispatchWorkItem { [weak self] in self?.refreshDesktopWindows() }
         screenChangeWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.3, execute: work)
     }
 
-    private func rebuildWindows() {
+    private var targetScreens: [NSScreen] {
+        if PreferencesStore.shared.mainScreenOnly, let main = NSScreen.main { return [main] }
+        return NSScreen.screens
+    }
+
+    private func refreshDesktopWindows() {
+        let screens = targetScreens
+        let targets = screens.map(DisplayTarget.init)
+        guard targets != displayTargets else { return }
+        displayTargets = targets
         applyGeneration &+= 1
         renderers.forEach { $0.r.stop() }
         renderers.removeAll()
         windows.forEach { $0.orderOut(nil) }
-        // 显示器范围:仅主屏 or 所有屏。
-        let screens: [NSScreen]
-        if PreferencesStore.shared.mainScreenOnly, let main = NSScreen.main {
-            screens = [main]
-        } else {
-            screens = NSScreen.screens
-        }
         windows = screens.map { DesktopWindow(screen: $0) }
         windows.forEach { $0.orderFrontRegardless() }
         Log.write("rebuildWindows: \(windows.count) screen(s)")
         for (i, w) in windows.enumerated() {
             Log.write("  window[\(i)] level=\(w.level.rawValue) frame=\(NSStringFromRect(w.frame)) visible=\(w.isVisible)")
         }
+        if let current { apply(current) }
     }
 
     /// 应用一张壁纸到所有屏幕。
@@ -190,7 +208,6 @@ final class DesktopController {
     /// 显示器范围变更:重建窗口并重放当前壁纸。
     func setMainScreenOnly(_ on: Bool) {
         PreferencesStore.shared.mainScreenOnly = on
-        rebuildWindows()
-        if let c = current { apply(c) }
+        refreshDesktopWindows()
     }
 }
