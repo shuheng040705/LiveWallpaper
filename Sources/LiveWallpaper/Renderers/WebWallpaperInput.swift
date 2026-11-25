@@ -111,12 +111,12 @@ final class WebWallpaperInput {
     }
 
     private func updatePanelVisibility() {
-        guard !panels.isEmpty else { return }
+        guard !panels.isEmpty, let screen = webView?.window?.screen else { return }
         let pointer = NSEvent.mouseLocation
         let overHotspot = panels.contains { $0.frame.contains(pointer) }
         let modifiers = NSEvent.modifierFlags.intersection([.shift, .option, .control, .command])
         let mayOrder = overHotspot && modifiers.isEmpty &&
-            Self.canRoute(at: pointer, placingPanels: Set(panels.filter(\.isVisible).map(\.windowNumber)))
+            Self.canRoute(at: pointer, on: screen, placingPanels: Set(panels.filter(\.isVisible).map(\.windowNumber)))
         for panel in panels {
             panel.setReceivingClicks(modifiers.isEmpty && (!panel.frame.contains(pointer) || mayOrder))
         }
@@ -146,7 +146,7 @@ final class WebWallpaperInput {
         let quartzPoint = cgEvent.location
         let point = CGPoint(x: quartzPoint.x, y: CGDisplayBounds(CGMainDisplayID()).height - quartzPoint.y)
         let target = pid_t(clamping: cgEvent.getIntegerValueField(.eventTargetUnixProcessID))
-        guard screen.visibleFrame.contains(point), Self.canRoute(at: point, target: target) else { return }
+        guard screen.visibleFrame.contains(point), Self.canRoute(at: point, on: screen, target: target) else { return }
         if event.type == .leftMouseDown {
             press = point
             return
@@ -170,59 +170,72 @@ final class WebWallpaperInput {
                        y: (flipped ? point.y - bounds.minY : bounds.maxY - point.y) / bounds.height)
     }
 
-    private static func canRoute(at point: CGPoint, target: pid_t = 0, placingPanels panels: Set<Int>? = nil) -> Bool {
-        // Use WindowServer's hit test rather than bounding boxes. A covered wallpaper or an
-        // interactive desktop widget, menu, Dock or regular Finder window must not get clicks.
-        var hit = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
-        if let panels {
-            var skipped = Set<Int>()
-            while panels.contains(hit), skipped.insert(hit).inserted {
-                hit = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: hit)
-            }
-        }
+    private static func canRoute(at point: CGPoint, on screen: NSScreen, target: pid_t = 0,
+                                 placingPanels panels: Set<Int>? = nil) -> Bool {
         let desktopOwners = ["com.apple.finder", "com.apple.dock", "com.apple.WindowManager"]
-        if hit == 0 {
-            // Some versions report no window at all for background clicks.
-            guard target > 0, let bundle = NSRunningApplication(processIdentifier: target)?.bundleIdentifier else { return false }
-            return desktopOwners.contains(bundle)
-        }
-        guard hit > 0, let info = CGWindowListCopyWindowInfo(.optionIncludingWindow, CGWindowID(hit))
-                as? [[String: Any]], let window = info.first,
-              let level = window[kCGWindowLayer as String] as? Int,
-              let owner = window[kCGWindowOwnerPID as String] as? pid_t,
-              let bundle = NSRunningApplication(processIdentifier: owner)?.bundleIdentifier else { return false }
-
-        if target > 0 && target != owner {
-            guard let receiver = NSRunningApplication(processIdentifier: target)?.bundleIdentifier,
-                  desktopOwners.contains(receiver) else { return false }
-        }
         let icons = Int(CGWindowLevelForKey(.desktopIconWindow))
         let background = Int(CGWindowLevelForKey(.desktopWindow))
-        // App windows, Dock and Stage Manager thumbnails already outrank our panels.
-        // Keep the panels ready underneath them when the pointer returns to the desktop.
-        if panels != nil && level > icons + 1 { return true }
-        if level <= background && ["com.apple.dock", "com.apple.WindowManager"].contains(bundle) { return true }
-        guard level == icons else { return false }
-        if bundle == "com.apple.WindowManager" {
-            // The desktop's backdrop can cover Finder's icon hit regions. Ask for the
-            // next actual event recipient under it as well; zero means empty backdrop.
-            let below = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: hit)
-            return below == 0
+        var hit = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
+        var visited = Set<Int>()
+        var foundBackdrop = false
+
+        while hit > 0, visited.insert(hit).inserted {
+            if panels?.contains(hit) == true {
+                hit = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: hit)
+                continue
+            }
+            guard let info = CGWindowListCopyWindowInfo(.optionIncludingWindow, CGWindowID(hit))
+                    as? [[String: Any]], let window = info.first,
+                  let level = window[kCGWindowLayer as String] as? Int,
+                  let owner = window[kCGWindowOwnerPID as String] as? pid_t,
+                  let bundle = NSRunningApplication(processIdentifier: owner)?.bundleIdentifier else { return false }
+            if target > 0 && target != owner {
+                guard let receiver = NSRunningApplication(processIdentifier: target)?.bundleIdentifier,
+                      desktopOwners.contains(receiver) else { return false }
+            }
+
+            // Ordinary windows and the Stage Manager strip already receive input above the panels.
+            if level > icons + 1 { return panels != nil && !foundBackdrop }
+            if level <= background { return bundle == "com.apple.dock" || bundle == "com.apple.WindowManager" }
+            guard level == icons, bundle == "com.apple.finder" || bundle == "com.apple.WindowManager",
+                  let id = screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
+                  let rawBounds = window[kCGWindowBounds as String] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: rawBounds) else { return false }
+            let display = CGDisplayBounds(id.uint32Value)
+            let finderRole = bundle == "com.apple.finder" ? finderRole(at: point, owner: owner) : nil
+            guard isDesktopBackdrop(frame: frame, display: display, finderRole: finderRole) else { return false }
+            // Show Desktop can expose Finder directly or underneath WindowManager. Only skip
+            // screen-sized desktop surfaces; a distinct icon or widget underneath still wins.
+            foundBackdrop = true
+            hit = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: hit)
         }
-        guard bundle == "com.apple.finder" else { return false }
-        // Older Finder versions expose one window for both icons and empty space. Refine
-        // that hit when Accessibility is already available; native icon clicks still work
-        // without it since this monitor neither consumes events nor activates the wallpaper.
-        guard AXIsProcessTrusted() else { return panels == nil }
-        var element: AXUIElement?
+        guard hit == 0 else { return false }
+        if foundBackdrop { return true }
+        guard target > 0, let receiver = NSRunningApplication(processIdentifier: target)?.bundleIdentifier else { return false }
+        return desktopOwners.contains(receiver)
+    }
+
+    static func isDesktopBackdrop(frame: CGRect, display: CGRect, finderRole: String?) -> Bool {
+        let matchesDisplay = !display.isEmpty && abs(frame.minX - display.minX) <= 1
+            && abs(frame.minY - display.minY) <= 1 && abs(frame.maxX - display.maxX) <= 1
+            && abs(frame.maxY - display.maxY) <= 1
+        guard matchesDisplay else { return false }
+        // Finder exposes the blank desktop as an AXGroup, and individual icons as AXImage.
+        // The WindowServer geometry remains available when Accessibility isn't authorized.
+        guard let finderRole else { return true }
+        return [kAXGroupRole, kAXScrollAreaRole, kAXListRole, kAXWindowRole].contains(finderRole)
+    }
+
+    private static func finderRole(at point: CGPoint, owner: pid_t) -> String? {
+        guard AXIsProcessTrusted() else { return nil }
+        let finder = AXUIElementCreateApplication(owner)
         let quartzY = CGDisplayBounds(CGMainDisplayID()).height - point.y
-        let result = AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(),
-                                                     Float(point.x), Float(quartzY), &element)
-        guard result == .success, let element else { return panels == nil }
+        var element: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(finder, Float(point.x), Float(quartzY), &element) == .success,
+              let element else { return nil }
         var role: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success,
-              let role = role as? String else { return panels == nil }
-        return [kAXScrollAreaRole, kAXListRole, kAXWindowRole].contains(role)
+        guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success else { return nil }
+        return role as? String
     }
 
     /// Use viewport CSS coordinates (including on Retina) and hit-test the actual canvas

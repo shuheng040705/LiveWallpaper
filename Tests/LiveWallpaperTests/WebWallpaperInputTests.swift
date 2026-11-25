@@ -3,6 +3,18 @@ import XCTest
 @testable import LiveWallpaper
 
 final class WebWallpaperInputTests: XCTestCase {
+    func testRevealedFinderDesktopAcceptsHotspotsWithOrWithoutAccessibility() {
+        let display = CGRect(x: -1440, y: -120, width: 1440, height: 900)
+        XCTAssertTrue(WebWallpaperInput.isDesktopBackdrop(frame: display, display: display, finderRole: nil))
+        XCTAssertTrue(WebWallpaperInput.isDesktopBackdrop(frame: display, display: display, finderRole: kAXGroupRole))
+        XCTAssertFalse(WebWallpaperInput.isDesktopBackdrop(frame: display, display: display, finderRole: kAXImageRole))
+
+        let item = CGRect(x: -300, y: 0, width: 80, height: 80)
+        XCTAssertFalse(WebWallpaperInput.isDesktopBackdrop(frame: item, display: display, finderRole: nil))
+        let otherDisplay = display.offsetBy(dx: display.width, dy: 0)
+        XCTAssertFalse(WebWallpaperInput.isDesktopBackdrop(frame: otherDisplay, display: display, finderRole: kAXGroupRole))
+    }
+
     func testCoordinateConversionUsesViewBoundsAndOneVerticalFlip() {
         let bounds = CGRect(x: -80, y: 60, width: 320, height: 200)
         let point = CGPoint(x: 0, y: 110)
