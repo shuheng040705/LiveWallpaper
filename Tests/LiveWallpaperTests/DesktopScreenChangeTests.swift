@@ -1,8 +1,33 @@
 import AppKit
+import Metal
+import QuartzCore
 import XCTest
 @testable import LiveWallpaper
 
 final class DesktopScreenChangeTests: XCTestCase {
+    @MainActor
+    func testWebWallpaperKeepsItsOnePixelBackingWhenResizedOrReapplied() throws {
+        _ = NSApplication.shared
+        guard let screen = NSScreen.main, MTLCreateSystemDefaultDevice() != nil else {
+            throw XCTSkip("Requires a display and Metal")
+        }
+        let window = DesktopWindow(screen: screen)
+        defer { window.close() }
+        let webHost = window.hostView(for: .web)
+        let backing = try XCTUnwrap(webHost.layer as? CAMetalLayer)
+        window.setContentSize(CGSize(width: 480, height: 270))
+        XCTAssertTrue(window.hostView(for: .web) === webHost)
+        XCTAssertTrue(webHost.layer === backing)
+        XCTAssertEqual(backing.drawableSize, CGSize(width: 1, height: 1))
+        XCTAssertTrue(window.isOpaque)
+        XCTAssertTrue(window.ignoresMouseEvents)
+
+        let sceneHost = window.hostView(for: .scene)
+        XCTAssertFalse(sceneHost.layer is CAMetalLayer)
+        XCTAssertTrue(window.hostView(for: .video) === sceneHost)
+        XCTAssertTrue(window.hostView(for: .web).layer is CAMetalLayer)
+    }
+
     @MainActor
     func testScreenNotificationWithSameRenderTargetsKeepsDesktopWindows() async throws {
         let app = NSApplication.shared

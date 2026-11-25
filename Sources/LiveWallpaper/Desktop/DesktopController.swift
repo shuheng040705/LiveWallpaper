@@ -89,7 +89,7 @@ final class DesktopController {
         Log.write("apply: \(item.title) [\(item.type.rawValue)] file=\(item.fileURL?.path ?? "nil") on \(windows.count) window(s)")
         var pending = 0   // 待加载渲染器数(闭包按引用捕获;全部回调都在主线程,无需加锁)
         for window in windows {
-            guard let host = window.contentView else { continue }
+            let host = window.hostView(for: item.type)
             host.subviews.forEach { $0.removeFromSuperview() }
             guard let renderer = RendererFactory.make(for: item) else {
                 Log.write("apply: no renderer for type \(item.type.rawValue)")

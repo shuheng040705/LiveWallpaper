@@ -27,13 +27,25 @@ final class DesktopWindow: NSWindow {
         self.canHide = false
         self.displaysWhenScreenProfileChanges = true
 
-        let content = NSView(frame: NSRect(origin: .zero, size: screen.frame.size))
-        content.wantsLayer = true
-        content.layer?.backgroundColor = NSColor.black.cgColor
-        content.autoresizesSubviews = true
-        self.contentView = content
-
+        self.contentView = Self.plainHost(size: screen.frame.size)
         self.setFrame(screen.frame, display: true)
+    }
+
+    private static func plainHost(size: CGSize) -> NSView {
+        let host = NSView(frame: CGRect(origin: .zero, size: size))
+        host.wantsLayer = true
+        host.layer?.backgroundColor = NSColor.black.cgColor
+        return host
+    }
+
+    func hostView(for type: WallpaperType) -> NSView {
+        let isWeb = type == .web
+        if let host = contentView, (host is WebDesktopBackingView) == isWeb { return host }
+        let size = contentRect(forFrameRect: frame).size
+        let host = isWeb ? WebDesktopBackingView(frame: CGRect(origin: .zero, size: size))
+                         : Self.plainHost(size: size)
+        contentView = host
+        return host
     }
 
     override var canBecomeKey: Bool { false }
