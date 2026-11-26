@@ -15,7 +15,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
 
     static let scheme = "lwwp"          // Live Wallpaper Web Project
 
-    private var webView: WKWebView?
+    private var webView: WebWallpaperView?
     private var desktopInput: WebWallpaperInput?
     private var hostPaused = false
     private var mediaSuspended = false
@@ -68,7 +68,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         """, injectionTime: .atDocumentStart, forMainFrameOnly: true)
         config.userContentController.addUserScript(weShim)
 
-        let wv = WKWebView(frame: host.bounds, configuration: config)
+        let wv = WebWallpaperView(frame: host.bounds, configuration: config)
         wv.autoresizingMask = [.width, .height]
         wv.navigationDelegate = self
         // Web 壁纸是不受信任的第三方内容。它可以播放已有媒体，但绝不允许通过 getUserMedia
@@ -88,6 +88,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
 
     func load(_ item: WallpaperItem) {
         guard let entry = item.fileName, !entry.isEmpty else { Log.write("WebRenderer.load: no entry file"); return }
+        webView?.resetPointer(release: true)
         rootURL = item.folderURL
         loadedItem = item
         documentReady = false
@@ -114,6 +115,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     func stop() {
         desktopInput?.stop()
         desktopInput = nil
+        webView?.resetPointer(release: true)
         webView?.stopLoading()
         webView?.navigationDelegate = nil
         webView?.uiDelegate = nil
@@ -131,6 +133,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     func pause() {
         guard !hostPaused else { return }
         hostPaused = true
+        webView?.resetPointer(release: true)
         desktopInput?.invalidateHotspots()
         if let webView { notifyPagePaused(in: webView) }
     }
@@ -200,6 +203,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     }
 
     func webView(_ webView: WKWebView, didCommit navigation: WKNavigation!) {
+        (webView as? WebWallpaperView)?.resetPointer(release: false)
         documentReady = false
         desktopInput?.invalidateHotspots()
     }

@@ -24,18 +24,17 @@ final class WebWallpaperInput {
         CFPreferencesGetAppBooleanValue("GloballyEnabled" as CFString, "com.apple.WindowManager" as CFString, nil)
     }
 
-    convenience init(webView: WKWebView, isEnabled: @escaping () -> Bool) {
+    convenience init(webView: WebWallpaperView, isEnabled: @escaping () -> Bool) {
         self.init(view: webView, isEnabled: { [weak webView] in
             isEnabled() && webView?.url?.scheme == WebRenderer.scheme && webView?.url?.host == "wp"
         }, observesUnclaimedDesktop: true, readHotspots: { [weak webView] point, completion in
             guard let webView else { completion([]); return }
             WebWallpaperHotspots.read(in: webView, at: point, completion: completion)
         }, onPointer: { [weak webView] phase, point in
-            if let webView { Self.dispatch(phase, at: point, in: webView) }
+            webView?.send(phase, at: point)
         })
         onObservedDown = { [weak webView] point in
-            guard let webView else { return }
-            Self.dispatch(phases: ["down"], at: point, in: webView, checkCanvasHit: true, completion: nil)
+            webView?.send(.down, at: point, checkCanvasHit: true)
         }
     }
 
@@ -288,65 +287,13 @@ final class WebWallpaperInput {
 
     static func dispatch(_ phase: WallpaperPointerPhase, at point: CGPoint, in webView: WKWebView,
                          completion: ((Any?, Error?) -> Void)? = nil) {
-        dispatch(phases: [phase.rawValue], at: point, in: webView, completion: completion)
+        guard let wallpaper = webView as? WebWallpaperView else { completion?(false, nil); return }
+        wallpaper.send(phase, at: point, completion: completion)
     }
 
     static func dispatchClick(at point: CGPoint, in webView: WKWebView, completion: ((Any?, Error?) -> Void)? = nil) {
-        dispatch(phases: ["down", "up"], at: point, in: webView, completion: completion)
-    }
-
-    private static func dispatch(phases: [String], at point: CGPoint, in webView: WKWebView,
-                                 checkCanvasHit: Bool = false, completion: ((Any?, Error?) -> Void)?) {
-        guard point.x.isFinite, point.y.isFinite, (0...1).contains(point.x), (0...1).contains(point.y),
-              webView.url?.scheme == WebRenderer.scheme, webView.url?.host == "wp" else {
-            completion?(false, nil)
-            return
-        }
-        let script = """
-        if (location.protocol !== 'lwwp:' || location.hostname !== 'wp') return false;
-        const x = Math.min(innerWidth - 1, nx * innerWidth), y = Math.min(innerHeight - 1, ny * innerHeight);
-        const hit = document.elementFromPoint(x, y);
-        if (checkCanvasHit) {
-            \(WebWallpaperHotspots.canvasProbe)
-            // An exposed full-screen canvas without a hit map may react to every desktop click.
-            // Known runtimes have an explicit empty-space result, which belongs to the system.
-            if (canvasHit(hit, x, y) === false) return false;
-        }
-        for (const phase of phases) {
-            let press = window.__lwDesktopPress;
-            const target = (phase === 'down' || phase === 'hover') ? hit : press?.target;
-            if (!target) return false;
-            const options = {clientX:x, clientY:y, button:0, bubbles:true, cancelable:true,
-                             composed:true, view:window, detail:1};
-            const pointer = (name, buttons) => target.dispatchEvent(new PointerEvent(name, {
-                ...options, button:name==='pointermove' ? -1 : 0, buttons, pointerId:1, pointerType:'mouse', isPrimary:true
-            }));
-            const mouse = (name, buttons) => target.dispatchEvent(new MouseEvent(name, {...options, buttons}));
-            if (phase === 'down') {
-                press = window.__lwDesktopPress = {target, x, y, clicked:true, compatible:true};
-                press.compatible = pointer('pointerdown', 1);
-                if (press.compatible) mouse('mousedown', 1);
-            } else if (phase === 'hover' || phase === 'drag') {
-                const buttons = phase === 'drag' ? 1 : 0;
-                if (buttons && Math.hypot(x-press.x, y-press.y) > 4) press.clicked = false;
-                pointer('pointermove', buttons);
-                if (!buttons || press.compatible) mouse('mousemove', buttons);
-            } else {
-                delete window.__lwDesktopPress;
-                if (phase === 'cancel') { pointer('pointercancel', 0); continue; }
-                pointer('pointerup', 0);
-                if (press.compatible) mouse('mouseup', 0);
-                if (press.clicked && hit === target && Math.hypot(x-press.x, y-press.y) <= 4) mouse('click', 0);
-            }
-        }
-        return true;
-        """
-        webView.callAsyncJavaScript(script, arguments: ["phases": phases, "nx": point.x, "ny": point.y, "checkCanvasHit": checkCanvasHit],
-                                    in: nil, in: .page) { result in
-            switch result {
-            case .success(let value): completion?(value, nil)
-            case .failure(let error): completion?(nil, error)
-            }
-        }
+        guard let wallpaper = webView as? WebWallpaperView else { completion?(false, nil); return }
+        wallpaper.send(.down, at: point)
+        wallpaper.send(.up, at: point, completion: completion)
     }
 }
