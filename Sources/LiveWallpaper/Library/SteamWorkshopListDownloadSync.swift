@@ -65,6 +65,9 @@ final class SteamWorkshopListDownloadSync {
             guard !Task.isCancelled else { return }
             var confirmed = [String: WorkshopWallpaper]()
             for item in items where item.isSubscribed == true { confirmed[item.id] = item }
+            if !confirmed.isEmpty {
+                Log.write("Steam 工坊：已在列表核实订阅 " + String(confirmed.count) + " 项")
+            }
             for (id, var candidate) in batch where candidates[id]?.token == candidate.token {
                 if let item = confirmed[id] {
                     candidates[id] = nil
