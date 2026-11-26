@@ -24,9 +24,23 @@ enum SteamSubscriptionRegistry {
         mutate(id, subscribed: false)
     }
 
-    static func wasConfirmedByApp(_ id: String) -> Bool {
+    private static let skippedDownloadKey = "steam.explicitlySkippedDownloads.v1"
+
+    static func skipsAutomaticDownload(_ id: String) -> Bool {
         lock.lock(); defer { lock.unlock() }
-        return Set(UserDefaults.standard.stringArray(forKey: key) ?? []).contains(id)
+        return (UserDefaults.standard.stringArray(forKey: skippedDownloadKey) ?? []).contains(id)
+    }
+
+    static func skipAutomaticDownload(_ skip: Bool, id: String) {
+        guard WallpaperUninstallPolicy.isSteamWorkshopID(id) else { return }
+        lock.lock(); defer { lock.unlock() }
+        var ids = Set(UserDefaults.standard.stringArray(forKey: skippedDownloadKey) ?? [])
+        if skip {
+            guard ids.insert(id).inserted else { return }
+        } else {
+            guard ids.remove(id) != nil else { return }
+        }
+        UserDefaults.standard.set(ids.sorted(), forKey: skippedDownloadKey)
     }
 
     static func isKnownSubscribed(_ id: String) -> Bool {

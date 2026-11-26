@@ -332,6 +332,7 @@ final class WorkshopDownloader: ObservableObject {
         waitForSubscription: Bool = false
     ) {
         DispatchQueue.main.async {
+            if self.libraryDirectoryOverride == nil { SteamSubscriptionRegistry.skipAutomaticDownload(false, id: id) }
             // 已有同 id 任务时不重复排队 —— 但**失败/取消的任务是刻意保留在列表里的**(见 finish),
             // 旧代码在这里一律 return,导致首页 hero 的「重试」、工坊卡片点击、详情页「下载」按钮
             // 对失败任务全部**点了没反应也无提示**(只有下载管理窗口的重试图标走 retry(id:) 才有效)。
@@ -1321,6 +1322,7 @@ final class WorkshopDownloader: ObservableObject {
 
     /// 请求取消下载:杀掉正在跑的 steamcmd。临时文件保留,由 resolveCancelled 决定去留。
     func requestCancel(id: String) {
+        if libraryDirectoryOverride == nil { SteamSubscriptionRegistry.skipAutomaticDownload(true, id: id) }
         lock.lock()
         cancelledSet.insert(id)
         let p = processes[id]
@@ -1415,6 +1417,7 @@ final class WorkshopDownloader: ObservableObject {
     /// 抽出来是为了让 enqueue 对「同 id 的失败/取消任务」也能走重下,而不是被去重直接丢弃。
     private func retryLocked(index i: Int, waitForSubscription: Bool = false) {
         let id = jobs[i].id
+        if libraryDirectoryOverride == nil { SteamSubscriptionRegistry.skipAutomaticDownload(false, id: id) }
         if runningSlots[id] != nil {
             lock.lock(); let session = sessions[id]; lock.unlock()
             if let session { session.group.notify(queue: .main) { self.retry(id: id) } }

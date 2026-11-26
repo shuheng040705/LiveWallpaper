@@ -21,6 +21,13 @@ final class SteamWorkshopSubscriptionStatusTests: XCTestCase {
 
     private func query(status: [String: Any]?, app: Int = 431960, html: String = "",
                        unavailable: Bool = false, signedIn: Bool = true, switchAccount: Bool = false) async throws -> WorkshopWallpaper? {
+        try await queryRows(rows: status.map { [$0] } ?? [], app: app, html: html, unavailable: unavailable,
+                            signedIn: signedIn, switchAccount: switchAccount)?.first
+    }
+
+    private func queryRows(rows: [[String: Any]], batch: [String]? = nil, app: Int = 431960, html: String = "",
+                           unavailable: Bool = false, signedIn: Bool = true,
+                           switchAccount: Bool = false) async throws -> [WorkshopWallpaper]? {
         let config = WKWebViewConfiguration()
         config.websiteDataStore = .nonPersistent()
         if signedIn {
@@ -33,10 +40,11 @@ final class SteamWorkshopSubscriptionStatusTests: XCTestCase {
         }
         let web = WKWebView(frame: .zero, configuration: config)
         web.loadHTMLString("<html><meta http-equiv='Content-Security-Policy' content=\"connect-src 'none'\"></html>",
-                           baseURL: URL(string: "https://steamcommunity.com/sharedfiles/filedetails/?id=\(id)"))
+                           baseURL: batch == nil ? URL(string: "https://steamcommunity.com/sharedfiles/filedetails/?id=\(id)") :
+                                                    URL(string: "https://steamcommunity.com/workshop/browse/?appid=431960"))
         for _ in 0..<100 where web.isLoading { try await Task.sleep(nanoseconds: 30_000_000) }
 
-        let mocks: [String: Any] = ["id": id, "app": app, "rows": status.map { [$0] } ?? [],
+        let mocks: [String: Any] = ["app": app, "rows": rows,
                                     "html": html, "unavailable": unavailable, "hold": switchAccount]
         _ = try await web.callAsyncJavaScript("""
             window.fixtureCalls = [];
@@ -44,18 +52,24 @@ final class SteamWorkshopSubscriptionStatusTests: XCTestCase {
             window.fetch = async (address, options) => {
                 const url = new URL(address);
                 const method = options.method || 'GET';
-                window.fixtureCalls.push([url.origin, method]);
+                window.fixtureCalls.push([url.origin, method, url.searchParams.get('q') || url.pathname, url.searchParams.get('qp') || '']);
                 await gate;
                 if (url.pathname === '/sharedfiles/filedetails/')
                     return new Response(html, { status: html ? 200 : 503 });
                 if (unavailable) return new Response('{"success":21}', {status:500});
-                const summary = [{publishedfileid:id, consumer_appid:app, file_type:0, title:'Summary fixture', file_size:'173'}];
+                const params = JSON.parse(url.searchParams.get('qp'));
+                const summary = url.searchParams.get('q') === 'GetUGCSummary'
+                    ? params[0].map(i => ({publishedfileid:i, consumer_appid:app, file_type:0, title:'Summary fixture', file_size:'173'}))
+                    : [];
                 const data = url.searchParams.get('q') === 'GetUGCSummary' ? summary : rows;
                 return new Response(JSON.stringify({data}));
             };
             return true;
             """, arguments: mocks, in: nil, contentWorld: .defaultClient)
-        let lookup = Task { await SteamWorkshopSubscriptionStatus.lookup(id: id, in: web) }
+        let lookup = Task { () -> [WorkshopWallpaper]? in
+            if let batch { return await SteamWorkshopSubscriptionStatus.subscribedItems(ids: batch, in: web) }
+            return await SteamWorkshopSubscriptionStatus.lookup(id: id, in: web).map { [$0] }
+        }
         if switchAccount {
             for _ in 0..<100 {
                 let count = try await web.callAsyncJavaScript("return window.fixtureCalls.length", arguments: [:],
@@ -73,8 +87,42 @@ final class SteamWorkshopSubscriptionStatusTests: XCTestCase {
         let calls = try await web.callAsyncJavaScript("return window.fixtureCalls", arguments: [:], in: nil, contentWorld: .defaultClient)
         let requests = try XCTUnwrap(calls as? [[String]])
         if signedIn { XCTAssertGreaterThanOrEqual(requests.count, 2) } else { XCTAssertTrue(requests.isEmpty) }
-        XCTAssertTrue(requests.allSatisfy { $0 == ["https://steamcommunity.com", "GET"] })
+        XCTAssertTrue(requests.allSatisfy { $0.prefix(2) == ["https://steamcommunity.com", "GET"] })
+        if let batch, signedIn {
+            let statusRequests = requests.filter { $0[2] == "GetUserListStatus" }
+            let summaries = requests.filter { $0[2] == "GetUGCSummary" }
+            XCTAssertEqual(statusRequests.count, 1)
+            XCTAssertEqual(summaries.count, 1)
+            let statusRequest = try XCTUnwrap(statusRequests.first)
+            let parameters = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(statusRequest[3].utf8)) as? [Any])
+            let sentIDs = try XCTUnwrap(parameters.last as? [String])
+            XCTAssertEqual(Set(sentIDs), Set(batch))
+            XCTAssertEqual(sentIDs.count, Set(batch).count)
+            XCTAssertLessThanOrEqual(requests.filter { $0[2] == "/sharedfiles/filedetails/" }.count, 2)
+        }
         return result
+    }
+
+    func testBatchDeliversConfirmedSubscribersEvenWhenOtherRowsAreMissing() async throws {
+        let missing = "3844145761", unsubscribed = "3842432893", unrequested = "3843425147"
+        let ids = [id, missing, unsubscribed, id]
+        let rows: [[String: Any]] = [
+            ["publishedfileid": unrequested, "inlist": true],
+            ["publishedfileid": unsubscribed, "inlist": false],
+            ["publishedfileid": id, "inlist": true]
+        ]
+        let items = try await queryRows(rows: rows, batch: ids)
+        XCTAssertEqual(items?.map(\.id), [id])
+        XCTAssertEqual(items?.first?.sizeBytes, 173)
+        let switched = try await queryRows(rows: rows, batch: ids, switchAccount: true)
+        XCTAssertNil(switched)
+        let guest = try await queryRows(rows: rows, batch: ids, signedIn: false)
+        XCTAssertNil(guest)
+        let inconclusive = try await queryRows(rows: [], batch: ids, unavailable: true)
+        XCTAssertNil(inconclusive)
+        let recovered = try await queryRows(rows: [], batch: ids, html: serverDetail(accountID: account, subscribed: true),
+                                            unavailable: true)
+        XCTAssertEqual(recovered?.map(\.id), [id])
     }
 
     func testExplicitStatusMatchesRequestedWallpaperAndApp() async throws {

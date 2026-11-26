@@ -5,21 +5,36 @@ import WebKit
 @MainActor
 enum SteamWorkshopSubscriptionStatus {
     static func lookup(id: String, in webView: WKWebView) async -> WorkshopWallpaper? {
-        guard WorkshopWebAddress.detailURL(id) != nil,
+        await lookup(ids: [id], in: webView)?.first
+    }
+
+    /// Only positive results may start a transfer. An absent item can be unconfirmed or unsubscribed.
+    static func subscribedItems(ids: [String], in webView: WKWebView) async -> [WorkshopWallpaper]? {
+        await lookup(ids: ids, in: webView)?.filter { $0.isSubscribed == true }
+    }
+
+    private static func lookup(ids: [String], in webView: WKWebView) async -> [WorkshopWallpaper]? {
+        // Steam's own DataLoader accepts at most 100 file IDs per request.
+        guard !ids.isEmpty, ids.count <= 100, ids.allSatisfy({ WorkshopWebAddress.detailURL($0) != nil }),
               let page = webView.url, SteamWorkshopBrowser.isSteamPage(page),
               page.host?.lowercased() == "steamcommunity.com" else { return nil }
         let store = webView.configuration.websiteDataStore.httpCookieStore
-        guard let account = await accountID(in: store) else { return nil }
+        guard let account = await accountID(in: store), !Task.isCancelled else { return nil }
+        var requested = Set<String>()
+        let uniqueIDs = ids.filter { requested.insert($0).inserted }
         do {
-            let value = try await webView.callAsyncJavaScript(query, arguments: ["id": id, "account": account],
+            let value = try await webView.callAsyncJavaScript(query, arguments: ["ids": uniqueIDs, "account": account],
                                                              in: nil, contentWorld: .defaultClient)
-            guard let info = value as? [String: Any], info["id"] as? String == id,
-                  let title = info["title"] as? String, let subscribed = info["subscribed"] as? Bool,
-                  await accountID(in: store) == account else { return nil }
-            var item = WorkshopWallpaper(id: id, title: title)
-            item.isSubscribed = subscribed
-            item.sizeBytes = Int64(info["bytes"] as? String ?? "") ?? 0
-            return item
+            guard let rows = value as? [[String: Any]], await accountID(in: store) == account,
+                  !Task.isCancelled else { return nil }
+            return rows.compactMap { info in
+                guard let id = info["id"] as? String, requested.contains(id),
+                      let title = info["title"] as? String, let subscribed = info["subscribed"] as? Bool else { return nil }
+                var item = WorkshopWallpaper(id: id, title: title)
+                item.isSubscribed = subscribed
+                item.sizeBytes = Int64(info["bytes"] as? String ?? "") ?? 0
+                return item
+            }
         } catch {
             return nil
         }
@@ -50,9 +65,9 @@ enum SteamWorkshopSubscriptionStatus {
         const text = await request(url, {"x-valve-request-type": "queryAction"});
         if (!text) return null;
         const payload = JSON.parse(text);
-        return Array.isArray(payload.data) ? payload.data.find(row => row?.publishedfileid === id) : null;
+        return Array.isArray(payload.data) ? payload.data : [];
     }
-    async function readDetail() {
+    async function readDetail(id) {
         const url = new URL("/sharedfiles/filedetails/", location.origin);
         url.searchParams.set("id", id);
         const html = await request(url);
@@ -70,12 +85,24 @@ enum SteamWorkshopSubscriptionStatus {
             add.classList.contains("selected") === subscribed) return null;
         return {id, title: doc.querySelector(".workshopItemTitle")?.textContent.trim() || id, subscribed};
     }
-    const [item, status] = await Promise.all([
-        read("GetUGCSummary", [[id]]), read("GetUserListStatus", [431960, 1, 0, [id]])
-    ]).catch(() => [null, null]);
-    if (!item || !status || typeof status.inlist !== "boolean") return await readDetail();
-    if (item?.consumer_appid !== 431960 || item?.file_type !== 0 || typeof item.title !== "string" ||
-        item.publishedfileid !== id) return null;
-    return {id, title: item.title, bytes: String(item.file_size || 0), subscribed: status.inlist};
+    const [items, statuses] = await Promise.all([
+        read("GetUGCSummary", [ids]).catch(() => null),
+        read("GetUserListStatus", [431960, 1, 0, ids]).catch(() => null)
+    ]);
+    const results = [], missing = [];
+    for (const id of ids) {
+        const item = items?.find(row => row?.publishedfileid === id);
+        if (item && (item.consumer_appid !== 431960 || item.file_type !== 0)) continue;
+        const status = statuses?.find(row => row?.publishedfileid === id);
+        if (typeof item?.title === "string" && typeof status?.inlist === "boolean") {
+            results.push({id, title: item.title, bytes: String(item.file_size || 0), subscribed: status.inlist});
+        } else {
+            missing.push(id);
+        }
+    }
+    // Keep partial batch successes. Limit isolated compatibility reads when the list service is unavailable.
+    const details = await Promise.all(missing.slice(0, 2).map(id => readDetail(id).catch(() => null)));
+    results.push(...details.filter(Boolean));
+    return results.length || !missing.length ? results : null;
     """#
 }

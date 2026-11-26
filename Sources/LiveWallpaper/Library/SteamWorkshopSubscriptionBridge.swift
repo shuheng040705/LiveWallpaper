@@ -5,7 +5,9 @@ import WebKit
 /// Finish Steam's confirmed website actions in the local download queue.
 @MainActor
 final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScriptMessageHandler {
-    static let shared = SteamWorkshopSubscriptionBridge { item, subscribed in
+    static let shared = SteamWorkshopSubscriptionBridge(onListSubscription: { item in
+        WorkshopSubscriptions.shared.recoverMissingWebsiteDownload(item)
+    }) { item, subscribed in
         WorkshopSubscriptions.shared.confirmedWebsiteChange(item, subscribed: subscribed)
     }
     private static let handler = "workshopSubscription"
@@ -18,10 +20,36 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
     private var observers: [String: AnyCancellable] = [:]
     private var cardGestures: [String: (token: String, subscribing: Bool, account: Task<String?, Never>)] = [:]
 
+    private var listSync: SteamWorkshopListDownloadSync?
+    // Ignore a stale badge while Steam is processing a user-initiated unsubscribe.
+    private var unsubscribingCards = Set<String>()
+
     init(lookup: @escaping (String, WKWebView) async -> WorkshopWallpaper? = SteamWorkshopSubscriptionStatus.lookup,
+         listLookup: @escaping ([String], WKWebView) async -> [WorkshopWallpaper]? = SteamWorkshopSubscriptionStatus.subscribedItems,
+         onListSubscription: ((WorkshopWallpaper) -> Void)? = nil,
          onChange: @escaping (WorkshopWallpaper, Bool) -> Void) {
         self.onChange = onChange
         self.lookup = lookup
+        super.init()
+        if let onListSubscription {
+            listSync = SteamWorkshopListDownloadSync(lookup: listLookup) { [weak self] item, webView in
+                guard let self, !unsubscribingCards.contains(item.id) else { return }
+                guard let gesture = cardGestures[item.id], gesture.subscribing else {
+                    onListSubscription(item)
+                    return
+                }
+                // One confirmed action owns the transfer even if the DOM tick and
+                // the direct check both complete while the mouse leaves the card.
+                let store = webView.configuration.websiteDataStore.httpCookieStore
+                Task {
+                    guard let account = await gesture.account.value,
+                          await SteamWorkshopSubscriptionStatus.accountID(in: store) == account,
+                          self.cardGestures[item.id]?.token == gesture.token else { return }
+                    self.cancelCheck(item.id)
+                    self.onChange(item, true)
+                }
+            }
+        }
     }
 
     static func install(in controller: WKUserContentController) {
@@ -29,6 +57,9 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
     }
 
     func attach(to controller: WKUserContentController) {
+        if listSync != nil {
+            SteamWorkshopListSubscriptions.install(in: controller, world: Self.world, handler: Self.handler)
+        }
         controller.add(self, contentWorld: Self.world, name: Self.handler)
         controller.addUserScript(WKUserScript(source: Self.cardScript, injectionTime: .atDocumentStart,
                                               forMainFrameOnly: true, in: Self.world))
@@ -47,12 +78,22 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
         return id
     }
 
+    private static func isWorkshopListing(_ url: URL) -> Bool {
+        guard SteamWorkshopBrowser.isSteamPage(url), url.host?.lowercased() == "steamcommunity.com" else { return false }
+        let path = url.path.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if path == "app/431960/workshop" { return true }
+        let app = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "appid" }
+        return app?.value == "431960" && (path == "workshop/browse" || path.hasSuffix("/myworkshopfiles"))
+    }
+
     func detail(for url: URL?) -> WorkshopWallpaper? {
         guard let current, Self.itemID(in: url) == current.id else { return nil }
         return current
     }
 
     func clearDetail() {
+        listSync?.reset()
+        unsubscribingCards.removeAll()
         documentID = nil
         current = nil
     }
@@ -63,8 +104,16 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
         guard frame.isMainFrame, origin.protocol == "https", origin.host.lowercased() == "steamcommunity.com",
               origin.port == 0 || origin.port == 443,
               let webView = message.webView, let sourceURL = frame.request.url, SteamWorkshopBrowser.isSteamPage(sourceURL),
-              let body = message.body as? [String: Any], let id = body["id"] as? String,
+              let body = message.body as? [String: Any],
               body["app"] as? String == "431960", let kind = body["kind"] as? String else { return }
+        if kind == "listSubscriptions" {
+            guard let listing = webView.url, Self.isWorkshopListing(listing),
+                  let ids = body["ids"] as? [String], ids.count <= 32,
+                  ids.allSatisfy({ WorkshopWebAddress.detailURL($0) != nil }) else { return }
+            listSync?.offer(ids.filter { !unsubscribingCards.contains($0) }, in: webView)
+            return
+        }
+        guard let id = body["id"] as? String else { return }
         if kind == "cardSubscribed", let token = body["gesture"] as? String,
            let title = body["title"] as? String, let gesture = cardGestures[id], gesture.subscribing, gesture.token == token {
             let store = webView.configuration.websiteDataStore.httpCookieStore
@@ -73,6 +122,7 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
                       await SteamWorkshopSubscriptionStatus.accountID(in: store) == account,
                       let self, self.cardGestures[id]?.token == token else { return }
                 self.cancelCheck(id)
+                self.listSync?.forget(id)
                 var item = WorkshopWallpaper(id: id, title: title.isEmpty ? id : title)
                 item.isSubscribed = true
                 Log.write("Steam 工坊：卡片确认订阅 \(id)，同步到下载中心")
@@ -119,13 +169,20 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
     /// the check on the native side and follow the last gesture for each item.
     private func verifyCardAction(id: String, subscribed: Bool, gesture: String?, webView: WKWebView) {
         cancelCheck(id)
+        if subscribed { unsubscribingCards.remove(id) }
+        else {
+            unsubscribingCards.insert(id)
+            listSync?.forget(id)
+        }
         if let gesture {
             let store = webView.configuration.websiteDataStore.httpCookieStore
             cardGestures[id] = (gesture, subscribed, Task { await SteamWorkshopSubscriptionStatus.accountID(in: store) })
         }
         // Never apply an outstanding gesture to the next account in this browser.
-        observers[id] = SteamWebSession.shared.$steamID64.removeDuplicates().dropFirst().sink { [weak self] _ in
-            self?.cancelCheck(id)
+        var lastAccount = SteamWebSession.shared.steamID64
+        observers[id] = SteamWebSession.shared.$steamID64.removeDuplicates().dropFirst().sink { [weak self] account in
+            if let previous = lastAccount, previous != account { self?.cancelCheck(id) }
+            lastAccount = account
         }
         let cardGesture = cardGestures[id]
         pending[id] = Task { [weak self, weak webView] in
@@ -145,6 +202,7 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
                             guard let account, active == account else { self.cancelCheck(id); return }
                         }
                         self.cancelCheck(id)
+                        self.listSync?.forget(id)
                         if Self.itemID(in: webView.url) == id { self.current = item }
                         Log.write("Steam 工坊：服务器确认作品 \(id) \(subscribed ? "已订阅" : "已退订")")
                         self.onChange(item, subscribed)

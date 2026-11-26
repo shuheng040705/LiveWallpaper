@@ -349,6 +349,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             )
             return
         }
+        if !subscriptionWasCancelled { SteamSubscriptionRegistry.skipAutomaticDownload(true, id: id) }
         uninstallingIDs.remove(id)
         library.scan()
         completion?(nil)
