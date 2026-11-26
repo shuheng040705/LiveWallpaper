@@ -14,19 +14,18 @@ final class SteamWebLoginWindowController: NSObject, NSWindowDelegate, WKNavigat
 
     /// 已有有效 Cookie 时直接成功；否则打开官方登录页，检测到 Cookie 后自动关闭并回调。
     func authorize(workshopID: String? = nil, completion: @escaping (Bool) -> Void) {
-        SteamWebSession.shared.refresh { [weak self] authenticated in
+        completions.append(completion)
+        if let window {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return
+        }
+        guard completions.count == 1 else { return }
+        Task { @MainActor [weak self] in
+            let authenticated = await SteamWebSession.shared.restoreForLogin()
             guard let self else { return }
-            if authenticated {
-                completion(true)
-                return
-            }
-            self.completions.append(completion)
-            if let window = self.window {
-                window.makeKeyAndOrderFront(nil)
-                NSApp.activate(ignoringOtherApps: true)
-                return
-            }
-            self.makeWindow(workshopID: workshopID)
+            if authenticated { self.finish(success: true) }
+            else { self.makeWindow(workshopID: workshopID) }
         }
     }
 
@@ -106,6 +105,7 @@ final class SteamWebLoginWindowController: NSObject, NSWindowDelegate, WKNavigat
     private func finish(success: Bool) {
         guard !finishing else { return }
         finishing = true
+        if success { SteamWebSession.shared.rememberLogin() }
         pollTimer?.invalidate()
         pollTimer = nil
         let callbacks = completions

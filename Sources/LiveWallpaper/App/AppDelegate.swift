@@ -34,8 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
         setupMainMenu()
-        // 启动即迁移/恢复 Steam Community 网页授权，不能等到用户下一次打开设置或执行退订：
-        // 这样升级前仍有效的 WebKit session cookie 会立刻进入 Keychain，避免迁移窗口内丢失。
+        // 启动时从 WebKit 恢复网页会话，钥匙串授权由用户打开 Steam 登录时进行。
         SteamWebSession.shared.refresh()
         // 首页预览每次重启重新渲染一遍(清磁盘缓存),反映引擎最新改动(用户要求)。
         RenderedPreviewCache.shared.invalidateAllOnLaunch()

@@ -5,10 +5,10 @@ import Security
 ///
 /// WKWebsiteDataStore.default() 会持久化普通 Cookie，但 Steam 的 `sessionid` 常是会话 Cookie；
 /// WebKit 网站进程重建、系统清理网站数据或应用升级后，它可能先于 `steamLoginSecure` 消失。
-/// 这里把最小认证 Cookie 集合加密保存到 macOS Keychain，并在需要订阅/退订时恢复。
+/// 用户明确完成网页授权后把最小认证 Cookie 集合保存到钥匙串。仅显式登录可以恢复备份。
 ///
 /// 注意：延长的是本机 Cookie 的保留时间，不是 Steam 服务端令牌寿命。Steam 主动吊销令牌后，
-/// 请求仍会返回 authenticationRequired，调用方会清掉 Keychain 并要求重新授权。
+/// 请求仍会返回 authenticationRequired，已拒绝的快照随即停止使用，下次显式授权时清理。
 enum SteamWebCredentialVault {
     struct StoredCookie: Codable, Equatable {
         let name: String
@@ -26,11 +26,11 @@ enum SteamWebCredentialVault {
         "sessionid", "steamLoginSecure", "steamRememberLogin", "steamMachineAuth", "browserid"
     ]
 
-    static func save(cookies: [HTTPCookie]) {
+    static func save(cookies: [HTTPCookie]) -> Bool {
+        dispatchPrecondition(condition: .notOnQueue(.main))
         guard let data = encodeSnapshot(cookies: cookies) else {
             // 调用方要求保存空集合时，必须同时清除旧认证快照，不能让已被服务端拒绝的 token 留下来复活。
-            clear()
-            return
+            return clear()
         }
         let identity: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -49,12 +49,15 @@ enum SteamWebCredentialVault {
             if addStatus != errSecSuccess {
                 Log.write("SteamWebCredentialVault: Keychain save failed (\(addStatus))")
             }
+            return addStatus == errSecSuccess
         } else if status != errSecSuccess {
             Log.write("SteamWebCredentialVault: Keychain update failed (\(status))")
         }
+        return status == errSecSuccess
     }
 
-    static func loadCookies(now: Date = Date()) -> [HTTPCookie] {
+    static func loadCookies() -> [HTTPCookie]? {
+        dispatchPrecondition(condition: .notOnQueue(.main))
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -64,11 +67,12 @@ enum SteamWebCredentialVault {
         ]
         var result: CFTypeRef?
         let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { return [] }
-        return decodeSnapshot(data, now: now)
+        if status == errSecItemNotFound { return [] }
+        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        return decodeSnapshot(data)
     }
 
-    static func clear() {
+    private static func clear() -> Bool {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -77,7 +81,9 @@ enum SteamWebCredentialVault {
         let status = SecItemDelete(query as CFDictionary)
         if status != errSecSuccess, status != errSecItemNotFound {
             Log.write("SteamWebCredentialVault: Keychain delete failed (\(status))")
+            return false
         }
+        return true
     }
 
     /// 纯函数入口供测试。仅保存 Steam Community 的最小认证 Cookie 集，不保存表单、密码或其它站点数据。

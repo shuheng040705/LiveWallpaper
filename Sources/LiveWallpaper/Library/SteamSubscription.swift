@@ -14,93 +14,151 @@ final class SteamWebSession: ObservableObject {
     @Published private(set) var isChecking = false
     @Published private(set) var steamID64: String?
 
-    private init() {}
+    private let cookieStore: () -> WKHTTPCookieStore
+    private let defaults: UserDefaults
+    private let loadSnapshot: () -> [HTTPCookie]?
+    private let saveSnapshot: ([HTTPCookie]) -> Bool
+    private let vaultQueue = DispatchQueue(label: "LiveWallpaper.steam-web-vault", qos: .userInitiated)
+    private let invalidSnapshot = "steamWebCredentialSnapshotInvalidated"
+    private let lastAccount = "steamWebLastAuthenticatedAccount"
+    private var revision = 0
+    private var checks = 0
+    private var rejectedLogins = Set<String>()
+    private var clearing: [() -> Void] = []
+    private var maySaveLogin = true
 
-    /// Mirror a completed navigation in Steam's own website. Reading this snapshot
-    /// must never restore credentials while the site is signing out or switching accounts.
-    @MainActor
-    func updateFromWebsite(cookies: [HTTPCookie], afterLogout: Bool) {
-        if let auth = SteamSubscription.authenticatedSession(from: cookies) {
-            guard !isAuthenticated || steamID64 != auth.steamID64 else { return }
-            SteamWebCredentialVault.save(cookies: cookies)
-            isAuthenticated = true
-            steamID64 = auth.steamID64
-        } else if afterLogout {
-            SteamWebCredentialVault.save(cookies: cookies.filter { !Self.isCommunityAuthenticationCookie($0) })
-            isAuthenticated = false
-            steamID64 = nil
-        }
+    init(cookieStore: @escaping () -> WKHTTPCookieStore = { WKWebsiteDataStore.default().httpCookieStore },
+         defaults: UserDefaults = .standard,
+         loadSnapshot: @escaping () -> [HTTPCookie]? = SteamWebCredentialVault.loadCookies,
+         saveSnapshot: @escaping ([HTTPCookie]) -> Bool = SteamWebCredentialVault.save) {
+        self.cookieStore = cookieStore
+        self.defaults = defaults
+        self.loadSnapshot = loadSnapshot
+        self.saveSnapshot = saveSnapshot
     }
 
+    // The legacy login keychain may present an ACL dialog even for background queries.
+    // Startup, page navigation and login polling therefore use only the WebKit cookie store.
     func refresh(completion: ((Bool) -> Void)? = nil) {
-        DispatchQueue.main.async {
-            self.isChecking = true
-            self.resolveAuthenticatedSession { auth in
-                DispatchQueue.main.async {
-                    let ok = auth != nil
-                    self.isAuthenticated = ok
-                    self.steamID64 = auth?.steamID64
-                    self.isChecking = false
-                    completion?(ok)
-                }
-            }
-        }
+        authenticatedSession { completion?($0 != nil) }
     }
 
-    /// 订阅/退订请求的统一认证入口。先读 WebKit；若 session cookie 被清掉，则从 Keychain
-    /// 自动恢复并写回默认网站数据仓库，再返回可直接用于 HTTP 请求的完整会话。
     func authenticatedSession(completion: @escaping (SteamSubscription.AuthenticatedSession?) -> Void) {
         DispatchQueue.main.async {
-            self.resolveAuthenticatedSession { auth in
+            self.checks += 1
+            self.isChecking = true
+            let generation = self.revision
+            self.cookieStore().getAllCookies { cookies in
+                let auth: SteamSubscription.AuthenticatedSession?
+                if generation == self.revision && self.clearing.isEmpty {
+                    auth = self.observe(cookies)
+                } else {
+                    auth = nil
+                }
+                self.checks -= 1
+                self.isChecking = self.checks > 0
+                completion(auth)
+            }
+        }
+    }
+
+    @MainActor
+    func updateFromWebsite(cookies: [HTTPCookie], afterLogout: Bool) {
+        if afterLogout && SteamSubscription.authenticatedSession(from: cookies) == nil {
+            invalidateSnapshot()
+            isAuthenticated = false
+            steamID64 = nil
+        } else if clearing.isEmpty, SteamSubscription.authenticatedSession(from: cookies) != nil {
+            _ = observe(cookies)
+        }
+    }
+
+    @discardableResult
+    private func observe(_ cookies: [HTTPCookie]) -> SteamSubscription.AuthenticatedSession? {
+        let auth = SteamSubscription.authenticatedSession(from: cookies)
+        if let account = auth?.steamID64 {
+            if let previous = defaults.string(forKey: lastAccount), previous != account { invalidateSnapshot() }
+            defaults.set(account, forKey: lastAccount)
+        }
+        isAuthenticated = auth != nil
+        steamID64 = auth?.steamID64
+        // Steam often issues a session-only CSRF cookie. Persist that cookie in the
+        // same WebKit store so a normal application relaunch keeps the usable pair.
+        if let auth {
+            for cookie in auth.cookies where cookie.expiresDate == nil {
+                guard var properties = cookie.properties else { continue }
+                properties.removeValue(forKey: .discard)
+                properties[.expires] = Date().addingTimeInterval(365 * 24 * 60 * 60)
+                if let persistent = HTTPCookie(properties: properties) { cookieStore().setCookie(persistent) }
+            }
+        }
+        return auth
+    }
+
+    /// Only the explicit Steam login window calls this. Existing installations can
+    /// grant a newly signed build access to their legacy item without blocking AppKit.
+    @MainActor
+    func restoreForLogin() async -> Bool {
+        maySaveLogin = true
+        let generation = revision
+        let store = cookieStore()
+        let current = await store.allCookies()
+        guard generation == revision else { return false }
+        if observe(current) != nil { return true }
+
+        let snapshot: [HTTPCookie]? = await withCheckedContinuation { result in
+            vaultQueue.async { result.resume(returning: self.loadSnapshot()) }
+        }
+        guard generation == revision else { return false }
+        guard let snapshot else {
+            // User denied or cancelled access. Continue with web login without a
+            // second prompt to overwrite the same protected item after login.
+            maySaveLogin = false
+            return false
+        }
+        // The website can sign in or change accounts while the ACL dialog is open.
+        let latest = await store.allCookies()
+        guard generation == revision else { return false }
+        if observe(latest) != nil { return true }
+
+        let savedAccount = Self.accountID(in: snapshot)
+        let expected = Self.accountID(in: latest) ?? defaults.string(forKey: lastAccount)
+        let stale = defaults.bool(forKey: invalidSnapshot)
+            || (expected != nil && savedAccount != nil && expected != savedAccount)
+        let usable = stale ? snapshot.filter { !Self.isCommunityAuthenticationCookie($0) } : snapshot
+        if stale && usable.count != snapshot.count {
+            // The explicit login was allowed to open this item. Purge its rejected
+            // pair, keeping remembered-device cookies, without holding up the UI.
+            vaultQueue.async { _ = self.saveSnapshot(usable) }
+        }
+        let keys = Set(latest.map(Self.cookieIdentity))
+        for cookie in usable where !keys.contains(Self.cookieIdentity(cookie)) {
+            guard generation == revision else { return false }
+            await store.setCookie(cookie)
+        }
+        let merged = await store.allCookies()
+        guard generation == revision else { return false }
+        return observe(merged) != nil
+    }
+
+    /// Back up the current session after the user explicitly authorized Steam.
+    func rememberLogin() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        guard maySaveLogin else { return }
+        let generation = revision
+        cookieStore().getAllCookies { cookies in
+            guard generation == self.revision, SteamSubscription.authenticatedSession(from: cookies) != nil else { return }
+            self.vaultQueue.async {
+                let saved = self.saveSnapshot(cookies)
                 DispatchQueue.main.async {
-                    self.isAuthenticated = auth != nil
-                    self.steamID64 = auth?.steamID64
-                    completion(auth)
+                    if generation == self.revision && saved { self.defaults.removeObject(forKey: self.invalidSnapshot) }
                 }
             }
         }
     }
 
-    private func resolveAuthenticatedSession(
-        completion: @escaping (SteamSubscription.AuthenticatedSession?) -> Void
-    ) {
-        let store = WKWebsiteDataStore.default().httpCookieStore
-        store.getAllCookies { cookies in
-            if let auth = SteamSubscription.authenticatedSession(from: cookies) {
-                SteamWebCredentialVault.save(cookies: cookies)
-                completion(auth)
-                return
-            }
-
-            let restored = SteamWebCredentialVault.loadCookies()
-            guard !restored.isEmpty else {
-                completion(nil)
-                return
-            }
-            // WebKit 常见状态是长期 steamLoginSecure 仍是新的，只丢了 sessionid。旧实现把
-            // Keychain 整份旧快照写回，反而覆盖较新的登录令牌，几次启动后必然被 Steam 判失效。
-            // 这里只补“同名+同域+同路径”缺失的 Cookie，绝不覆盖 WebKit 已有值。
-            let existingKeys = Set(cookies.map(Self.cookieIdentity))
-            let missing = restored.filter { !existingKeys.contains(Self.cookieIdentity($0)) }
-            guard !missing.isEmpty else {
-                // Keychain 可能只剩记住设备/browserid，用于之后的登录页，但不足以组成授权会话。
-                completion(nil)
-                return
-            }
-            let group = DispatchGroup()
-            for cookie in missing {
-                group.enter()
-                store.setCookie(cookie) { group.leave() }
-            }
-            group.notify(queue: .global(qos: .utility)) {
-                store.getAllCookies { merged in
-                    let auth = SteamSubscription.authenticatedSession(from: merged)
-                    if auth != nil { SteamWebCredentialVault.save(cookies: merged) }
-                    Log.write("SteamWebSession: restored \(missing.count) missing cookie(s), authenticated=\(auth != nil)")
-                    completion(auth)
-                }
-            }
-        }
+    private static func accountID(in cookies: [HTTPCookie]) -> String? {
+        SteamSubscription.communityLoginCookie(in: cookies).flatMap { SteamSubscription.steamID64(fromSecureCookieValue: $0.value) }
     }
 
     private static func cookieIdentity(_ cookie: HTTPCookie) -> String {
@@ -108,41 +166,50 @@ final class SteamWebSession: ObservableObject {
         return "\(domain)|\(cookie.path.isEmpty ? "/" : cookie.path)|\(cookie.name)"
     }
 
-    /// 服务端判定 Cookie 已失效时删掉认证 Cookie，防止“本地看似已授权 → 重试 → 再失效”的循环。
+    private func invalidateSnapshot() {
+        revision &+= 1
+        defaults.set(true, forKey: invalidSnapshot)
+    }
+
+    func noteRejected(_ session: SteamSubscription.AuthenticatedSession) {
+        if let login = SteamSubscription.communityLoginCookie(in: session.cookies) {
+            rejectedLogins.insert(login.value)
+        }
+    }
+
     func clearAuthenticationCookies(completion: (() -> Void)? = nil) {
         DispatchQueue.main.async {
-            let store = WKWebsiteDataStore.default().httpCookieStore
-            store.getAllCookies { cookies in
-                let targets = cookies.filter {
-                    Self.isCommunityAuthenticationCookie($0)
-                }
-                // 只丢弃服务端已拒绝的认证对；browserid / RememberLogin / MachineAuth 继续加密
-                // 保存在 Keychain，下一次官方登录页仍能识别设备。旧实现 Vault.clear() 把它们也全删了。
-                let supporting = (SteamWebCredentialVault.loadCookies() + cookies).filter {
-                    !$0.value.isEmpty
-                        && $0.domain.lowercased().contains("steamcommunity.com")
-                        && !Self.isCommunityAuthenticationCookie($0)
-                }
-                SteamWebCredentialVault.save(cookies: supporting)
-                guard !targets.isEmpty else {
-                    DispatchQueue.main.async {
-                        self.isAuthenticated = false
-                        self.steamID64 = nil
-                        completion?()
-                    }
-                    return
-                }
-                let group = DispatchGroup()
-                for cookie in targets {
+            self.clearing.append(completion ?? {})
+            if self.clearing.count == 1 { self.purgeRejectedCookies() }
+        }
+    }
+
+    private func purgeRejectedCookies() {
+        // A missing WebKit pair can also lead callers here. Its keychain backup
+        // remains eligible for explicit restore until the server actually rejects it.
+        guard !rejectedLogins.isEmpty else {
+            let callbacks = clearing
+            clearing.removeAll()
+            callbacks.forEach { $0() }
+            return
+        }
+        let rejected = rejectedLogins
+        rejectedLogins.removeAll()
+        let store = cookieStore()
+        store.getAllCookies { cookies in
+            let login = SteamSubscription.communityLoginCookie(in: cookies)
+            let group = DispatchGroup()
+            if login.map({ rejected.contains($0.value) }) ?? true {
+                self.invalidateSnapshot()
+                self.isAuthenticated = false
+                self.steamID64 = nil
+                for cookie in cookies.filter(Self.isCommunityAuthenticationCookie) {
                     group.enter()
                     store.delete(cookie) { group.leave() }
                 }
-                group.notify(queue: .main) {
-                    self.isAuthenticated = false
-                    self.steamID64 = nil
-                    completion?()
-                }
             }
+            // Requests for multiple wallpapers can fail before the purge completes.
+            group.notify(queue: .main) { self.purgeRejectedCookies() }
         }
     }
 
@@ -290,6 +357,7 @@ enum SteamSubscription {
                         }
                         SteamWebSession.shared.refresh()
                     case .authenticationRequired:
+                        SteamWebSession.shared.noteRejected(auth)
                         Log.write("SteamSubscription: \(endpoint) \(id) → authentication required (HTTP \(code), bytes=\(data?.count ?? 0))")
                     case .failure(let message):
                         Log.write("SteamSubscription: \(endpoint) \(id) → HTTP \(code), \(message)")
