@@ -16,6 +16,22 @@ final class SteamWebSession: ObservableObject {
 
     private init() {}
 
+    /// Mirror a completed navigation in Steam's own website. Reading this snapshot
+    /// must never restore credentials while the site is signing out or switching accounts.
+    @MainActor
+    func updateFromWebsite(cookies: [HTTPCookie], afterLogout: Bool) {
+        if let auth = SteamSubscription.authenticatedSession(from: cookies) {
+            guard !isAuthenticated || steamID64 != auth.steamID64 else { return }
+            SteamWebCredentialVault.save(cookies: cookies)
+            isAuthenticated = true
+            steamID64 = auth.steamID64
+        } else if afterLogout {
+            SteamWebCredentialVault.save(cookies: cookies.filter { !Self.isCommunityAuthenticationCookie($0) })
+            isAuthenticated = false
+            steamID64 = nil
+        }
+    }
+
     func refresh(completion: ((Bool) -> Void)? = nil) {
         DispatchQueue.main.async {
             self.isChecking = true

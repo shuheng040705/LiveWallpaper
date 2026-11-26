@@ -166,6 +166,9 @@ struct LibraryView: View {
                     item: item,
                     onApply: { actions.onApplySettings(item) },
                     onClose: { withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil } },
+                    onOpenWorkshop: {
+                        if let url = WorkshopWebAddress.detailURL(item.id) { openWorkshop(url) }
+                    },
                     onUnsubscribe: WallpaperUninstallPolicy.isSteamWorkshopID(item.id) ? {
                         actions.onUnsubscribe(item); favVersion += 1
                         withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil }
@@ -332,7 +335,7 @@ struct LibraryView: View {
             Text(sort.shelfTitle).font(.system(size: 17, weight: .bold)).foregroundStyle(.white)
                 .shadow(color: .black.opacity(0.4), radius: 4, y: 1)
             Spacer()
-            Button { tab = .workshop } label: {
+            Button { openWorkshop(WorkshopWebAddress.browseURL(for: sort)) } label: {
                 HStack(spacing: 3) {
                     Text("浏览全部").font(.system(size: 12, weight: .medium))
                     Image(systemName: "chevron.right").font(.system(size: 9, weight: .bold))
@@ -343,6 +346,12 @@ struct LibraryView: View {
             }.buttonStyle(.plain)
         }
         .padding(.horizontal, 26)
+    }
+
+    private func openWorkshop(_ url: URL) {
+        SteamWorkshopBrowser.shared.open(url)
+        settingsItem = nil
+        tab = .workshop
     }
 
     /// 工坊货架加载占位(骨架卡片)。

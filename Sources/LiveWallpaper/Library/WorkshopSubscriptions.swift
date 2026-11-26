@@ -84,8 +84,32 @@ final class WorkshopSubscriptions: ObservableObject {
     func retryDownload(_ item: WorkshopWallpaper) {
         guard operations[item.id] == nil else { return }
         errors[item.id] = nil
-        if !isSubscribed(item) { toggle(item) }
-        else { environment.download(item) }
+        if item.isSubscribed == true { confirmedWebsiteChange(item, subscribed: true) }
+        else if isSubscribed(item) { environment.download(item) }
+        else { toggle(item) }
+    }
+
+    /// Steam has confirmed the change, so only the local registry, transfer and files need updating.
+    func confirmedWebsiteChange(_ item: WorkshopWallpaper, subscribed: Bool) {
+        guard WallpaperUninstallPolicy.isSteamWorkshopID(item.id) else { return }
+        errors[item.id] = nil
+        overrides[item.id] = subscribed
+        environment.recordSubscription(item.id, subscribed)
+        if subscribed { subscribedIDs.insert(item.id) } else { subscribedIDs.remove(item.id) }
+
+        // An earlier unsubscribe still owns the download worker. Its completion will use the latest state.
+        guard operations[item.id] != .removing else { return }
+        if subscribed {
+            operations[item.id] = nil
+            if !environment.installed(item.id) { environment.download(item) }
+        } else {
+            operations[item.id] = .removing
+            environment.discard(item.id) { [weak self] in
+                guard let self else { return }
+                if self.overrides[item.id] == true { self.finishRemoval(item, error: nil) }
+                else { self.removeLocal(item) }
+            }
+        }
     }
 
     /// 删除文件失败时，Steam 已经退订，保留一个只重试本地卸载的入口。
@@ -99,27 +123,17 @@ final class WorkshopSubscriptions: ObservableObject {
     private func transact(_ item: WorkshopWallpaper, subscribing: Bool, authorizedOnce: Bool) {
         let action = subscribing ? environment.subscribe : environment.unsubscribe
         action(item.id) { [weak self] result in
-            guard let self else { return }
+            guard let self, self.operations[item.id] == (subscribing ? .subscribing : .unsubscribing) else { return }
             switch result {
             case .success:
-                self.overrides[item.id] = subscribing
-                self.environment.recordSubscription(item.id, subscribing)
-                if subscribing {
-                    self.subscribedIDs.insert(item.id)
-                    if !self.environment.installed(item.id) { self.environment.download(item) }
-                    self.operations[item.id] = nil
-                } else {
-                    self.subscribedIDs.remove(item.id)
-                    self.operations[item.id] = .removing
-                    self.environment.discard(item.id) { [weak self] in self?.removeLocal(item) }
-                }
+                self.confirmedWebsiteChange(item, subscribed: subscribing)
             case .authenticationRequired:
                 guard !authorizedOnce else {
                     self.fail(item.id, "Steam 网页授权尚未生效，请重新登录后重试")
                     return
                 }
                 self.environment.authorize(item.id) { [weak self] success in
-                    guard let self else { return }
+                    guard let self, self.operations[item.id] == (subscribing ? .subscribing : .unsubscribing) else { return }
                     if success { self.transact(item, subscribing: subscribing, authorizedOnce: true) }
                     else { self.fail(item.id, "已取消 Steam 授权，订阅与本地文件保持原状") }
                 }
@@ -130,10 +144,16 @@ final class WorkshopSubscriptions: ObservableObject {
 
     private func removeLocal(_ item: WorkshopWallpaper) {
         environment.removeLocal(item.id) { [weak self] error in
-            guard let self else { return }
-            self.operations[item.id] = nil
-            if let error { self.errors[item.id] = "已取消订阅，本地卸载失败：\(error)" }
-            else { self.errors[item.id] = nil }
+            self?.finishRemoval(item, error: error)
+        }
+    }
+
+    private func finishRemoval(_ item: WorkshopWallpaper, error: String?) {
+        operations[item.id] = nil
+        if overrides[item.id] == true {
+            if !environment.installed(item.id) { environment.download(item) }
+        } else if let error {
+            errors[item.id] = "已取消订阅，本地卸载失败：\(error)"
         }
     }
 

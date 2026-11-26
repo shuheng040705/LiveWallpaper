@@ -95,14 +95,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// 打开「我的 Steam 订阅」窗口(独立可拖拽改大小的 NSWindow,取代原 SwiftUI sheet)。
     @objc private func openSubscriptions() { subscriptionsWindow.show() }
 
-    /// 原生工坊已确认 Steam 退订、并等待本地下载退出；这里只卸载并回报最终结果。
+    /// Steam 已确认退订，下载任务已退出。清理本机副本及其在壁纸库中的状态。
     @objc private func onWorkshopRemoveLocal(_ note: Notification) {
         guard let id = note.userInfo?["id"] as? String,
               let completion = note.userInfo?["completion"] as? (String?) -> Void,
               WallpaperUninstallPolicy.isSteamWorkshopID(id) else { return }
         guard !uninstallingIDs.contains(id) else { completion("该壁纸正在卸载，请稍后重试"); return }
         let folder = PreferencesStore.shared.libraryRoot.appendingPathComponent(id, isDirectory: true)
-        guard FileManager.default.fileExists(atPath: folder.path) else { completion(nil); return }
         uninstallingIDs.insert(id)
         let item = library.item(id: id)
         removeLocalWallpaper(id: id, title: item?.title ?? "创意工坊壁纸", folderURL: folder,
@@ -331,9 +330,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             try FileManager.default.trashItem(at: folderURL, resultingItemURL: nil)
             Log.write("uninstall: trashed \(id), steamCancelled=\(subscriptionWasCancelled)")
-            uninstallingIDs.remove(id)
-            library.scan()
-            completion?(nil)
+        } catch let error as NSError where error.domain == NSCocoaErrorDomain &&
+                    [NSFileNoSuchFileError, NSFileReadNoSuchFileError].contains(error.code) {
+            // The Steam client can remove the installed copy as soon as the website confirms unsubscribe.
         } catch {
             Log.write("uninstall: trash failed \(id): \(error)")
             uninstallingIDs.remove(id)
@@ -348,7 +347,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 subscriptionWasCancelled: subscriptionWasCancelled,
                 error: error
             )
+            return
         }
+        uninstallingIDs.remove(id)
+        library.scan()
+        completion?(nil)
     }
 
     /// Steam 退订失败时默认保留本地文件；用户仍可明确选择“仅卸载本地”。

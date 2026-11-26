@@ -65,15 +65,19 @@ final class SteamBootstrapUpdateTests: XCTestCase {
         try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
         let script = root.appendingPathComponent("steamcmd-fixture")
+        // Allow a cold worker to launch. Six progress intervals span 1.5 login
+        // windows, so the worker can finish only if real log growth extends its deadline.
+        let loginWindow: TimeInterval = 4
+        let progressInterval = loginWindow / 4
         try """
         #!/bin/sh
         dest="$2"
         logs="$HOME/Library/Application Support/Steam/logs"
         mkdir -p "$logs"
         if [ ! -e "$HOME/updated" ]; then
-          for kb in 100 200 300 400 500; do
-            echo "正在下载更新 (已下载 ${kb}，共 500 KB)..." >> "$logs/bootstrap_log.txt"
-            sleep 0.25
+          for kb in 100 200 300 400 500 600; do
+            echo "正在下载更新 (已下载 ${kb}，共 600 KB)..." >> "$logs/bootstrap_log.txt"
+            sleep \(progressInterval)
           done
           echo '更新完成，正在启动 Steamcmd...' >> "$logs/bootstrap_log.txt"
           touch "$HOME/updated"
@@ -90,7 +94,7 @@ final class SteamBootstrapUpdateTests: XCTestCase {
         try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
         let client = WorkshopDownloader(stagingDirectory: root.appendingPathComponent("cache"), executable: script,
                                         libraryDirectory: library, account: "fixture",
-                                        timeouts: .init(login: 0.8, retryDelay: 0.01))
+                                        timeouts: .init(login: loginWindow, retryDelay: 0.01))
         defer { client.shutdown() }
         let finished = expectation(description: "Updated worker installs the first request")
         var showedUpdate = false
@@ -106,7 +110,7 @@ final class SteamBootstrapUpdateTests: XCTestCase {
             }
         }
         client.enqueue(id: "1234567890", title: "bootstrap")
-        wait(for: [finished], timeout: 8)
+        wait(for: [finished], timeout: 6 * loginWindow)
         observation.cancel()
         XCTAssertTrue(showedUpdate)
     }

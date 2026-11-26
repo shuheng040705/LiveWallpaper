@@ -8,6 +8,7 @@ struct WallpaperSettingsPanel: View {
     let item: WallpaperItem
     var onApply: () -> Void
     var onClose: () -> Void
+    var onOpenWorkshop: () -> Void
     var onUnsubscribe: (() -> Void)? = nil   // 取消订阅 + 删除本地(创意工坊条目才有)
 
     @State private var version = 0   // 改动后递增,触发条件重算 + 控件刷新
@@ -199,11 +200,8 @@ struct WallpaperSettingsPanel: View {
     private var quickActions: some View {
         HStack(spacing: 8) {
             if WallpaperUninstallPolicy.isSteamWorkshopID(item.id) {
-                quickButton("Steam", icon: "safari") {
-                    if let url = URL(string: "https://steamcommunity.com/sharedfiles/filedetails/?id=\(item.id)") {
-                        NSWorkspace.shared.open(url)
-                    }
-                }
+                quickButton("Steam", icon: "safari", action: onOpenWorkshop)
+                    .help("在创意工坊查看此壁纸")
             }
             quickButton("访达", icon: "folder") {
                 NSWorkspace.shared.activateFileViewerSelecting([item.folderURL])

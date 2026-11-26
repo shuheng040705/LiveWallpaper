@@ -119,4 +119,52 @@ final class WorkshopSubscriptionsTests: XCTestCase {
         XCTAssertNil(store.errors[item.id])
         XCTAssertEqual(fixture.events, ["unsubscribe", "discard", "remove", "remove"])
     }
+
+    @MainActor
+    func testWebsiteConfirmationOnlyRunsLocalActions() {
+        let fixture = Fixture()
+        let store = WorkshopSubscriptions(environment: fixture.environment)
+        store.confirmedWebsiteChange(item, subscribed: true)
+        store.confirmedWebsiteChange(item, subscribed: false)
+        XCTAssertEqual(fixture.events, ["download", "discard", "remove"])
+        XCTAssertFalse(store.isSubscribed(item))
+    }
+
+    @MainActor
+    func testResubscribingWhileWorkerStopsKeepsInstalledCopy() {
+        let fixture = Fixture()
+        fixture.installed = true
+        fixture.deferDiscard = true
+        let store = WorkshopSubscriptions(environment: fixture.environment)
+        store.confirmedWebsiteChange(item, subscribed: false)
+        store.confirmedWebsiteChange(item, subscribed: true)
+        fixture.discarded?()
+        XCTAssertEqual(fixture.events, ["discard"])
+        XCTAssertTrue(store.isSubscribed(item))
+        XCTAssertNil(store.operations[item.id])
+    }
+
+    @MainActor
+    func testResubscribingDuringCancelledDownloadRestartsAfterWorkerExits() {
+        let fixture = Fixture()
+        fixture.deferDiscard = true
+        let store = WorkshopSubscriptions(environment: fixture.environment)
+        store.confirmedWebsiteChange(item, subscribed: false)
+        store.confirmedWebsiteChange(item, subscribed: true)
+        XCTAssertEqual(fixture.events, ["discard"])
+        fixture.discarded?()
+        XCTAssertEqual(fixture.events, ["discard", "download"])
+    }
+
+    @MainActor
+    func testDownloadOfSubscriptionConfirmedByPageSkipsSecondPost() {
+        let fixture = Fixture()
+        let store = WorkshopSubscriptions(environment: fixture.environment)
+        store.confirmedWebsiteChange(item, subscribed: false)
+        var subscribedOnSteam = item
+        subscribedOnSteam.isSubscribed = true
+        store.retryDownload(subscribedOnSteam)
+        XCTAssertEqual(fixture.events, ["discard", "remove", "download"])
+        XCTAssertTrue(store.isSubscribed(item))
+    }
 }
