@@ -4,11 +4,24 @@ import XCTest
 
 @MainActor
 final class WebWallpaperHotspotPanelTests: XCTestCase {
+    func testWallpaperPriorityOnlyClaimsASmallRegionOnTheCurrentDisplay() {
+        let viewport = CGSize(width: 1728, height: 1117)
+        let point = CGPoint(x: 0.43, y: 0.61)
+        let rect = WallpaperDesktopInput.pointerRegion(around: point, viewSize: viewport)
+        XCTAssertTrue(rect.contains(point))
+        XCTAssertEqual(rect.width * viewport.width, 12, accuracy: 0.001)
+        XCTAssertEqual(rect.height * viewport.height, 12, accuracy: 0.001)
+        let edge = WallpaperDesktopInput.pointerRegion(around: .zero, viewSize: viewport)
+        XCTAssertEqual(edge.origin, .zero)
+        XCTAssertEqual(edge.width * viewport.width, 6, accuracy: 0.001)
+        XCTAssertEqual(WallpaperDesktopInput.pointerRegion(around: point, viewSize: .zero), .zero)
+    }
+
     func testHotspotForwardsOriginalPressDragReleaseAndCancellation() throws {
         _ = NSApplication.shared
         var phases: [WallpaperPointerPhase] = []
         var points: [CGPoint] = []
-        let panel = WebWallpaperHotspotPanel(frame: CGRect(x: 40, y: 90, width: 80, height: 50)) { phase, point in
+        let panel = WallpaperHotspotPanel(frame: CGRect(x: 40, y: 90, width: 80, height: 50)) { phase, point, _ in
             phases.append(phase)
             points.append(point)
         }

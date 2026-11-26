@@ -5,8 +5,8 @@ final class SceneCursorInputTests: XCTestCase {
     private final class Fixture: SceneSource {
         var allPaths = ["scene.json"]
         let data: Data
-        init(size: String = "20 20", solid: Bool = true) throws {
-            let callback = """
+        init(size: String = "20 20", solid: Bool = true, source: String? = nil) throws {
+            let callback = source ?? """
                 export function cursorClick(e) {
                     shared.values = [e.worldPosition.x, e.worldPosition.y,
                                      e.localPosition.x, e.localPosition.y, input.cursorLeftDown];
@@ -41,6 +41,39 @@ final class SceneCursorInputTests: XCTestCase {
         }
     }
 
+    func testGlobalInputWorksWithoutSolidRegionsOrCursorCallbacks() throws {
+        let source = try Fixture(solid: false, source: """
+            export function update(value) {
+                const { cursorLeftDown, cursorScreenPosition } = input;
+                shared.pressed = cursorLeftDown;
+                shared.screen = [cursorScreenPosition.x, cursorScreenPosition.y];
+                shared.dimensions = [engine.canvasSize.x, engine.screenResolution.x];
+                return value;
+            }
+            """)
+        let doc = try XCTUnwrap(SceneDocument.build(from: source))
+        let script = try XCTUnwrap(doc.layers.first?.visibleScript)
+        guard let engine = SceneRenderEngine() else { throw XCTSkip("Metal unavailable") }
+        engine.load(document: doc, source: source)
+        engine.update(time: 0, mouseNorm: .zero)
+        engine.setScreenResolution(SIMD2(800, 300))
+        XCTAssertTrue(engine.needsDesktopInput)
+        let point = CGPoint(x: 0.1, y: 0.3)
+        XCTAssertTrue(engine.cursorHotspots(at: point).isEmpty)
+        for (phase, pressed) in [(WallpaperPointerPhase.down, true), (.leave, true), (.drag, true), (.up, false),
+                                 (.down, true), (.cancel, false)] {
+            engine.routeCursor(phase, at: point)
+            _ = script.runBool(current: true)
+            let state = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(script.sharedJSON().utf8)) as? [String: Any])
+            XCTAssertEqual(state["pressed"] as? Bool, pressed)
+            let coords = try XCTUnwrap(state["screen"] as? [Double])
+            XCTAssertEqual(coords.count, 2)
+            XCTAssertEqual(state["dimensions"] as? [Int], [100, 800])
+            XCTAssertEqual(coords.first ?? 0, 80, accuracy: 0.001)
+            XCTAssertEqual(coords.last ?? 0, 90, accuracy: 0.001)
+        }
+    }
+
     func testClickPlaysOnlyReferencedSceneSoundLayer() throws {
         let runtime = try XCTUnwrap(WEScript(script: """
         export function cursorClick() { thisScene.getLayer("touchhead.mp3").play(); }
@@ -57,7 +90,7 @@ final class SceneCursorInputTests: XCTestCase {
         XCTAssertEqual(played, [27])
     }
 
-    func testSceneCursorCallbacksUseRenderedGeometryAndCapturePress() throws {
+    func testSceneCursorCallbacksUseRenderedGeometryAndReleaseTarget() throws {
         let source = try Fixture()
         let doc = try XCTUnwrap(SceneDocument.build(from: source))
         let target = try XCTUnwrap(doc.layers.first(where: { $0.id == 42 })?.visibleScript)
@@ -74,9 +107,10 @@ final class SceneCursorInputTests: XCTestCase {
         engine.routeCursor(.drag, at: outside)
         engine.routeCursor(.up, at: outside)
         XCTAssertNil(try result()["values"])
-        XCTAssertEqual(try result()["events"] as? String, "down,up")
+        XCTAssertEqual(try result()["events"] as? String, "down")
         engine.routeCursor(.down, at: inside)
         engine.routeCursor(.up, at: inside)
+        XCTAssertEqual(try result()["events"] as? String, "down,up")
         let values = try XCTUnwrap(try result()["values"] as? [NSNumber])
         XCTAssertEqual(values.count, 5)
         guard values.count == 5 else { return }

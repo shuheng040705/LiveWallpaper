@@ -42,7 +42,8 @@ final class WEScript {
     private var installedSceneLayerDefs: [SceneLayerDefinition]? = nil
     private let updateFn: JSValue?
     private(set) var cursorEvents = Set<WECursorEvent>()
-    let requiresWritableBones: Bool
+    let usesBones: Bool
+    private var boneAPIReady = false
     let readsCursorInput: Bool
     let usesShared: Bool
     private let cursorInputFn: JSValue?
@@ -123,8 +124,8 @@ final class WEScript {
     ///        不注入会 TypeError 抛错 → 脚本失败 → 调用方退回旧画布快照(飘字根因 B)。
     init?(script: String, propertyOverrides: [String: Any], tag: String, canvas: SIMD2<Float> = SIMD2(1920, 1080)) {
         self.sourceTag = tag
-        requiresWritableBones = script.contains("setBoneTransform") || script.contains("applyBonePhysicsImpulse")
-        readsCursorInput = script.contains("input.cursor")
+        usesBones = script.contains("Bone")
+        readsCursorInput = script.range(of: #"\binput\b"#, options: .regularExpression) != nil
         usesShared = script.contains("shared")
         // 纯局部检查(无 self):脚本是否用音频。供引擎决定采集音频 + 每帧喂频谱。
         self.usesAudio = script.contains("registerAudioBuffers") || script.contains("__audio")
@@ -150,6 +151,7 @@ final class WEScript {
         //    stripModuleSyntax 删掉了脚本对 WEMath/WEColor 等的 import,这些全局把它们补回来,
         //    复杂脚本(console.log / setInterval / 读写 thisLayer 等)才不会因缺全局抛错回退。
         context.evaluateScript(WEScript.preludeSource)
+        if usesBones { SceneBoneScript.install(in: context) }
         cursorInputFn = readsCursorInput ? context.evaluateScript("""
             (function(wx, wy, sx, sy, pressed) {
                 input.cursorWorldPosition = new Vec3(wx, wy, 0);
@@ -158,15 +160,12 @@ final class WEScript {
             })
             """) : nil
 
-        // 0b) 注入 engine.canvasSize + engine.screenResolution(WE 的渲染画布尺寸,这里用场景
-        //     orthogonalprojection w/h)。WE 挂件容器/时钟/日期/灵动岛/拖拽脚本第一行就读
-        //     engine.canvasSize.x/y 或 engine.screenResolution.x/y,缺任一必抛 TypeError →
-        //     整个时钟挂件脚本崩、时钟不显示。screenResolution 用画布尺寸作为合理值(脚本主要用它
-        //     做相对定位,画布即渲染区域;真实屏幕分辨率会被等比 cover 到画布,相对位置一致)。
-        if let engine = context.objectForKeyedSubscript("engine"), engine.isObject {
-            let cs: [String: Any] = ["x": canvas.x, "y": canvas.y]
-            engine.setObject(cs, forKeyedSubscript: "canvasSize" as NSString)
-            engine.setObject(cs, forKeyedSubscript: "screenResolution" as NSString)
+        // An offscreen scene starts at its design resolution. The renderer supplies
+        // the actual display pixels as soon as the scene has a screen.
+        if let engine = context.objectForKeyedSubscript("engine"),
+           let vector = context.objectForKeyedSubscript("Vec2") {
+            engine.setObject(vector.construct(withArguments: [canvas.x, canvas.y]), forKeyedSubscript: "canvasSize" as NSString)
+            engine.setObject(vector.construct(withArguments: [canvas.x, canvas.y]), forKeyedSubscript: "screenResolution" as NSString)
         }
         // 0c) 注入 video 播放控制桩。视频图层(MP4 动态贴图)的可见性/播放控制脚本会读
         //     video.isPlaying/duration/rate/getCurrentTime() 并调 play()/pause()/stop()/setCurrentTime()。
@@ -263,9 +262,21 @@ final class WEScript {
     /// 只读取字符串异常本身或标准 Error.message，不执行任意异常对象的 toString。读取 message
     /// 若碰到恶意 getter 再次抛错，exceptionHandler 会因 formattingException=true 仅记 hit，
     /// 不会覆盖原异常或递归格式化。
+    func setScreenResolution(_ pixels: SIMD2<Float>) {
+        guard let engine = context.objectForKeyedSubscript("engine"),
+              let vector = context.objectForKeyedSubscript("Vec2") else { return }
+        engine.setObject(vector.construct(withArguments: [pixels.x, pixels.y]), forKeyedSubscript: "screenResolution" as NSString)
+    }
+
     func setCursorInput(world: SIMD2<Float>, screen: SIMD2<Float>, pressed: Bool) {
         guard readsCursorInput else { return }
         _ = cursorInputFn?.call(withArguments: [world.x, world.y, screen.x, screen.y, pressed])
+    }
+
+    func bindBones(_ poses: [Int: SceneBonePose]) {
+        guard usesBones else { return }
+        SceneBoneScript.bind(in: context, poses: poses)
+        boneAPIReady = true
     }
 
     func setSoundLayerPlayback(_ play: @escaping @convention(block) (Int) -> Void) {
@@ -321,6 +332,7 @@ final class WEScript {
     ///   - frametime:引擎本帧 sim dt(秒,对标 lwe `g_Time - g_TimeLast`);音频平滑等脚本依赖它。
     ///     传入时 engine.frametime 直接取此真实帧间隔;nil 时回退用 runtime 差近似。
     func runString(current: String, simTime: Double? = nil, frametime: Double? = nil) -> Result {
+        guard !usesBones || boneAPIReady else { return .failed }
         didFail = false
         tickFrame(initArg: current, simTime: simTime, frametime: frametime)
         // 纯 media 文本(歌名/艺术家):无 update()。now-playing 由 dispatchMediaState 写进 thisLayer.text,
@@ -357,6 +369,7 @@ final class WEScript {
     /// 审计修复(#1):同 runString,新增可选 simTime/frametime;上层应传引擎 sim 时间(秒)做时间源、
     ///   本帧 sim dt 做 frametime,默认 nil 回退墙钟/runtime 差。
     func runVec3(current: SIMD3<Float>, simTime: Double? = nil, frametime: Double? = nil) -> Result {
+        guard !usesBones || boneAPIReady else { return .failed }
         didFail = false
         // WE 传入的属性矢量是 Vec3，不是仅有 x/y/z 的桥接字典。官方脚本会直接调用
         // value.copy()/multiply()/hasOwnProperty()；普通对象会在这些调用处失败。
@@ -390,6 +403,7 @@ final class WEScript {
     /// 布尔脚本(对象/特效 visible:lwe 每帧 reevaluate)。update(value) 据 engine.timeOfDay / Date /
     /// Math.random / 音频 返回 bool(或可转 bool 的数字)。返回 nil = 脚本不可用/抛错 → 调用方回退静态值。
     func runBool(current: Bool, simTime: Double? = nil, frametime: Double? = nil) -> Bool? {
+        guard !usesBones || boneAPIReady else { return nil }
         didFail = false
         tickFrame(initArg: current, simTime: simTime, frametime: frametime)
         guard let fn = updateFn else {
@@ -414,6 +428,7 @@ final class WEScript {
     /// 标量脚本(alpha:lwe 每帧 reevaluate)。update(value) 传当前标量、期望返回数字。
     /// 返回 nil = 不可用/抛错/非有限 → 调用方回退静态值。
     func runScalar(current: Float, simTime: Double? = nil, frametime: Double? = nil) -> Float? {
+        guard !usesBones || boneAPIReady else { return nil }
         didFail = false
         tickFrame(initArg: current, simTime: simTime, frametime: frametime)
         guard let fn = updateFn else {
@@ -434,6 +449,7 @@ final class WEScript {
     /// 与 runVec3 相同地传入真正的 WE Vec 实例，避免脚本调用 value.copy()/multiply() 时因裸字典失败。
     /// 返回 nil 表示脚本失败或分量数不受支持，调用方保留 pkg 的静态/关键帧 fallback。
     func runFloats(current: [Float], simTime: Double? = nil, frametime: Double? = nil) -> [Float]? {
+        guard !usesBones || boneAPIReady else { return nil }
         guard (1...4).contains(current.count) else { return nil }
         didFail = false
 

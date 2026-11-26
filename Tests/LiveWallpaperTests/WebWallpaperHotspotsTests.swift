@@ -4,118 +4,97 @@ import XCTest
 
 final class WebWallpaperHotspotsTests: XCTestCase {
     @MainActor
-    func testAuthorGeometryWithHiddenHintsAndOrdinaryHTMLControls() async throws {
+    func testStandardTargetsAndNativeInputAcrossLocalDocuments() async throws {
         _ = NSApplication.shared
-        let id = UUID().uuidString
-        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(id)
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
-        let item = WallpaperItem(id: id, folderURL: folder, title: "Hotspots", type: .web,
-                                 fileName: "index.html", previewName: nil, tags: [])
-        let store = WallpaperPropertyStore.shared
-        let renderer = WebRenderer()
-        defer {
-            renderer.stop()
-            store.reset(forID: id, folderURL: folder)
-            try? FileManager.default.removeItem(at: folder)
-        }
-        let project = #"{"general":{"properties":{"hints":{"type":"bool","value":false},"interaction":{"type":"bool","value":true}}}}"#
-        let html = """
+        defer { try? FileManager.default.removeItem(at: folder) }
+        let html = #"""
         <!doctype html><style>
-        body{margin:0} #stage,#hotspots,.hotspot,button{position:fixed}
-        #stage,#hotspots{inset:0;width:100%;height:100%} #hotspots{pointer-events:none}
-        [data-hit=fallback]{inset:0} button{top:0;right:0;width:40px;height:20px}
-        </style><canvas id="stage"></canvas>
-        <div id="hotspots" hidden><div class="hotspot" data-hit="head"></div>
-        <div class="hotspot" data-hit="fallback"></div></div><button>Play</button>
+          * {box-sizing:border-box} body {margin:0} #art {position:absolute;inset:0;width:100%;height:100%}
+          #tool {position:absolute;left:5px;top:5px} #widget {position:absolute;left:5px;top:50px}
+          iframe {position:absolute;left:130px;top:50px;width:120px;height:80px;box-sizing:content-box;
+                  border:4px solid orange;padding:2px;transform:scale(1.25);transform-origin:top left}
+          #opaque {left:300px;top:5px;width:40px;height:40px}
+        </style>
+        <canvas id="art"></canvas><button id="tool">Action</button><div id="widget"></div>
+        <iframe id="local" src="inner.html"></iframe><iframe id="opaque" sandbox srcdoc="<button>opaque</button>"></iframe>
         <script>
-        const box = document.querySelector('[data-hit=head]'); window.left = 20;
-        window.wallpaperPropertyListener = { applyUserProperties(p) {
-            if (p.hints) {
-                hotspots.hidden = !p.hints.value;
-                if (!hotspots.hidden) box.style.cssText = 'left:'+window.left+'px;top:60px;width:40px;height:20px';
-            }
-        }};
+          window.actions = [];
+          art.addEventListener('pointerdown', e => { if(e.clientX>280) actions.push('drawing') });
+          tool.onclick = () => actions.push('tool');
+          const shadow = widget.attachShadow({mode:'open'});
+          shadow.innerHTML='<span role="switch" style="display:block;width:60px;height:20px">Switch</span><button disabled>Unavailable</button>';
+          shadow.firstChild.addEventListener('click', () => actions.push('switch'));
         </script>
-        """
-        try Data(project.utf8).write(to: folder.appendingPathComponent("project.json"))
+        """#
+        let inner = #"""
+        <!doctype html><style>body{margin:0} #nested{position:absolute;left:14px;top:8px;width:70px;height:50px;border:2px solid pink}</style>
+        <iframe id="nested" srcdoc="<style>body{margin:0}button{margin:4px}</style><button onclick='top.actions.push(&quot;frame&quot;)'>Go</button>"></iframe>
+        """#
         try Data(html.utf8).write(to: folder.appendingPathComponent("index.html"))
-        let host = NSView(frame: CGRect(x: 0, y: 0, width: 400, height: 200))
-        renderer.attach(to: host)
-        renderer.load(item)
-        let web = try XCTUnwrap(host.subviews.compactMap { $0 as? WKWebView }.first)
-        func rects() async -> [CGRect] {
+        try Data(inner.utf8).write(to: folder.appendingPathComponent("inner.html"))
+        let panel = NSPanel(contentRect: CGRect(x: -4000, y: -4000, width: 400, height: 200),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        panel.ignoresMouseEvents = true
+        panel.orderBack(nil)
+        let renderer = WebRenderer()
+        defer { renderer.stop(); panel.close() }
+        renderer.attach(to: try XCTUnwrap(panel.contentView))
+        let web = try XCTUnwrap(panel.contentView?.subviews.compactMap { $0 as? WebWallpaperView }.first)
+        renderer.load(WallpaperItem(id: folder.lastPathComponent, folderURL: folder, title: "Input fixture", type: .web,
+                                    fileName: "index.html", previewName: nil, tags: []))
+        let deadline = Date().addingTimeInterval(8)
+        while (try? await web.evaluateJavaScript("!!window.local?.contentDocument?.getElementById('nested')?.contentDocument?.querySelector('button')") as? Bool) != true {
+            guard Date() < deadline else { return XCTFail("Local wallpaper frames did not load") }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        func point(_ x: Double, _ y: Double) -> CGPoint { CGPoint(x: x / 400, y: y / 200) }
+        func captures(_ p: CGPoint) async -> Bool {
             await withCheckedContinuation { continuation in
-                WebWallpaperHotspots.read(in: web) { continuation.resume(returning: $0) }
+                WebWallpaperHotspots.read(in: web, at: p) { continuation.resume(returning: $0.contains { $0.contains(p) }) }
             }
         }
-        func pixels(_ rect: CGRect) -> CGRect {
-            CGRect(x: (rect.minX * 400).rounded(), y: (rect.minY * 200).rounded(),
-                   width: (rect.width * 400).rounded(), height: (rect.height * 200).rounded())
+        func clicked(_ p: CGPoint) async -> Bool {
+            await withCheckedContinuation { continuation in
+                web.send(.down, at: p)
+                web.send(.up, at: p) { value, _ in continuation.resume(returning: value as? Bool == true) }
+            }
         }
-        let deadline = Date().addingTimeInterval(6)
-        while (try? await web.evaluateJavaScript("!!window.__lwUserPropertyState?.values") as? Bool) != true {
-            guard Date() < deadline else { return XCTFail("Wallpaper did not receive initial properties") }
-            try await Task.sleep(nanoseconds: 30_000_000)
+        let artwork = point(310, 160), switchPoint = point(25, 59), nestedButton = point(177, 90)
+        let disabled = point(30, 80), opaque = point(323, 25), blank = point(75, 155)
+        for p in [point(23, 15), switchPoint, nestedButton] {
+            let priority = await captures(p)
+            XCTAssertTrue(priority, "Expected a standard interactive target at \(p)")
         }
-        let normal = await rects()
-        let button = CGRect(x: 360, y: 0, width: 40, height: 20)
-        XCTAssertEqual(normal.map(pixels), [CGRect(x: 20, y: 60, width: 40, height: 20), button])
-        let stillHidden = try await web.evaluateJavaScript("hotspots.hidden") as? Bool
-        XCTAssertEqual(stillHidden, true)
-        _ = try await web.evaluateJavaScript("window.left = 160")
-        let moved = await rects()
-        XCTAssertEqual(moved.first?.minX, 0.4)
-        _ = try await web.evaluateJavaScript("document.querySelector('[data-hit=fallback]').style.inset = '8%'")
-        let boundedFallback = await rects()
-        XCTAssertEqual(boundedFallback.map(pixels), [CGRect(x: 160, y: 60, width: 40, height: 20),
-                                                      CGRect(x: 32, y: 16, width: 336, height: 168), button])
-        store.setValue(.bool(false), forID: id, propertyKey: "interaction")
-        renderer.reloadInPlace()
-        let disabled = await rects()
-        XCTAssertEqual(disabled.map(pixels), [button])
+        for p in [artwork, disabled, opaque, blank] {
+            let priority = await captures(p)
+            XCTAssertFalse(priority, "Desktop click should pass through at \(p)")
+        }
+        for p in [disabled, opaque] {
+            let sent = await clicked(p)
+            XCTAssertFalse(sent, "Disabled control or sandbox frame received a gesture")
+        }
+        for p in [artwork, switchPoint, nestedButton] {
+            let sent = await clicked(p)
+            XCTAssertTrue(sent, "Native input rejected at \(p)")
+        }
+        let eventsDeadline = Date().addingTimeInterval(3)
+        while (try await web.evaluateJavaScript("actions.length") as? Int) != 3 && Date() < eventsDeadline {
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        let actions = try await web.evaluateJavaScript("actions") as? [String]
+        XCTAssertEqual(actions, ["drawing", "switch", "frame"])
 
-        func captures(_ point: CGPoint) async -> Bool {
-            let frames: [CGRect] = await withCheckedContinuation { continuation in
-                WebWallpaperHotspots.read(in: web, at: point) { continuation.resume(returning: $0) }
-            }
-            return frames.contains { $0.contains(point) }
-        }
-        let character = CGPoint(x: 0.6, y: 0.4)
-        let blank = CGPoint(x: 0.12, y: 0.2)
-        for runtime in [
-            "window.__rt5 = {hitTest: (x, y) => x === 240 && y === 80 ? 0 : null}",
-            "window.wallpaperInteraction = {candidates: (x,y) => x === 240 && y === 80 ? [{}] : []}",
-            "window.inspectPointerHit = (x,y) => ({selectedCandidate: x === 240 && y === 80 ? {} : null})",
-            "window.hitNameAt = (x,y) => x === 240 && y === 80 ? 'touch_head' : null"
-        ] {
-            _ = try await web.evaluateJavaScript("delete window.__rt5; delete window.wallpaperInteraction; delete window.inspectPointerHit; delete window.hitNameAt; " + runtime + "; true")
-            let hit = await captures(character), miss = await captures(blank)
-            XCTAssertTrue(hit, runtime)
-            XCTAssertFalse(miss, runtime)
-        }
-        _ = try await web.evaluateJavaScript("delete window.hitNameAt; true")
-        _ = try await web.evaluateJavaScript("""
-            window.__rt5 = {
-                touch: () => [{index:0, enabled:true},{index:1, enabled:true},{index:2, enabled:false}],
-                quad: i => i === 0 ? [{x:110,y:60},{x:150,y:60},{x:150,y:84},{x:110,y:84}]
-                                   : [{x:200,y:50},{x:250,y:80},{x:200,y:110},{x:150,y:80}],
-                hitTest: () => 0
-            }; true
-            """)
-        let declared = await rects()
-        XCTAssertEqual(declared.map(pixels), [CGRect(x: 110, y: 60, width: 40, height: 24), button])
-        _ = try await web.evaluateJavaScript("delete window.__rt5; true")
-        _ = try await web.evaluateJavaScript("""
-            const overlay = document.createElement('div');
-            overlay.style.cssText='position:fixed;inset:0';
-            document.body.append(overlay);
-            window.inspectPointerHit = (x, y) => ({selectedCandidate: x===240 && y===80 ? {} : null}); true
-            """)
-        let documentCapture = await captures(character), coveredBlank = await captures(blank)
-        XCTAssertTrue(documentCapture)
-        XCTAssertFalse(coveredBlank)
-        _ = try await web.evaluateJavaScript("delete window.inspectPointerHit; true")
-        let fullCanvas = await captures(character)
-        XCTAssertFalse(fullCanvas)
+        _ = try await web.evaluateJavaScript("local.style.transform = 'rotate(90deg) scale(1.25)'; document.body.style.height = '400px'; scrollTo(0, 20)")
+        let rotatedAndScrolled = await captures(point(90, 77))
+        XCTAssertTrue(rotatedAndScrolled, "Frame hit testing must use local viewport coordinates after transforms and scrolling")
+        _ = try await web.evaluateJavaScript("scrollTo(0, 0); art.style.cursor = 'pointer'")
+        let hinted = await captures(artwork)
+        XCTAssertTrue(hinted)
+        _ = try await web.evaluateJavaScript("art.style.cursor = 'default'")
+        let cleared = await captures(artwork)
+        XCTAssertFalse(cleared)
     }
 }

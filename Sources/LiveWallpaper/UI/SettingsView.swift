@@ -136,12 +136,20 @@ struct SettingsForm: View {
     @State private var mainScreenOnly = PreferencesStore.shared.mainScreenOnly
     @State private var parallax = PreferencesStore.shared.parallaxStrength
     @State private var frameCap = PreferencesStore.shared.frameRateCap
+    @AppStorage("wallpaperInputPriority") private var wallpaperInputPriority = false
     @State private var showIcons = DesktopIcons.isVisible
 
     private var displaySection: some View {
         Section("显示与渲染") {
             toggleRow("仅主显示器", "多显示器时只在主屏显示壁纸", $mainScreenOnly) {
                 actions.onMainScreenOnlyChanged($0)
+            }
+            Toggle(isOn: $wallpaperInputPriority) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("台前调度下优先与壁纸互动")
+                    Text("开启后可直接点击或拖动整张壁纸。关闭时，控件优先响应，空白处可显示桌面。")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
             }
             row("场景动效强度", "调整场景壁纸的视差 / 漂浮幅度") {
                 HStack(spacing: 8) {

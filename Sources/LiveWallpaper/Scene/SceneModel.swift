@@ -425,6 +425,13 @@ enum WEVisibilityResolver {
 
 /// 一个待渲染图层的描述(尚未解码纹理)。
 struct LayerDesc {
+    var usesBoneScript: Bool {
+        let fields = [visibleScript, alphaScript, colorScript, scaleScript, originScript, angleScript,
+                      ancestorOriginScript, instancedBarsScript]
+        if fields.contains(where: { $0?.usesBones == true }) { return true }
+        if case .script(let script) = text?.kind, script.usesBones { return true }
+        return effects.contains { $0.weScriptsPerPass.contains { $0.values.contains(where: \.usesBones) } }
+    }
     var id: Int
     var name: String
     var sceneObjIndex: Int = .max // scene.json objects 数组下标(WE 按对象序绘制一切;粒子插画锚点用)

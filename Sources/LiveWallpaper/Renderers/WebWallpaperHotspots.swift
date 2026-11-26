@@ -1,156 +1,103 @@
 import WebKit
 
-/// Visible interactive regions in viewport coordinates (top-left origin). A canvas
-/// can contain a whole composition, so its bounds alone cannot identify a target.
+/// A local document may receive desktop input even when the DOM doesn't expose a
+/// discrete target, e.g. a WebGL scene. Only explicit UI signals claim a desktop click.
 enum WebWallpaperHotspots {
-    // null means that the author supplies no point hit test. Such wallpapers can
-    // observe clicks while leaving the desktop as the system event recipient.
-    static let canvasProbe = #"""
-    function canvasHit(target, x, y) {
-        try {
-            // BD2 routes in a document capture listener, even when artwork or a
-            // loading overlay, rather than the Spine canvas, is the DOM event target.
-            if (typeof window.inspectPointerHit === 'function') return window.inspectPointerHit(x, y)?.selectedCandidate != null;
-            if (!(target instanceof HTMLCanvasElement)) return null;
-            const spine = window.__rt5, live2d = window.wallpaperInteraction;
-            if (typeof spine?.hitTest === 'function') return spine.hitTest(x, y) != null;
-            if (typeof live2d?.candidates === 'function') {
-                if (live2d.isBusy?.() || (typeof settings !== 'undefined' && settings.interactive === false)) return false;
-                if (live2d.candidates(x, y).length) return true;
-                return live2d.idle === 0 && !!live2d.hits?.(x, y).some(name =>
-                    /^(touch_head|touch_body|touch_special)$/.test(name) && live2d.manager?.definitions?.[name]);
-            }
-            if (typeof window.hitNameAt === 'function') return window.hitNameAt(x, y) != null;
-            if (document.getElementById('hotspots')?.querySelector('.hotspot[data-hit]')) return false;
-        } catch { return false; } // Models can disappear while the next skin is loading.
-        return null;
+    private struct Hit {
+        var allowed = false
+        var region: CGRect?
     }
-    """#
-
-    private static let script = #"""
-    return (() => {
-        if (location.protocol !== 'lwwp:' || location.hostname !== 'wp') return [];
-        const w = innerWidth, h = innerHeight;
-        if (!(w > 0 && h > 0)) return [];
-        const result = [];
-        const limit = 64;
-        function add(rect, acceptsHit) {
-            const left = Math.max(0, rect.left), top = Math.max(0, rect.top);
-            const right = Math.min(w, rect.right), bottom = Math.min(h, rect.bottom);
-            const width = (right - left) / w, height = (bottom - top) / h;
-            // A backdrop or a canvas-sized fallback is a desktop click, not a specific target.
-            if (!(width > 0 && height > 0 && width * height < 0.95)) return;
-            const hit = document.elementFromPoint((left + right) / 2, (top + bottom) / 2);
-            if (hit && acceptsHit(hit)) result.push([left / w, top / h, width, height]);
-        }
-
-        // Some Spine wallpapers expose their moving mesh bounds in a non-interactive
-        // hint overlay. The canvas beneath those boxes handles the actual click.
-        const overlay = document.getElementById('hotspots');
-        const stage = document.querySelector('canvas#stage');
-        if (overlay && stage && overlay.querySelector('.hotspot[data-hit]')) {
-            const values = window.__lwUserPropertyState?.values;
-            const bool = key => {
-                if (!values?.[key]) return undefined;
-                const [type, value] = JSON.parse(values[key]);
-                if (type !== 'bool') return undefined;
-                return [true, 1, 'true', '1'].includes(value);
-            };
-            const hints = bool('hints');
-            const listener = window.wallpaperPropertyListener;
-            const temporarilyShow = hints === false && overlay.hidden &&
-                typeof listener?.applyUserProperties === 'function';
-            if (bool('interaction') === true && (!overlay.hidden || temporarilyShow)) {
-                try {
-                    // The author computes the boxes only when hints are enabled. Sample and
-                    // restore synchronously, before WebKit can paint a frame or handle input.
-                    if (temporarilyShow) listener.applyUserProperties({ hints: { value: true } });
-                    let visited = 0;
-                    for (const box of overlay.querySelectorAll('.hotspot[data-hit]')) {
-                        if (result.length >= limit || ++visited > 256) break;
-                        if (box.hidden) continue;
-                        add(box.getBoundingClientRect(), hit => hit === stage);
-                    }
-                } finally {
-                    if (temporarilyShow) listener.applyUserProperties({ hints: { value: false } });
-                }
-            }
-        }
-
-        // CardTouch exports expose projected quads as well as point hit testing.
-        // Pre-position stable rectangular targets so a click immediately after a
-        // fast mouse move is caught before the first mouseMoved callback returns.
-        const spine = window.__rt5;
-        if (typeof spine?.touch === 'function' && typeof spine.quad === 'function' && typeof spine.hitTest === 'function') {
-            try {
-                for (const region of spine.touch().slice(0, limit)) {
-                    if (!region.enabled || result.length >= limit) continue;
-                    const q = spine.quad(region.index);
-                    if (!Array.isArray(q) || q.length !== 4) continue;
-                    const xs = q.map(p => p.x), ys = q.map(p => p.y);
-                    const left = Math.min(...xs), top = Math.min(...ys), right = Math.max(...xs), bottom = Math.max(...ys);
-                    // Rotated quads use the cursor hit test below. Their bounding box
-                    // includes corners belonging to the desktop.
-                    if (!q.every(p => Math.min(Math.abs(p.x-left), Math.abs(p.x-right)) < .01 &&
-                                      Math.min(Math.abs(p.y-top), Math.abs(p.y-bottom)) < .01)) continue;
-                    const x = (left + right) / 2, y = (top + bottom) / 2;
-                    if (spine.hitTest(x, y) != null) add({left, top, right, bottom}, hit => hit instanceof HTMLCanvasElement);
-                }
-            } catch { /* Some versions publish the runtime before its meshes are ready. */ }
-        }
-
-        const selector = 'button, a[href], input, select, textarea, summary, [role="button"], [role="link"], [onclick]';
-        let visited = 0;
-        for (const control of document.querySelectorAll(selector)) {
-            if (result.length >= limit || ++visited > 256) break;
-            if (control.matches(':disabled') || control.closest('[inert], [aria-disabled="true"]')) continue;
-            const style = getComputedStyle(control);
-            if (style.pointerEvents === 'none' || style.visibility !== 'visible' || Number(style.opacity) === 0) continue;
-            for (const rect of control.getClientRects()) {
-                if (result.length >= limit) break;
-                add(rect, hit => control.contains(hit));
-            }
-        }
-        // A canvas usually fills the screen. Ask the author's active hit test at the
-        // pointer rather than making its entire bounding box consume desktop clicks.
-        if (Number.isFinite(mouseX) && Number.isFinite(mouseY)) {
-            const x = mouseX * w, y = mouseY * h;
-            const target = document.elementFromPoint(x, y);
-            \#(canvasProbe)
-            let hit = canvasHit(target, x, y) === true;
-            if (!hit && target && !(target instanceof HTMLCanvasElement) && getComputedStyle(target).cursor === 'pointer') {
-                // Widget frameworks often register delegated events on ordinary divs.
-                // Exclude inherited pointer cursors on entire-page wrappers.
-                const box = target.getBoundingClientRect();
-                hit = box.width * box.height > 0 && box.width * box.height < w * h * .95;
-            }
-            if (hit && !result.some(([l,t,width,height]) => mouseX >= l && mouseX < l+width && mouseY >= t && mouseY < t+height))
-                add({left:x-1, top:y-1, right:x+1, bottom:y+1}, el => el === target);
-        }
-        return result;
-    })()
-    """#
 
     static func read(in webView: WKWebView, at point: CGPoint? = nil, completion: @escaping ([CGRect]) -> Void) {
-        guard let url = webView.url, url.scheme == WebRenderer.scheme, url.host == "wp" else {
-            completion([])
-            return
-        }
-        let arguments: [String: Any] = ["mouseX": point.map { $0.x as Any } ?? NSNull(),
-                                        "mouseY": point.map { $0.y as Any } ?? NSNull()]
-        webView.callAsyncJavaScript(script, arguments: arguments, in: nil, in: .page) { [weak webView] result in
-            guard webView?.url == url, case let .success(value) = result, let rows = value as? [[Double]] else {
-                completion([])
-                return
+        guard let point else { completion([]); return }
+        inspect(in: webView, at: point) { hit in completion(hit.region.map { [$0] } ?? []) }
+    }
+
+    static func acceptsInput(in webView: WKWebView, at point: CGPoint, completion: @escaping (Bool) -> Void) {
+        inspect(in: webView, at: point) { hit in completion(hit.allowed) }
+    }
+
+    private static func inspect(in webView: WKWebView, at point: CGPoint, completion: @escaping (Hit) -> Void) {
+        guard let address = webView.url, address.scheme == WebRenderer.scheme, address.host == "wp",
+              (0...1).contains(point.x), (0...1).contains(point.y) else { completion(Hit()); return }
+        // Use WebKit's isolated world. No wallpaper globals, properties or
+        // event handlers are consulted or called to discover a hotspot.
+        webView.callAsyncJavaScript(script, arguments: ["nx": point.x, "ny": point.y],
+                                    in: nil, in: .defaultClient) { [weak webView] result in
+            guard webView?.url == address, case let .success(value) = result,
+                  let row = value as? [Double], !row.isEmpty else { completion(Hit()); return }
+            var hit = Hit(allowed: true)
+            if row.count == 4, row.allSatisfy({ $0.isFinite && (0...1).contains($0) }) {
+                hit.region = CGRect(x: row[0], y: row[1], width: row[2], height: row[3])
             }
-            let rects = rows.prefix(64).compactMap { row -> CGRect? in
-                guard row.count == 4, row.allSatisfy({ $0.isFinite && (0...1).contains($0) }),
-                      row[2] > 0, row[3] > 0, row[2] * row[3] < 0.95 else { return nil }
-                let rect = CGRect(x: row[0], y: row[1], width: row[2], height: row[3])
-                    .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
-                return rect.isEmpty ? nil : rect
-            }
-            completion(rects)
+            completion(hit)
         }
     }
+
+    private static let script = #"""
+    if (location.protocol !== 'lwwp:' || location.hostname !== 'wp' || !(innerWidth && innerHeight)) return [];
+    const viewX = Math.min(nx * innerWidth, innerWidth - 1), viewY = Math.min(ny * innerHeight, innerHeight - 1);
+    const controls = 'button,a[href],area[href],input,select,textarea,summary,audio[controls],video[controls]';
+    const roles = new Set('button link checkbox radio switch slider scrollbar spinbutton combobox textbox searchbox tab option menuitem menuitemcheckbox menuitemradio treeitem'.split(' '));
+    const cursors = new Set('pointer grab grabbing move crosshair ew-resize ns-resize nwse-resize nesw-resize col-resize row-resize'.split(' '));
+
+    // A plain canvas can draw any shape, or implement only hover. Its bounds
+    // don't tell us which pixels handle a click. A changing CSS cursor does.
+    let x = viewX, y = viewY, priority = false, painted = true;
+    let hit = document.elementFromPoint(x, y);
+    for (let depth = 0; hit && depth < 32; depth++) {
+        const win = hit.ownerDocument.defaultView;
+        for (let node = hit; node; node = node.assignedSlot || node.parentElement || node.getRootNode().host) {
+            if (node.matches(':disabled,[inert],[aria-disabled="true"],object,embed,input[type=file]')) return [];
+            if (node.localName === 'label' && node.control?.matches(':disabled,input[type=file]')) return [];
+            const style = win.getComputedStyle(node);
+            if (style.opacity === '0') painted = false;
+            if (style.visibility !== 'visible') continue;
+            if (node.matches(controls) || node.isContentEditable ||
+                (node.localName === 'label' && node.control) || node.getAttribute('role')?.split(/\s+/).some(role => roles.has(role))) priority = true;
+            // Programmatic focus and event listeners on a full-screen background
+            // alone do not distinguish its interactive pixels from empty space.
+            if (node.matches('[tabindex],[onclick],[onpointerdown],[onmousedown],[draggable="true"]')) {
+                const r = node.getBoundingClientRect();
+                if (r.width * r.height < win.innerWidth * win.innerHeight * .95 &&
+                    (node.tabIndex >= 0 || node.matches('[onclick],[onpointerdown],[onmousedown],[draggable="true"]'))) priority = true;
+            }
+        }
+        const shadow = hit.shadowRoot;
+        const inner = shadow?.elementFromPoint(x, y);
+        if (inner && inner !== hit) { hit = inner; continue; }
+
+        if (!hit.matches('iframe,frame')) {
+            const style = win.getComputedStyle(hit);
+            if (style.visibility === 'visible' && style.opacity !== '0' && cursors.has(style.cursor.split(',').pop().trim())) priority = true;
+            if (!priority || !painted) return [1];
+            // This single pointer-sized panel follows WebKit's hit test. It never
+            // covers an entire canvas, a clipped box, or the corners of a rotated control.
+            const l = Math.max(0, viewX - 1), t = Math.max(0, viewY - 1);
+            return [l / innerWidth, t / innerHeight, (Math.min(innerWidth, viewX + 1) - l) / innerWidth,
+                    (Math.min(innerHeight, viewY + 1) - t) / innerHeight];
+        }
+
+        const child = hit.contentDocument;
+        if (!child) return [];  // Cross-origin and opaque sandbox frames.
+        const address = new URL(child.URL);
+        if (!(address.protocol === 'lwwp:' && address.host === 'wp') &&
+            !['about:srcdoc','about:blank'].includes(address.href)) return [];
+        const rect = hit.getBoundingClientRect();
+        if (!(rect.width && rect.height && hit.offsetWidth && hit.offsetHeight)) return [];
+        // Convert from parent viewport into the child viewport. WebKit's coordinate
+        // conversion also accounts for transformed ancestors and the page scroll.
+        let local;
+        if (typeof win.webkitConvertPointFromPageToNode === 'function' && win.WebKitPoint) {
+            local = win.webkitConvertPointFromPageToNode(hit, new win.WebKitPoint(x + win.scrollX, y + win.scrollY));
+        } else {
+            local = {x:(x - rect.left) * hit.offsetWidth / rect.width, y:(y - rect.top) * hit.offsetHeight / rect.height};
+        }
+        const boxStyle = win.getComputedStyle(hit);
+        x = local.x - hit.clientLeft - parseFloat(boxStyle.paddingLeft);
+        y = local.y - hit.clientTop - parseFloat(boxStyle.paddingTop);
+        hit = child.elementFromPoint(x, y);
+    }
+    return [];
+    """#
 }

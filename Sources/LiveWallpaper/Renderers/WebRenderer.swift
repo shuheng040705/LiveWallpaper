@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import WebKit
 import UniformTypeIdentifiers
 
@@ -16,7 +17,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     static let scheme = "lwwp"          // Live Wallpaper Web Project
 
     private var webView: WebWallpaperView?
-    private var desktopInput: WebWallpaperInput?
+    private var desktopInput: WallpaperDesktopInput?
     private var hostPaused = false
     private var mediaSuspended = false
     private var masterMuted = PreferencesStore.shared.isMuted
@@ -24,6 +25,8 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     private var rootURL: URL?           // 壁纸文件夹(资源根)
     private var loadedItem: WallpaperItem?
     private var documentReady = false
+    private var frameRateObserver: AnyCancellable?
+    private var lastFrameRate: Int?
 
     /// 审计修复(#7):进行中的 scheme task 集合 + 已取消标记。WKWebView 在 stop()/导航中断时会调
     ///   webView(_:stop:) 取消进行中的 task;此后再调该 task 的 didReceive/didFinish 会崩。
@@ -77,8 +80,12 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         wv.setValue(false, forKey: "drawsBackground")          // 透明背景(失败也无妨)
         host.addSubview(wv)
         webView = wv
+        frameRateObserver = NotificationCenter.default.publisher(for: UserDefaults.didChangeNotification, object: UserDefaults.standard)
+            .merge(with: NotificationCenter.default.publisher(for: NSApplication.didChangeScreenParametersNotification))
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.applyGeneralProperties() }
         if host.window is DesktopWindow {
-            desktopInput = WebWallpaperInput(webView: wv) { [weak self] in
+            desktopInput = WallpaperDesktopInput(webView: wv) { [weak self] in
                 guard let self else { return false }
                 return self.documentReady && !self.hostPaused
             }
@@ -113,6 +120,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     }
 
     func stop() {
+        frameRateObserver = nil
         desktopInput?.stop()
         desktopInput = nil
         webView?.resetPointer(release: true)
@@ -210,6 +218,8 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         documentReady = true
+        lastFrameRate = nil
+        applyGeneralProperties()
         Log.write("WebRenderer: didFinish \(webView.url?.absoluteString ?? "nil")")
         applyProperties()
         applyMediaVolume()
@@ -222,6 +232,34 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
 
     func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
         Log.write("WebRenderer: didFailProvisional \(error.localizedDescription)")
+    }
+
+    private func applyGeneralProperties() {
+        guard documentReady, let webView else { return }
+        let cap = PreferencesStore.shared.frameRateCap
+        let screen = webView.window?.screen ?? NSScreen.main
+        // Authors commonly calculate 1000 / fps. With no cap, WebKit paints at the display rate.
+        let refreshRate = screen?.maximumFramesPerSecond ?? 60
+        let fps = cap > 0 ? cap : (refreshRate > 0 ? refreshRate : 60)
+        guard fps != lastFrameRate else { return }
+        lastFrameRate = fps
+        webView.callAsyncJavaScript("""
+            const state = window.__lwGeneralPropertyState ??= { revision: 0 };
+            const revision = ++state.revision;
+            for (const delay of [0, 50, 150, 400, 1000, 2500, 5000, 10000, 20000]) {
+                if (delay) await new Promise(resolve => setTimeout(resolve, delay));
+                if (revision !== state.revision) return;
+                const listener = window.wallpaperPropertyListener;
+                if (typeof listener?.applyGeneralProperties === 'function') {
+                    listener.applyGeneralProperties({fps});
+                    return;
+                }
+            }
+            """, arguments: ["fps": fps], in: nil, in: .page) { result in
+            if case .failure(let error) = result {
+                Log.write("WebRenderer: applyGeneralProperties failed: \(error.localizedDescription)")
+            }
+        }
     }
 
     /// 首次派发完整属性，之后只派发变化的项。切换预设或恢复默认无需重新加载网页。
@@ -348,5 +386,18 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
             if let ut = UTType(filenameExtension: ext), let m = ut.preferredMIMEType { return m }
             return "application/octet-stream"
         }
+    }
+}
+
+private extension WallpaperDesktopInput {
+    convenience init(webView: WebWallpaperView, isEnabled: @escaping () -> Bool) {
+        self.init(view: webView, isEnabled: { [weak webView] in
+            isEnabled() && webView?.url?.scheme == WebRenderer.scheme && webView?.url?.host == "wp"
+        }, readHotspots: { [weak webView] point, completion in
+            guard let webView else { completion([]); return }
+            WebWallpaperHotspots.read(in: webView, at: point, completion: completion)
+        }, onPointer: { [weak webView] phase, point, count in
+            webView?.send(phase, at: point, clickCount: count)
+        })
     }
 }

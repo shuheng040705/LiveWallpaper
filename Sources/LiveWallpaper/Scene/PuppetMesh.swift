@@ -26,7 +26,7 @@ enum WEBlinkIrisOcclusion {
 /// (头发/身体待机摇摆、眨眼等),我方在此实现(CPU 蒙皮:每帧求值动画→骨骼矩阵→顶点蒙皮→更新顶点)。
 /// 格式经真实文件(3233141951 头_puppet.mdl)逐字节验证:
 ///  - 顶点 80 字节:pos.xy@[0:8]、骨索引 4×u32@[40:56]、骨权重 4×f32@[56:72]、uv@[72:80]。
-///  - MDLS:u8 + u32(ptr) + u32 boneCount;每骨 = u8 flag + u32 id + i32 parent + u32(=64) + 16×f32 行主序局部 bind 矩阵 + JSON cstr。
+///  - MDLS:u8 + u32(ptr) + u32 boneCount;每骨 = cstr name + u32 id + i32 parent + u32(=64) + 16×f32 行主序局部 bind 矩阵 + JSON cstr。
 ///  - MDLA:u8 + u32(ptr) + u32 animCount;每动画 = u32 id + u32 + cstr name + cstr mode + f32 fps + u32 frameCount + u32 + u32 boneCount + u32;
 ///    然后 boneCount 条轨道,每条 = u32 size + (frameCount+1)×36字节(9 floats TRS:tx,ty,tz,rx,ry,rz,sx,sy,sz,旋转为弧度)+ u32 trailer。
 struct PuppetMesh {
@@ -106,6 +106,7 @@ struct PuppetMesh {
     private let boneIdx: [SIMD4<UInt32>]    // 每顶点 4 根骨索引
     private let boneWt: [SIMD4<Float>]      // 每顶点 4 个权重(和=1)
     // 骨骼:
+    let scriptBones: [SceneBonePose.Bone]
     private let parent: [Int]
     private let localBind: [simd_float4x4]  // 每骨局部 bind(父相对)
     private let worldBind: [simd_float4x4]  // 累乘后的世界 bind
@@ -503,7 +504,7 @@ struct PuppetMesh {
     /// 睁眼(配对眼白 sy≈1)→ 竖向因子 1 → 与 skinLayers 逐元素相同(零回归)。无塌缩眼白/无虹膜骨 → 返回 nil。
     /// 多 animationlayer 合成 local pose(base + additive 叠加;与 skinLayers 同一约定)。
     /// 抽出来是为了 clip 遮挡能在**任意时刻**重求值(扫描全 anim 周期找眼睑最大行程)。
-    private func composedLocalPose(time: Double, layers: [(animId: Int, rate: Float, additive: Bool, hold: Float?)], use3D: Bool) -> [simd_float4x4]? {
+    func composedLocalPose(time: Double, layers: [(animId: Int, rate: Float, additive: Bool, hold: Float?)], use3D: Bool) -> [simd_float4x4]? {
         let nb = parent.count
         var composed: [simd_float4x4]? = nil
         for l in layers {
@@ -1089,7 +1090,7 @@ struct PuppetMesh {
     }
 
     /// 共享顶点蒙皮:skin[b] = world[b]·invBind[b],逐顶点 4 骨加权,输出单位空间 [x,y,u,v]。
-    private func skinVerts(world: [simd_float4x4]) -> [Float] {
+    func skinVerts(world: [simd_float4x4]) -> [Float] {
         let nb = world.count
         var skinned = [SIMD2<Float>](repeating: .zero, count: rawPos.count)
         for i in 0..<rawPos.count {
@@ -1150,7 +1151,7 @@ struct PuppetMesh {
     }
 
     // ============================ 解析 ============================
-    static func parse(_ data: Data, size: SIMD2<Float>) -> PuppetMesh? {
+    static func parse(_ data: Data, size: SIMD2<Float>, readScriptBones: Bool = false) -> PuppetMesh? {
         guard size.x > 0, size.y > 0 else { return nil }
         let b = [UInt8](data)
         let markerSize = 9
@@ -1321,27 +1322,24 @@ struct PuppetMesh {
             }
         }
 
-        // ---- MDLS 骨骼:u8 + u32(ptr) + u32 boneCount;每骨 u8+u32 id+i32 parent+u32(matBytes)+16f 矩阵(行主序)+ JSON cstr ----
+        // ---- MDLS 骨骼:u8 + u32(ptr) + u32 boneCount;每骨 cstr name+u32 id+i32 parent+u32(matBytes)+16f 矩阵(行主序)+ JSON cstr ----
         var parent = [Int](); var localBind = [simd_float4x4]()
+        var scriptBones: [SceneBonePose.Bone] = []
         if let m = mdls {
             let hdrEnd = m + 8 + 1 + 4     // 跳 magic(8) + u8 flag + u32 ptr
             let boneCount = Int(u32(hdrEnd))
-            var o = hdrEnd + 4             // 默认:骨区紧跟头(旧假设,兜底)
-            // 数据锚点定位 bone0(2026-06-15 修头发炸开真因):每骨 = flag1+id4+parent4+matBytes4(=64)+matrix64+cstr(NUL)+
-            //   1字节名字后缀。bone0 是唯一 parent=-1 的根骨 → 字节模式 `FF FF FF FF 40 00 00 00`(parent=-1 + matBytes=64)
-            //   全库唯一。旧解析硬设「骨区紧跟9字节头」,对某些 strand(刘海)/尾巴 puppet 的 bone0 前有 0~2 字节前缀 →
-            //   从错位起 → desync。用锚点定位 bone0 flag(=anchor-5),限定头后小窗(前缀≤8)避免误命中,失败退旧。
-            let strideFix = WPEnv.vars["WP_NO_MDLS_STRIDE_FIX"] == nil
-            let mdlsEnd = mdlaRaw ?? b.count
-            if strideFix, let anchor = findTag([0xFF,0xFF,0xFF,0xFF,0x40,0x00,0x00,0x00], from: hdrEnd + 4),
-               anchor < mdlsEnd, anchor - 5 >= hdrEnd + 4, anchor - 5 <= hdrEnd + 4 + 8 {
-                o = anchor - 5             // bone0 flag = parent锚点 - (flag1+id4)
-            }
+            var o = hdrEnd + 4
+            let mdlsEnd = min(b.count, mdlaRaw ?? b.count)
             if boneCount > 0 && boneCount < 4096 {
-                for bi in 0..<boneCount {
-                    guard o + 13 + 64 <= b.count else { break }
-                    o += 1                 // u8 flag
-                    o += 4                 // u32 id
+                for _ in 0..<boneCount {
+                    // MDLS stores a NUL-terminated author name before the object id (including empty names).
+                    let start = o
+                    while o < mdlsEnd, b[o] != 0 { o += 1 }
+                    guard o < mdlsEnd else { break }
+                    let nameEnd = o
+                    o += 1
+                    guard o + 12 + 64 <= mdlsEnd, u32(o + 8) == 64 else { break }
+                    o += 4 // object id, independent of bone index/name
                     let par = Int(i32(o)); o += 4
                     let matBytes = Int(u32(o)); o += 4   // 通常 64
                     // 16×f32 行主序行向量(平移在行3 [12][13][14])。simd 是列主序列向量(M×v,平移在列3)。
@@ -1357,17 +1355,14 @@ struct PuppetMesh {
                         SIMD4(rm[8], rm[9], rm[10], rm[11]),
                         SIMD4(rm[12], rm[13], rm[14], rm[15])))
                     parent.append(par); localBind.append(mat)
-                    // 跳过 JSON cstr(到 NUL)
-                    while o < b.count && b[o] != 0 { o += 1 }
-                    o += 1                 // 跳 NUL
-                    // stride 自愈(2026-06-15):吃掉 cstr 后的 1 字节名字后缀。若非末根,下一根 matBytes(o+9)应==64,
-                    // 否则逐字节前进(guard≤8)对齐。修「每骨 desync 1 字节 → 第2根 matBytes 读成 16384 → break →
-                    // hasSkin=false → 刘海渲散开 bind 姿态(头顶炸尖刺)而非播 sway 动画 anim707(frame0=自然下垂)」。
-                    // 对已正常解析的 puppet(凯尔希/御剑)下一根本就对齐(u32(o+9)==64)→ 不前进 → 零变化。
-                    if strideFix, bi < boneCount - 1 {
-                        var gd = 0
-                        while o + 13 <= b.count && u32(o + 9) != 64 && gd < 8 { o += 1; gd += 1 }
+                    let jsonStart = o
+                    while o < mdlsEnd, b[o] != 0 { o += 1 }
+                    if readScriptBones {
+                        let name = String(decoding: b[start..<nameEnd], as: UTF8.self)
+                        let metadata = jsonStart < o ? try? JSONSerialization.jsonObject(with: Data(b[jsonStart..<o])) : nil
+                        scriptBones.append(.init(name: name, parent: par, bind: mat, physics: .init(metadata as? [String: Any] ?? [:])))
                     }
+                    if o < mdlsEnd { o += 1 }
                 }
             }
         }
@@ -1588,7 +1583,7 @@ struct PuppetMesh {
         return PuppetMesh(size: size, indices: indices,
                           drawGroups: drawGroups, clippingMasks: clippingMasks,
                           rawPos: rawPos, uv: uv,
-                          boneIdx: bIdx, boneWt: bWt, parent: parent,
+                          boneIdx: bIdx, boneWt: bWt, scriptBones: scriptBones, parent: parent,
                           localBind: localBind, worldBind: worldBind, invBind: invBind,
                           anims: anims, attachments: attachments)
     }

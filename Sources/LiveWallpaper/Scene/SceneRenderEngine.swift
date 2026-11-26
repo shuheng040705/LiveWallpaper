@@ -346,6 +346,7 @@ private struct GPULayer {
     //   clamp 羽化(见 SceneModel.lsUVScale)。非光束层为 nil → 合成走默认 quadBuffer(UV[0,1],零变化)。
     var lsQuadVB: MTLBuffer? = nil
     // puppet 骨骼蒙皮动画(MDLS 骨骼 + MDLA 动画):非 nil 且 hasSkin 时,update() 每帧求值动画→蒙皮→写 puppetVBs 本帧槽。
+    var bonePose: SceneBonePose? = nil
     var puppetMesh: PuppetMesh? = nil
     var puppetAnimId: Int = 0               // animationlayers[].animation(对应 MDLA 动画 id)
     var puppetAnimRate: Float = 1           // animationlayers[].rate(播放速率)
@@ -772,14 +773,19 @@ final class SceneRenderEngine {
     }
 
     private(set) var canvas: SIMD2<Float> = SIMD2(1920, 1080)
+    private var boneLayerIndices: [Int] = []
     private var cursorTargets: [Int] = [] // Layer indices in draw order
     private var cursorScripts: [Int: [WEScript]] = [:]
     private var inputScripts: [WEScript] = []
+    private var viewportScripts: [WEScript] = []
+    private var screenResolution = SIMD2<Float>.zero
     private var sharedCursorRecipients: [WEScript] = []
     private var hoveredLayer: Int?
     private var pressedLayer: Int?
+    private var cursorLeftDown = false
     private var lastScriptPointer: SIMD2<Float>?
-    var hasCursorTargets: Bool { !has3DScene && !cursorTargets.isEmpty }
+    private var lastScriptWorld: SIMD2<Float>?
+    var needsDesktopInput: Bool { !inputScripts.isEmpty || (!has3DScene && !cursorTargets.isEmpty) }
     private(set) var clearColor: MTLClearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
     private var ambientColor: SIMD3<Float> = .zero   // general.ambientcolor(lwe 默认 vec3(0));喂 LIGHTING 材质 g_LightAmbientColor
     private var layers: [GPULayer] = []
@@ -1227,6 +1233,7 @@ final class SceneRenderEngine {
             buildNSL2DHost(source: source, document: document)
             if let h = nsl2DHost { Log.write("NSL2D host: \(h.libraryOK ? "library OK, \(h.registered) layer scripts" : "no NSL library")") }
         }
+        let usesBones = document.layers.contains(where: \.usesBoneScript) || document.logicScripts.contains(where: \.usesBones)
         var result: [GPULayer] = []
         for layer in document.layers {
             // 缺口B:有 visibleScript 的层即使静态 visible=false 也要建(否则脚本永远点不亮);
@@ -1786,6 +1793,7 @@ final class SceneRenderEngine {
             var puppetVBs: [MTLBuffer?] = [nil, nil, nil, nil]   // 4 套轮换(见 GPULayer.puppetVBs 注释)
             var puppetIB: MTLBuffer? = nil, puppetCount = 0
             var puppetAlphaVBs: [MTLBuffer?] = [nil, nil, nil, nil]
+            var bonePose: SceneBonePose?
             var puppetMesh: PuppetMesh? = nil, puppetAnimId = 0, puppetAnimRate: Float = 1
             var puppetDrawGroups: [PuppetMesh.DrawGroup] = []
             var puppetClipStates: [PuppetClipState] = []
@@ -1798,9 +1806,15 @@ final class SceneRenderEngine {
             var eyeOccludeFoldFlag = false     // 3D fold 眼(凯尔希 anim1405)静止虹膜骨兜底收向眼线(睁眼零回归)
             if WPEnv.vars["WP_NOPUPPET"] == nil,
                let pup = layer.puppet, let blob = source.data(for: pup),
-               let parsedMesh = PuppetMesh.parse(blob, size: size), parsedMesh.indices.count >= 3,
+               let parsedMesh = PuppetMesh.parse(blob, size: size, readScriptBones: usesBones), parsedMesh.indices.count >= 3,
                size.x >= 1, size.y >= 1 {
                 var mesh = parsedMesh
+                if usesBones, !mesh.scriptBones.isEmpty {
+                    let pose = SceneBonePose(bones: mesh.scriptBones)
+                    pose.layerToScene = model * simd_float4x4(diagonal: SIMD4(1 / size.x, 1 / size.y, 1, 1))
+                    bonePose = pose
+                    puppetMesh = mesh
+                }
                 // 眼睛层:采样贴图标记「虹膜色」顶点(浅塌缩眼 eyeOcclude 顶点级清残留用,识别侧脸单眼上下两块虹膜)。
                 //   非眼 puppet 也算但 shallowType 不命中=不用(无害)。一次性解码,加载期可接受。
                 if let tp = layer.texturePath, let tblob = source.data(for: tp),
@@ -2069,7 +2083,7 @@ final class SceneRenderEngine {
                 puppetDrawGroups: puppetDrawGroups,
                 puppetClipStates: puppetClipStates,
                 puppetClipByGroup: puppetClipByGroup,
-                puppetMesh: puppetMesh,
+                bonePose: bonePose, puppetMesh: puppetMesh,
                 puppetAnimId: puppetAnimId,
                 puppetAnimRate: puppetAnimRate,
                 scaleScript: layer.scaleScript,
@@ -2737,7 +2751,7 @@ final class SceneRenderEngine {
         !particleGroups.isEmpty || hasVideo || hasEffects || hasText
             || hasScaleScript || hasOriginScript || hasAngleScript || hasAudioBars
             || hasInstancedBars || hasCursorRipple || has3DScene || hasKeyframeAnim || hasCameraAnim
-            || hasPuppetAnim || hasCursorTargets
+            || hasPuppetAnim || !boneLayerIndices.isEmpty || needsDesktopInput
     }
     var isAnimated: Bool { hasParallax || hasContinuousAnimation }
     private var hasScaleScript = false
@@ -3211,7 +3225,6 @@ final class SceneRenderEngine {
     /// cameraParallaxEnabled 只控制 WE 相机视差通道，不能把交互光标一并归中。
     /// 视差位移 = 鼠标影响 × 每层 parallaxDepth(WE 鼠标驱动、静止归中,无自动漂移)。camerashake 不渲染(对齐 lwe)。
     func update(time: Double, mouseNorm: SIMD2<Float>, cameraParallaxEnabled: Bool = true) {
-        updateScriptPointer(SIMD2(mouseNorm.x + 1, 1 - mouseNorm.y) * 0.5)
         guard !layers.isEmpty || !particleGroups.isEmpty else { return }
         let _perfUpdateT0 = perfNow()
         let _perfSkinSnapshot = perfSkin, _perfPartSnapshot = perfPart   // WP_PERF:本帧 skin/part 增量基线
@@ -3243,6 +3256,11 @@ final class SceneRenderEngine {
             if sec != nsl2DLastSecond { nsl2DLastSecond = sec; events = ["secondlyRandom", "clockUpdate"] }
             h.tick(runtime: time, frametime: 1.0 / 60.0, periodicEvents: events)
             if !events.isEmpty { nsl2DRecenterClock(loader: MTKTextureLoader(device: device)) }
+        }
+        for i in boneLayerIndices {
+            guard let mesh = layers[i].puppetMesh, let pose = layers[i].bonePose else { continue }
+            let authored = mesh.composedLocalPose(time: time, layers: layers[i].puppetAnimLayers, use3D: layers[i].puppetUse3D)
+            pose.advance(frameTime: lastFrameTime >= 0 ? time - lastFrameTime : 0, animatedLocal: authored)
         }
         // 单次播放(眨眼)场景级共享调度时钟:眼/睑/眉同步眨。一次播放长度取所有 single-shot 层最长的(各 1s 一致)。
         // 平时停 rest(睁眼),每 ~1.5-4s(等价 WE secondlyRandom)触发播一遍。WP_NO_BLINK_SCHED 退回旧连续循环。
@@ -3295,6 +3313,7 @@ final class SceneRenderEngine {
                 FileHandle.standardError.write("WP_DBG_CAMERA t=\(String(format:"%.2f",t))s f\(String(format:"%.0f",fr)) zoom=\(String(format:"%.3f",zoom)) pan=(\(String(format:"%.1f",dp.x)),\(String(format:"%.1f",dp.y))) pivot=(\(Int(pivot.x)),\(Int(pivot.y)))\n".data(using: .utf8)!)
             }
         }
+        updateScriptPointer(SIMD2(mouseNorm.x + 1, 1 - mouseNorm.y) * 0.5)
         // puppet 骨骼蒙皮动画(MDLS/MDLA):每帧求值动画 → 蒙皮顶点 → 写该层 puppetVBs 本帧槽(真 WE 角色待机
         // 摇摆/形变;lwe 无此功能)。skin() 失败/无骨返回 nil → 不更新 → 维持静态 bind 姿态(零回归)。
         // 默认启用(转置修复后 rest=I 已验证;版本保护只对 MDLS0004/MDLA0006 蒙皮)。WP_NO_PUPPET_ANIM 可临时关。
@@ -4030,6 +4049,20 @@ final class SceneRenderEngine {
         // ⚠ 必须与 isAnimated 共用同一份判据(hasContinuousAnimation),不能各自手抄一份清单——
         //   原来这里的清单相对 isAnimated 漏了 hasInstancedBars / has3DScene(音频条、太阳系轨道在
         //   鼠标静止时冻结),两份清单都漏了 hasPuppetAnim(眨眼/摆动)。共用后不可能再漂移。
+        // SceneScript writes win over authored keyframes on the same displayed frame.
+        for i in boneLayerIndices {
+            guard let mesh = layers[i].puppetMesh, let pose = layers[i].bonePose else { continue }
+            pose.layerToScene = layers[i].baseModel * simd_float4x4(diagonal: SIMD4(1 / mesh.size.x, 1 / mesh.size.y, 1, 1))
+            if pose.hasDeformation, let vb = layers[i].puppetVBs[frameIndex % Self.kBufferRing] {
+                let vertices = mesh.skinVerts(world: pose.world)
+                vertices.withUnsafeBytes { bytes in
+                    if let start = bytes.baseAddress, bytes.count <= vb.length {
+                        vb.contents().copyMemory(from: start, byteCount: bytes.count)
+                    }
+                }
+                pose.didUpload()
+            }
+        }
         let alwaysAnimating = hasContinuousAnimation
         let parallaxMoved = cameraParallax
             && (simd_distance(parallaxDisplacement, dispBefore) > 1e-5
@@ -6701,6 +6734,7 @@ final class SceneRenderEngine {
         cursorScripts.removeAll()
         hoveredLayer = nil
         pressedLayer = nil
+        cursorLeftDown = false
         lastScriptPointer = nil
         var allScripts = logicScripts
         for i in layers.indices {
@@ -6712,19 +6746,25 @@ final class SceneRenderEngine {
                 for pass in effect.weScriptsPerPass { scripts.append(contentsOf: pass.values) }
             }
             allScripts += scripts
-            let authored = scripts.filter { !$0.cursorEvents.isEmpty }
-            if authored.contains(where: \.requiresWritableBones) {
-                addLoadGap("图层「\(layer.name)」使用骨骼拖动或物理冲量，当前场景渲染器仅支持读取骨骼动画。")
-            }
-            let callbacks = authored.filter { !$0.requiresWritableBones }
+            let callbacks = scripts.filter { !$0.cursorEvents.isEmpty }
             if !callbacks.isEmpty && !nonSolidIds.contains(layer.id) {
                 cursorTargets.append(i)
                 cursorScripts[i] = callbacks
             }
         }
+        boneLayerIndices = layers.indices.filter { layers[$0].bonePose != nil }
+        let boneLayers = Dictionary(boneLayerIndices.compactMap { i in layers[i].bonePose.map { (layers[i].id, $0) } },
+                                    uniquingKeysWith: { first, _ in first })
+        var boundBoneScripts = Set<ObjectIdentifier>()
+        for script in allScripts + layers.compactMap(\.ancestorOriginScript)
+            where script.usesBones && boundBoneScripts.insert(ObjectIdentifier(script)).inserted {
+            script.bindBones(boneLayers)
+        }
         for script in allScripts where !script.cursorEvents.isEmpty && script.usesLayerAPI {
             script.setSoundLayerPlayback { [weak audioPlayback] id in audioPlayback?.playFromScript(id: id) }
         }
+        viewportScripts = allScripts
+        screenResolution = .zero
         inputScripts = allScripts.filter(\.readsCursorInput)
         sharedCursorRecipients = allScripts.filter(\.usesShared)
     }
@@ -6781,12 +6821,22 @@ final class SceneRenderEngine {
         return SIMD2(p.x, p.y) / p.w
     }
 
+    func setScreenResolution(_ pixels: SIMD2<Float>) {
+        guard pixels.x > 0, pixels.y > 0, pixels != screenResolution else { return }
+        screenResolution = pixels
+        lastScriptPointer = nil
+        for script in viewportScripts { script.setScreenResolution(pixels) }
+    }
+
     private func updateScriptPointer(_ point: SIMD2<Float>, force: Bool = false) {
-        guard !inputScripts.isEmpty, !has3DScene, force || lastScriptPointer != point else { return }
+        guard !inputScripts.isEmpty, force || lastScriptPointer != point || hasCameraAnim else { return }
+        // SceneScript defines world cursor coordinates only for 2D wallpapers.
+        let world: SIMD2<Float> = has3DScene ? .zero : worldPointer(point)
+        guard force || lastScriptPointer != point || lastScriptWorld != world else { return }
         lastScriptPointer = point
-        let world = worldPointer(point)
-        let screen = point * canvas // engine.screenResolution uses canvas pixels
-        for s in inputScripts { s.setCursorInput(world: world, screen: screen, pressed: pressedLayer != nil) }
+        lastScriptWorld = world
+        let screen = point * (screenResolution == .zero ? canvas : screenResolution)
+        for s in inputScripts { s.setCursorInput(world: world, screen: screen, pressed: cursorLeftDown) }
     }
 
     func routeCursor(_ phase: WallpaperPointerPhase, at point: CGPoint) {
@@ -6816,19 +6866,23 @@ final class SceneRenderEngine {
         }
         switch phase {
         case .down:
+            cursorLeftDown = true
             pressedLayer = hit
             updateScriptPointer(position, force: true)
             hover(hit)
             send(.down, to: hit)
+        case .leave:
+            hover(nil)
         case .drag, .hover:
             updateScriptPointer(position)
             hover(hit)
-            send(.move, to: pressedLayer ?? hit)
+            send(.move, to: hit)
         case .up, .cancel:
             let captured = pressedLayer
+            cursorLeftDown = false
             pressedLayer = nil
             updateScriptPointer(position, force: true)
-            send(.up, to: captured)
+            send(.up, to: phase == .up ? hit : captured)
             if phase == .up, captured == hit { send(.click, to: captured) }
             hover(phase == .up ? hit : nil)
         }
@@ -6846,6 +6900,7 @@ final class SceneRenderEngine {
         // 屏幕适配(lwe 机制):场景渲到**画布长宽比**中间纹理(ndcScale 自动=1,顶点不缩放=无内屏分带),
         // 长宽比裁切/留黑边全挪到最终一次 blit(blitUVScale)。aspectMouse 给下一帧鼠标/视差用。
         let (encW, encH, mNdc, uvS, uvO) = aspectMap(outW: w, outH: h)
+        if aspectMouse != mNdc || blitUVOffset != uvO { lastScriptPointer = nil }
         aspectMouse = mNdc; blitUVScale = uvS; blitUVOffset = uvO
         let lowW = max(2, Int((Double(encW) * scale).rounded())), lowH = max(2, Int((Double(encH) * scale).rounded()))
         // 编码目标:降分辨率时渲到低分纹理(画布长宽比),否则直接渲到画布长宽比呈现纹理。
@@ -6989,6 +7044,7 @@ final class SceneRenderEngine {
         guard let cmd = queue.makeCommandBuffer() else { return false }
         // 屏幕适配(与实时同机制):场景渲到画布长宽比中间纹理(ndcScale=1),再按 uvScale 适配 blit 到目标尺寸。
         let (encW, encH, mNdc, uvS, uvO) = aspectMap(outW: width, outH: height)
+        if aspectMouse != mNdc || blitUVOffset != uvO { lastScriptPointer = nil }
         aspectMouse = mNdc; blitUVScale = uvS; blitUVOffset = uvO
         let interDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: encW, height: encH, mipmapped: false)
         interDesc.usage = [.renderTarget, .shaderRead, .shaderWrite]; interDesc.storageMode = .private
@@ -7077,6 +7133,7 @@ final class SceneRenderEngine {
         guard let target = device.makeTexture(descriptor: desc) else { return false }
         // 屏幕适配(与实时同机制):场景渲到画布长宽比中间纹理,再 uvScale 适配 blit 到 target。
         let (encW, encH, mNdc, uvS, uvO) = aspectMap(outW: width, outH: height)
+        if aspectMouse != mNdc || blitUVOffset != uvO { lastScriptPointer = nil }
         aspectMouse = mNdc; blitUVScale = uvS; blitUVOffset = uvO
         let interDesc = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .bgra8Unorm, width: encW, height: encH, mipmapped: false)
         interDesc.usage = [.renderTarget, .shaderRead]; interDesc.storageMode = .private

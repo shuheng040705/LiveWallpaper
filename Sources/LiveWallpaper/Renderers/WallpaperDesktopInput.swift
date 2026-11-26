@@ -1,20 +1,19 @@
 import AppKit
-import WebKit
 
 /// Desktop clicks are observed in the normal desktop. Stage Manager requires a real
 /// nonactivating event recipient over each hotspot before the mouse goes down.
-final class WebWallpaperInput {
+final class WallpaperDesktopInput {
     private weak var view: NSView?
     private let readHotspots: (CGPoint?, @escaping ([CGRect]) -> Void) -> Void
-    private let onPointer: (WallpaperPointerPhase, CGPoint) -> Void
-    private let observesUnclaimedDesktop: Bool
-    private var onObservedDown: ((CGPoint) -> Void)?
+    private let onPointer: (WallpaperPointerPhase, CGPoint, Int) -> Void
     private let isEnabled: () -> Bool
     private var monitor: Any?
     private var localMovement: Any?
     private var press: CGPoint?
+    private var lastDesktopPoint: CGPoint?
+    private var nextOcclusionCheck = 0.0
     private var timer: Timer?
-    private var panels: [WebWallpaperHotspotPanel] = []
+    private var panels: [WallpaperHotspotPanel] = []
     private var generation = 0
     private var reading = false
     private var nextRead = 0.0
@@ -24,30 +23,15 @@ final class WebWallpaperInput {
         CFPreferencesGetAppBooleanValue("GloballyEnabled" as CFString, "com.apple.WindowManager" as CFString, nil)
     }
 
-    convenience init(webView: WebWallpaperView, isEnabled: @escaping () -> Bool) {
-        self.init(view: webView, isEnabled: { [weak webView] in
-            isEnabled() && webView?.url?.scheme == WebRenderer.scheme && webView?.url?.host == "wp"
-        }, observesUnclaimedDesktop: true, readHotspots: { [weak webView] point, completion in
-            guard let webView else { completion([]); return }
-            WebWallpaperHotspots.read(in: webView, at: point, completion: completion)
-        }, onPointer: { [weak webView] phase, point in
-            webView?.send(phase, at: point)
-        })
-        onObservedDown = { [weak webView] point in
-            webView?.send(.down, at: point, checkCanvasHit: true)
-        }
-    }
-
-    init(view: NSView, isEnabled: @escaping () -> Bool, observesUnclaimedDesktop: Bool = false,
+    init(view: NSView, isEnabled: @escaping () -> Bool,
          readHotspots: @escaping (CGPoint?, @escaping ([CGRect]) -> Void) -> Void,
-         onPointer: @escaping (WallpaperPointerPhase, CGPoint) -> Void) {
+         onPointer: @escaping (WallpaperPointerPhase, CGPoint, Int) -> Void) {
         self.view = view
         self.isEnabled = isEnabled
-        self.observesUnclaimedDesktop = observesUnclaimedDesktop
         self.readHotspots = readHotspots
         self.onPointer = onPointer
-        monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged, .mouseMoved]) { [weak self] event in
-            if event.type == .mouseMoved { self?.hoverChanged(event) }
+        monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged, .mouseMoved, .flagsChanged]) { [weak self] event in
+            if event.type == .mouseMoved || event.type == .flagsChanged { self?.hoverChanged(event) }
             else { self?.handle(event) }
         }
         localMovement = NSEvent.addLocalMonitorForEvents(matching: [.mouseMoved, .flagsChanged]) { [weak self] event in
@@ -73,13 +57,25 @@ final class WebWallpaperInput {
     deinit { stop() }
 
     func invalidateHotspots() {
-        if let press { onPointer(.cancel, press) }
+        if let press { onPointer(.cancel, press, 0) }
         press = nil
         generation &+= 1
         reading = false
         nextRead = 0
         panels.forEach { $0.close() }
         panels.removeAll()
+        leaveDesktop()
+    }
+
+    private func forward(_ phase: WallpaperPointerPhase, at point: CGPoint, clickCount: Int = 1) {
+        if phase != .cancel { lastDesktopPoint = point }
+        onPointer(phase, point, clickCount)
+    }
+
+    private func leaveDesktop() {
+        guard let point = lastDesktopPoint else { return }
+        lastDesktopPoint = nil
+        onPointer(.leave, point, 0)
     }
 
     private var usesHotspots: Bool {
@@ -91,6 +87,15 @@ final class WebWallpaperInput {
     private func refresh(exposedPoint: CGPoint? = nil) {
         guard usesHotspots, let view, let window = view.window else {
             if reading || !panels.isEmpty { invalidateHotspots() }
+            // An app can cover a stationary pointer without generating mouseMoved.
+            // Only check occlusion while a desktop hover actually needs clearing.
+            let now = ProcessInfo.processInfo.systemUptime
+            if lastDesktopPoint != nil, NSEvent.pressedMouseButtons == 0, now >= nextOcclusionCheck {
+                nextOcclusionCheck = now + 0.5
+                if !isEnabled() || view?.window?.isVisible != true || view?.window?.isOnActiveSpace != true || exposedLocation() == nil {
+                    leaveDesktop()
+                }
+            }
             return
         }
         // A moving mesh must not move or replace the window between mouse down and up.
@@ -99,8 +104,10 @@ final class WebWallpaperInput {
         let now = ProcessInfo.processInfo.systemUptime
         guard !reading, now >= nextRead else { return }
         let revision = generation
+        let point = exposedPoint ?? exposedLocation()
+        if point == nil { leaveDesktop() }
         reading = true
-        readHotspots(exposedPoint ?? exposedLocation()) { [weak self, weak view, weak window] rects in
+        let apply: ([CGRect]) -> Void = { [weak self, weak view, weak window] rects in
             guard let self, self.generation == revision else { return }
             self.reading = false
             guard self.usesHotspots, let view, let window, let screen = window.screen else {
@@ -117,21 +124,36 @@ final class WebWallpaperInput {
                 let frame = window.convertToScreen(view.convert(rect, to: nil)).intersection(screen.visibleFrame)
                 return frame.isEmpty ? nil : frame
             }
-            self.nextRead = ProcessInfo.processInfo.systemUptime + (frames.isEmpty ? 0.75 : 0.12)
+            self.nextRead = ProcessInfo.processInfo.systemUptime + (frames.isEmpty && point == nil ? 0.75 : 0.12)
             while self.panels.count > frames.count { self.panels.removeLast().close() }
             for (index, frame) in frames.enumerated() {
                 if index < self.panels.count {
                     self.panels[index].update(frame: frame)
                 } else {
-                    self.panels.append(WebWallpaperHotspotPanel(frame: frame) { [weak self] phase, point in
+                    self.panels.append(WallpaperHotspotPanel(frame: frame) { [weak self] phase, point, count in
                         guard let self, phase == .cancel || self.usesHotspots,
                               let location = self.location(at: point, clamped: true) else { return }
-                        self.onPointer(phase, location)
+                        self.forward(phase, at: location, clickCount: count)
                     })
                 }
             }
             self.updatePanelVisibility()
         }
+        if UserDefaults.standard.bool(forKey: "wallpaperInputPriority") {
+            // Reserve just the exposed cursor position. AppKit keeps delivering the full
+            // gesture after a press even if the cursor leaves this small panel.
+            apply(point.map { [Self.pointerRegion(around: $0, viewSize: view.bounds.size)] } ?? [])
+        } else {
+            readHotspots(point, apply)
+        }
+    }
+
+    static func pointerRegion(around point: CGPoint, viewSize: CGSize) -> CGRect {
+        guard viewSize.width > 0, viewSize.height > 0 else { return .zero }
+        let radiusX = 6 / viewSize.width, radiusY = 6 / viewSize.height
+        return CGRect(x: point.x - radiusX, y: point.y - radiusY,
+                      width: 2 * radiusX, height: 2 * radiusY)
+            .intersection(CGRect(x: 0, y: 0, width: 1, height: 1))
     }
 
     private func updatePanelVisibility() {
@@ -151,14 +173,16 @@ final class WebWallpaperInput {
               event.type == .flagsChanged || event.timestamp >= nextHoverCheck else { return }
         nextHoverCheck = event.timestamp + 0.035
         guard let window = view?.window, window.isVisible, window.isOnActiveSpace, isEnabled(),
-              let screen = window.screen else { return }
-        guard screen.visibleFrame.contains(NSEvent.mouseLocation), let pos = exposedLocation() else { return }
+              let pos = exposedLocation() else {
+            leaveDesktop()
+            return
+        }
+        if event.type == .mouseMoved { forward(.hover, at: pos) }
         if Self.stageManagerEnabled {
             // Re-evaluate the point under a moving cursor even if the last sample was blank.
             nextRead = 0
             refresh(exposedPoint: pos)
         }
-        if observesUnclaimedDesktop && event.type == .mouseMoved { onPointer(.hover, pos) }
     }
 
     private func exposedLocation() -> CGPoint? {
@@ -173,30 +197,29 @@ final class WebWallpaperInput {
         let quartz = cgEvent.location
         let point = CGPoint(x: quartz.x, y: CGDisplayBounds(CGMainDisplayID()).height - quartz.y)
         if event.type == .leftMouseDown {
-            if let press { onPointer(.cancel, press) }
+            if let press { onPointer(.cancel, press, 0) }
             press = nil
-            guard (!Self.stageManagerEnabled || observesUnclaimedDesktop), isEnabled(),
+            guard isEnabled(),
                   let window = view?.window as? DesktopWindow, window.isVisible, window.isOnActiveSpace,
                   let screen = window.screen, screen.visibleFrame.contains(point),
-                  event.clickCount == 1, event.modifierFlags.intersection([.control, .shift, .option, .command]).isEmpty,
+                  event.clickCount > 0, event.modifierFlags.intersection([.control, .shift, .option, .command]).isEmpty,
                   let pos = location(at: point) else { return }
             let target = pid_t(clamping: cgEvent.getIntegerValueField(.eventTargetUnixProcessID))
             guard Self.canRoute(at: point, on: screen, target: target) else { return }
             // A global monitor observes Finder's click. It does not take it away from
             // Stage Manager on full-screen canvases without authored hit geometry.
             press = pos
-            if Self.stageManagerEnabled, let onObservedDown { onObservedDown(pos) }
-            else { onPointer(.down, pos) }
+            forward(.down, at: pos, clickCount: event.clickCount)
             return
         }
         guard let last = press else { return }
         let pos = location(at: point, clamped: true) ?? last
         if event.type == .leftMouseDragged {
             press = pos
-            onPointer(.drag, pos)
+            forward(.drag, at: pos)
         } else if event.type == .leftMouseUp {
             press = nil
-            onPointer(event.modifierFlags.intersection([.control, .shift, .option, .command]).isEmpty ? .up : .cancel, pos)
+            forward(event.modifierFlags.intersection([.control, .shift, .option, .command]).isEmpty ? .up : .cancel, at: pos, clickCount: event.clickCount)
         }
     }
 
@@ -283,17 +306,5 @@ final class WebWallpaperInput {
         var role: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role) == .success else { return nil }
         return role as? String
-    }
-
-    static func dispatch(_ phase: WallpaperPointerPhase, at point: CGPoint, in webView: WKWebView,
-                         completion: ((Any?, Error?) -> Void)? = nil) {
-        guard let wallpaper = webView as? WebWallpaperView else { completion?(false, nil); return }
-        wallpaper.send(phase, at: point, completion: completion)
-    }
-
-    static func dispatchClick(at point: CGPoint, in webView: WKWebView, completion: ((Any?, Error?) -> Void)? = nil) {
-        guard let wallpaper = webView as? WebWallpaperView else { completion?(false, nil); return }
-        wallpaper.send(.down, at: point)
-        wallpaper.send(.up, at: point, completion: completion)
     }
 }

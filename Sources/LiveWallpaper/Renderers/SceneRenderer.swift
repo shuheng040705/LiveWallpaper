@@ -96,7 +96,7 @@ final class SceneRenderer: WallpaperRenderer {
     private var metalLayer: CAMetalLayer?
     private var fallbackImageView: NSView?
     private var hostView: NSView?
-    private var desktopInput: WebWallpaperInput?
+    private var desktopInput: WallpaperDesktopInput?
     private var cursorRevision = UUID() // Protected by renderLock
     private let engine: SceneRenderEngine?
     private var loaded = false
@@ -165,6 +165,7 @@ final class SceneRenderer: WallpaperRenderer {
     // AppKit 窗口几何只在主线程捕获；渲染线程只读这份快照，不碰 NSScreen/NSWindow。
     private let mouseViewportLock = NSLock()
     private var mouseViewportFrame = CGRect.zero
+    private var viewportPixels = SIMD2<Float>.zero
     private var quartzMainDisplayHeight: CGFloat = 0
 
     init() { engine = SceneRenderEngine() }
@@ -177,15 +178,17 @@ final class SceneRenderer: WallpaperRenderer {
             frame = .zero
         }
         let mainHeight = CGDisplayBounds(CGMainDisplayID()).height
+        let pixels = host.convertToBacking(host.bounds).size
         mouseViewportLock.lock()
         mouseViewportFrame = frame
+        viewportPixels = SIMD2(Float(pixels.width), Float(pixels.height))
         quartzMainDisplayHeight = mainHeight
         mouseViewportLock.unlock()
     }
 
-    private func mouseViewportSnapshot() -> (CGRect, CGFloat) {
+    private func mouseViewportSnapshot() -> (frame: CGRect, mainDisplayHeight: CGFloat, pixels: SIMD2<Float>) {
         mouseViewportLock.lock()
-        let snapshot = (mouseViewportFrame, quartzMainDisplayHeight)
+        let snapshot = (mouseViewportFrame, quartzMainDisplayHeight, viewportPixels)
         mouseViewportLock.unlock()
         return snapshot
     }
@@ -522,7 +525,7 @@ final class SceneRenderer: WallpaperRenderer {
         //   转回 AppKit 左下原点 y 向上:y = 主屏高度 - cg.y。CG/AppKit 的全局坐标都以主屏为基准，
         //   不能用“所有屏的 maxY”，否则显示器在主屏上方/下方时会整体错一屏。
         let cgLoc = CGEvent(source: nil)?.location ?? .zero
-        let (mouseViewport, mainDisplayHeight) = mouseViewportSnapshot()
+        let (mouseViewport, mainDisplayHeight, pixels) = mouseViewportSnapshot()
         let mouse = WEMouseViewportMath.appKitPoint(fromQuartz: cgLoc,
                                                     mainDisplayHeight: mainDisplayHeight)
         // 真实交互光标必须始终进入引擎：X-Ray/cursorripple/鼠标粒子并不要求
@@ -540,6 +543,7 @@ final class SceneRenderer: WallpaperRenderer {
         //   loaded=false/metalLayer=nil(正在拆除),本帧不应再用 stale 的 layer 渲染(nextDrawable 可能阻塞/失败)。
         //   锁内重校验当前状态,已拆除则立刻放锁退出。
         guard loaded, metalLayer != nil else { renderLock.unlock(); return }
+        engine.setScreenResolution(pixels)
         engine.update(time: t, mouseNorm: mn, cameraParallaxEnabled: mouseParallaxOn)
         let _tU = _flog ? CACurrentMediaTime() : 0
         // 按需渲染:无连续动画内容、视差已收敛且鼠标未动 → 画面与上帧一致,跳过渲染(空闲 CPU/GPU 趋近 0)。
@@ -618,6 +622,7 @@ final class SceneRenderer: WallpaperRenderer {
         updateDrawableSize()
         // 审计修复 #1:与 frameTick 共用 engine,持锁防竞争。
         renderLock.lock()
+        engine.setScreenResolution(mouseViewportSnapshot().pixels)
         engine.update(time: 0, mouseNorm: SIMD2(0, 0))
         guard let acq = acquireDrawable(layer) else { renderLock.unlock(); return }
         let submitted = engine.render(to: acq.drawable, viewportSize: layer.drawableSize)
@@ -659,13 +664,13 @@ final class SceneRenderer: WallpaperRenderer {
         let revision = UUID()
         renderLock.lock()
         cursorRevision = revision
-        let hasTargets = engine?.hasCursorTargets == true
+        let needsInput = engine?.needsDesktopInput == true
         renderLock.unlock()
-        guard hasTargets, let hostView, hostView.window is DesktopWindow else { return }
-        desktopInput = WebWallpaperInput(view: hostView, isEnabled: { [weak self] in
+        guard needsInput, let hostView, hostView.window is DesktopWindow else { return }
+        desktopInput = WallpaperDesktopInput(view: hostView, isEnabled: { [weak self] in
             guard let self else { return false }
             return self.loaded && !self.isStopped && !self.paused
-        }, observesUnclaimedDesktop: true, readHotspots: { [weak self] point, completion in
+        }, readHotspots: { [weak self] point, completion in
             guard let self, let point else { completion([]); return }
             let accepted = self.frameQueue.async { [weak self] in
                 guard let self else { DispatchQueue.main.async { completion([]) }; return }
@@ -676,7 +681,7 @@ final class SceneRenderer: WallpaperRenderer {
                 DispatchQueue.main.async { completion(frames) }
             }
             if !accepted { completion([]) }
-        }, onPointer: { [weak self] phase, point in
+        }, onPointer: { [weak self] phase, point, _ in
             self?.frameQueue.async { [weak self] in
                 guard let self else { return }
                 self.renderLock.lock()
