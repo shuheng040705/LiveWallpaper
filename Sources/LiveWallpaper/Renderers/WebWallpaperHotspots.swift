@@ -1,7 +1,7 @@
 import WebKit
 
 /// A local document may receive desktop input even when the DOM doesn't expose a
-/// discrete target, e.g. a WebGL scene. Only explicit UI signals claim a desktop click.
+/// discrete target. Only DOM controls, cursor hints or named model hit areas claim a click.
 enum WebWallpaperHotspots {
     private struct Hit {
         var allowed = false
@@ -10,19 +10,18 @@ enum WebWallpaperHotspots {
 
     static func read(in webView: WKWebView, at point: CGPoint? = nil, completion: @escaping ([CGRect]) -> Void) {
         guard let point else { completion([]); return }
-        inspect(in: webView, at: point) { hit in completion(hit.region.map { [$0] } ?? []) }
+        inspect(in: webView, at: point, needsRegion: true) { hit in completion(hit.region.map { [$0] } ?? []) }
     }
 
     static func acceptsInput(in webView: WKWebView, at point: CGPoint, completion: @escaping (Bool) -> Void) {
-        inspect(in: webView, at: point) { hit in completion(hit.allowed) }
+        inspect(in: webView, at: point, needsRegion: false) { hit in completion(hit.allowed) }
     }
 
-    private static func inspect(in webView: WKWebView, at point: CGPoint, completion: @escaping (Hit) -> Void) {
+    private static func inspect(in webView: WKWebView, at point: CGPoint, needsRegion: Bool, completion: @escaping (Hit) -> Void) {
         guard let address = webView.url, address.scheme == WebRenderer.scheme, address.host == "wp",
               (0...1).contains(point.x), (0...1).contains(point.y) else { completion(Hit()); return }
-        // Use WebKit's isolated world. No wallpaper globals, properties or
-        // event handlers are consulted or called to discover a hotspot.
-        webView.callAsyncJavaScript(script, arguments: ["nx": point.x, "ny": point.y],
+        // DOM eligibility and the maximum panel size are decided in the isolated world.
+        webView.callAsyncJavaScript(script, arguments: ["nx": point.x, "ny": point.y, "needsRegion": needsRegion],
                                     in: nil, in: .defaultClient) { [weak webView] result in
             guard webView?.url == address, case let .success(value) = result,
                   let row = value as? [Double], !row.isEmpty else { completion(Hit()); return }
@@ -30,9 +29,99 @@ enum WebWallpaperHotspots {
             if row.count == 4, row.allSatisfy({ $0.isFinite && (0...1).contains($0) }) {
                 hit.region = CGRect(x: row[0], y: row[1], width: row[2], height: row[3])
             }
+            // Only an unobstructed canvas in the main document can request the model test.
+            if row.count == 6 {
+                let region = CGRect(x: row[0], y: row[1], width: row[2], height: row[3])
+                webView?.callAsyncJavaScript("""
+                    return window.__lwLive2DNamedHit?.(nx, ny, u, v) === true;
+                    """, arguments: ["nx": point.x, "ny": point.y, "u": row[4], "v": row[5]],
+                    in: nil, in: .page) { [weak webView] result in
+                    guard webView?.url == address else { completion(Hit()); return }
+                    if case let .success(answer) = result, (answer as? Bool) == true { hit.region = region }
+                    completion(hit)
+                }
+                return
+            }
             completion(hit)
         }
     }
+
+    /// Register with Pixi while its script loads so module-local applications are found
+    /// without inspecting the wallpaper's controllers or invoking its tap handlers.
+    static func install(in controller: WKUserContentController) {
+        controller.addUserScript(WKUserScript(source: live2DScript, injectionTime: .atDocumentStart,
+                                              forMainFrameOnly: true))
+    }
+
+    private static let live2DScript = #"""
+    (() => {
+        if (location.protocol !== 'lwwp:' || location.host !== 'wp') return;
+        const own = (object, key) => object == null ? undefined : Object.getOwnPropertyDescriptor(object, key)?.value;
+        const apps = new WeakMap(), registered = new WeakSet();
+        const canvasFor = app => own(own(app, 'renderer'), 'view');
+        function remember(app) {
+            const canvas = canvasFor(app);
+            if (canvas instanceof HTMLCanvasElement) apps.set(canvas, app);
+        }
+        function register() {
+            const Application = own(own(window, 'PIXI'), 'Application');
+            const add = own(Application, 'registerPlugin');
+            if (typeof add !== 'function' || registered.has(Application)) return;
+            registered.add(Application);
+            add.call(Application, {
+                init() { remember(this); },
+                destroy() {
+                    const canvas = canvasFor(this);
+                    if (apps.get(canvas) === this) apps.delete(canvas);
+                }
+            });
+        }
+        document.addEventListener('load', e => { if (e.target instanceof HTMLScriptElement) register(); }, true);
+        document.addEventListener('DOMContentLoaded', register, {once:true});
+        let lastDiscovery = -Infinity;
+        function namedHit(nx, ny, u, v) {
+            const canvas = document.elementFromPoint(nx * innerWidth, ny * innerHeight);
+            if (!(canvas instanceof HTMLCanvasElement)) return false;
+            const pixi = own(window, 'PIXI'), Model = own(own(pixi, 'live2d'), 'Live2DModel');
+            const modelPrototype = own(Model, 'prototype'), hitTest = own(modelPrototype, 'hitTest');
+            if (typeof hitTest !== 'function') return false;
+            // A single bundle can construct its app before the script's load event.
+            // Discover already published Pixi instances using data descriptors only.
+            if (!apps.has(canvas) && performance.now() - lastDiscovery >= 1000) {
+                lastDiscovery = performance.now();
+                const prototype = own(own(pixi, 'Application'), 'prototype');
+                if (prototype) for (const key of Object.keys(window)) {
+                    const value = own(window, key);
+                    if (value && typeof value === 'object' && own(value, 'stage') && own(value, 'renderer')
+                        && Object.prototype.isPrototypeOf.call(prototype, value)) remember(value);
+                }
+            }
+            const app = apps.get(canvas);
+            if (!app || canvasFor(app) !== canvas) return false;
+            const screen = own(own(app, 'renderer'), 'screen');
+            const x = u * own(screen, 'width'), y = v * own(screen, 'height');
+            if (!Number.isFinite(x) || !Number.isFinite(y)) return false;
+            const stack = [own(app, 'stage')];
+            for (let visited = 0; stack.length && visited < 2048; visited++) {
+                const object = stack.pop();
+                if (!object || own(object, 'visible') === false || own(object, 'renderable') === false
+                    || own(object, 'alpha') === 0 || own(object, 'worldAlpha') === 0) continue;
+                if (Object.prototype.isPrototypeOf.call(modelPrototype, object)) {
+                    const names = hitTest.call(object, x, y);
+                    if (Array.isArray(names) && names.some(name => typeof name === 'string' && name.length)) return true;
+                }
+                const children = own(object, 'children');
+                if (Array.isArray(children)) {
+                    const remaining = 2048 - visited - stack.length;
+                    for (let i = Math.max(0, children.length - remaining); i < children.length; i++)
+                        stack.push(own(children, i));
+                }
+            }
+            return false;
+        }
+        Object.defineProperty(window, '__lwLive2DNamedHit', {value: namedHit});
+    })();
+    """#
 
     private static let script = #"""
     if (location.protocol !== 'lwwp:' || location.hostname !== 'wp' || !(innerWidth && innerHeight)) return [];
@@ -70,12 +159,21 @@ enum WebWallpaperHotspots {
         if (!hit.matches('iframe,frame')) {
             const style = win.getComputedStyle(hit);
             if (style.visibility === 'visible' && style.opacity !== '0' && cursors.has(style.cursor.split(',').pop().trim())) priority = true;
-            if (!priority || !painted) return [1];
+            if (!painted || style.visibility !== 'visible') return [1];
             // This single pointer-sized panel follows WebKit's hit test. It never
             // covers an entire canvas, a clipped box, or the corners of a rotated control.
             const l = Math.max(0, viewX - 1), t = Math.max(0, viewY - 1);
-            return [l / innerWidth, t / innerHeight, (Math.min(innerWidth, viewX + 1) - l) / innerWidth,
-                    (Math.min(innerHeight, viewY + 1) - t) / innerHeight];
+            const panel = [l / innerWidth, t / innerHeight, (Math.min(innerWidth, viewX + 1) - l) / innerWidth,
+                           (Math.min(innerHeight, viewY + 1) - t) / innerHeight];
+            if (priority) return panel;
+            if (!needsRegion || hit.getRootNode() !== document || !(hit instanceof HTMLCanvasElement)) return [1];
+            // Convert into the CSS content box before scaling to Pixi's logical screen.
+            // This accounts for scroll, transformed ancestors, Retina and render resolution.
+            const box = win.webkitConvertPointFromPageToNode(hit, new win.WebKitPoint(x + win.scrollX, y + win.scrollY));
+            const px = parseFloat(style.paddingLeft), py = parseFloat(style.paddingTop);
+            const u = (box.x - hit.clientLeft - px) / (hit.clientWidth - px - parseFloat(style.paddingRight));
+            const v = (box.y - hit.clientTop - py) / (hit.clientHeight - py - parseFloat(style.paddingBottom));
+            return u >= 0 && u < 1 && v >= 0 && v < 1 ? [...panel, u, v] : [1];
         }
 
         const child = hit.contentDocument;

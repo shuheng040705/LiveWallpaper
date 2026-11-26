@@ -4,6 +4,87 @@ import XCTest
 
 final class WebWallpaperHotspotsTests: XCTestCase {
     @MainActor
+    func testLive2DNamedHitsUseOnlyTheVisibleModelInThePaintedCanvas() async throws {
+        _ = NSApplication.shared
+        let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        try FileManager.default.createDirectory(at: folder, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: folder) }
+        // The private app has no global instance to discover. Like Pixi, it invokes the
+        // registered Application plugins after its renderer and stage are available.
+        let framework = """
+            window.PIXI = { Application: class {
+                static plugins = [];
+                static registerPlugin(plugin) { this.plugins.push(plugin); }
+                constructor(canvas) {
+                    this.renderer = {view:canvas, screen:{width:100, height:50}};
+                    this.stage = {children:[]};
+                    for (const p of PIXI.Application.plugins) p.init.call(this);
+                }
+            }, live2d: { Live2DModel: class {
+                hitTest(x,y) { return x > 53 && x < 57 && y > 23 && y < 27 ? ['face'] : []; }
+            }}};
+            """
+        let html = """
+            <!doctype html><style>body{margin:0}
+            #c{position:absolute;left:12px;top:14px;width:200px;height:100px;padding:6px;border:4px solid;
+               transform:scale(1.5);transform-origin:top left}
+            #other{position:absolute;left:350px;top:0;width:45px;height:50px}
+            #cover{position:absolute;left:180px;top:95px;width:28px;height:22px}</style>
+            <canvas id=c width=600 height=300></canvas><canvas id=other></canvas><button id=cover disabled hidden>X</button>
+            <script src="framework.js"></script><script>
+            window.getterReads = 0;
+            (function() {
+                const app = new PIXI.Application(c), model = new PIXI.live2d.Live2DModel();
+                Object.defineProperty(model,'hitTest',{get(){getterReads++;throw Error();}});
+                app.stage.children.push({visible:true,children:[model]});
+                window.showBranch = value => { app.stage.children[0].visible = value; };
+                Object.defineProperty(window,'privateController',{enumerable:true,get(){getterReads++;throw Error();}});
+            })();
+            </script>
+            """
+        try Data(html.utf8).write(to: folder.appendingPathComponent("index.html"))
+        try Data(framework.utf8).write(to: folder.appendingPathComponent("framework.js"))
+        let panel = NSPanel(contentRect: CGRect(x: -4000, y: -4000, width: 400, height: 200),
+                            styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
+        panel.isReleasedWhenClosed = false
+        panel.ignoresMouseEvents = true
+        panel.orderBack(nil)
+        let renderer = WebRenderer()
+        defer { renderer.stop(); panel.close() }
+        renderer.attach(to: try XCTUnwrap(panel.contentView))
+        let web = try XCTUnwrap(panel.contentView?.subviews.compactMap { $0 as? WebWallpaperView }.first)
+        renderer.load(WallpaperItem(id: folder.lastPathComponent, folderURL: folder, title: "Model fixture",
+                                    type: .web, fileName: "index.html", previewName: nil, tags: []))
+        let deadline = Date().addingTimeInterval(8)
+        while (try? await web.evaluateJavaScript("typeof showBranch === 'function'") as? Bool) != true {
+            guard Date() < deadline else { return XCTFail("Model fixture did not load") }
+            try await Task.sleep(nanoseconds: 25_000_000)
+        }
+        func regions(_ x: CGFloat, _ y: CGFloat) async -> [CGRect] {
+            await withCheckedContinuation { c in
+                WebWallpaperHotspots.read(in: web, at: CGPoint(x: x / 400, y: y / 200)) { c.resume(returning: $0) }
+            }
+        }
+        let hit = await regions(192, 104)
+        let region = try XCTUnwrap(hit.first)
+        XCTAssertTrue(region.contains(CGPoint(x: 192.0/400, y: 104.0/200)))
+        XCTAssertLessThanOrEqual(region.width * 400, 2.001)
+        XCTAssertLessThanOrEqual(region.height * 200, 2.001)
+        for (x, y) in [(100,100), (370,20), (14,18)] {
+            let miss = await regions(CGFloat(x), CGFloat(y))
+            XCTAssertTrue(miss.isEmpty)
+        }
+        _ = try await web.evaluateJavaScript("showBranch(false)")
+        let hidden = await regions(192, 104)
+        XCTAssertTrue(hidden.isEmpty)
+        _ = try await web.evaluateJavaScript("showBranch(true); cover.hidden = false")
+        let covered = await regions(192, 104)
+        XCTAssertTrue(covered.isEmpty)
+        let reads = try await web.evaluateJavaScript("getterReads") as? Int
+        XCTAssertEqual(reads, 0)
+    }
+
+    @MainActor
     func testStandardTargetsAndNativeInputAcrossLocalDocuments() async throws {
         _ = NSApplication.shared
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)

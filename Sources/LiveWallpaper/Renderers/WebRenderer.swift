@@ -52,6 +52,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         config.mediaTypesRequiringUserActionForPlayback = []   // 允许自动播放
         config.setURLSchemeHandler(self, forURLScheme: Self.scheme)
         WebMediaCapturePolicy.install(into: config.userContentController)
+        WebWallpaperHotspots.install(in: config.userContentController)
         config.userContentController.addUserScript(WKUserScript(source: WebWallpaperMedia.script,
             injectionTime: .atDocumentStart, forMainFrameOnly: true))
 
