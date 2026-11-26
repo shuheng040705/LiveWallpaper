@@ -134,6 +134,93 @@ final class SteamWorkshopMenuLayoutTests: XCTestCase {
         XCTAssertEqual(restored as? Bool, true)
     }
 
+    func testBrowseSortAndSearchScopeMenusUseTheirSteamAnchors() async throws {
+        let config = WKWebViewConfiguration()
+        config.websiteDataStore = .nonPersistent()
+        SteamWorkshopMenuLayout.install(in: config.userContentController)
+        let web = WKWebView(frame: CGRect(x: 0, y: 0, width: 920, height: 640), configuration: config)
+        web.loadHTMLString("""
+            <style>
+              body { margin:0; height:1800px }
+              #bar { margin-top:400px; display:flex; justify-content:space-between; padding:0 30px }
+              [role=button] { height:36px; width:150px }
+              .positioner { inset:0; margin:auto; border:0; padding:0; width:250px; height:150px }
+              .positioner:not([popover]):not([class~=":popover-open"]) { display:none }
+              [role=radio] { height:30px }
+            </style>
+            <div id="bar">
+              <div><form><input name="SearchInput"></form>
+                <div class="Panel" id="scope" role="button" tabindex="0">⚙</div>
+                <div class="positioner" data-floating-ui-focusable style="position:fixed;left:0;top:0"><div>
+                  <div role="radiogroup" data-param="search_text_target">
+                    <div role="radio" data-radio-id="0">标题与描述</div>
+                    <div role="radio" data-radio-id="1">仅限标题</div>
+                    <div role="radio" data-radio-id="2">仅限描述</div>
+                  </div>
+                </div></div>
+              </div>
+              <div><div class="Panel" id="sort" role="button" tabindex="0">最热门（1 周）</div>
+                <div class="positioner" data-floating-ui-focusable style="position:fixed;left:0;top:0"><div><div class="Panel">
+                  <div role="radiogroup" data-param="browsesort">
+                    <div role="radio" data-radio-id="trend">最热门</div>
+                    <div role="radio" data-radio-id="mostrecent">最新</div>
+                  </div>
+                  <div role="radiogroup" data-param="days"><div role="radio" data-radio-id="7">1 周</div></div>
+                </div></div></div>
+              </div>
+            </div>
+            <div id="modal" popover="manual" style="position:fixed;width:80px;height:40px;
+              margin:auto;inset:0;border:0;padding:0" role="dialog"><div role="radiogroup">
+              <div role="radio" data-radio-id="other">Other</div></div></div>
+            <script>
+              document.addEventListener('click', event => {
+                const radio = event.target.closest('[role=radio]');
+                if (radio) {
+                  const u = new URL(location.href);
+                  u.searchParams.set(radio.parentElement.dataset.param, radio.dataset.radioId);
+                  history.replaceState(null, '', u);
+                }
+              });
+            </script>
+            """, baseURL: URL(string: "https://steamcommunity.com/workshop/browse/?appid=431960&searchtext=test"))
+        for _ in 0..<100 where web.isLoading { try await Task.sleep(for: .milliseconds(30)) }
+        let nativePopover = try await web.evaluateJavaScript("typeof HTMLElement.prototype.showPopover === 'function'") as? Bool
+        for native in (nativePopover == true ? [false, true] : [false]) {
+            for (id, parameter, value) in [("sort", "browsesort", "mostrecent"), ("scope", "search_text_target", "1")] {
+                let result = try await web.callAsyncJavaScript("""
+                    const button = document.getElementById(id), menu = button.nextElementSibling;
+                    if (native) { menu.setAttribute('popover', 'manual'); menu.showPopover(); }
+                    else menu.classList.add(':popover-open');
+                    const index = Array.from(menu.querySelectorAll('[role=radio]')).findIndex(r => r.dataset.radioId === value);
+                    const selected = [];
+                    for (const scroll of [250, 350]) {
+                      window.scrollTo(0, scroll);
+                      const rect = button.getBoundingClientRect();
+                      const left = id === 'sort' ? rect.right - menu.offsetWidth : rect.left;
+                      menu.style.transform = 'translate(' + left + 'px,' + rect.bottom + 'px)';
+                      const hit = document.elementFromPoint(left + 12, rect.bottom + index * 30 + 12);
+                      selected.push(hit?.closest('[role=radio]')?.dataset.radioId ?? '');
+                      hit?.click();
+                    }
+                    if (native) { menu.hidePopover(); menu.removeAttribute('popover'); }
+                    else menu.classList.remove(':popover-open');
+                    const query = new URL(location.href).searchParams;
+                    return [...selected, query.get(parameter) ?? '', query.get('searchtext') ?? ''];
+                    """, arguments: ["id": id, "parameter": parameter, "value": value, "native": native],
+                    in: nil, contentWorld: .page)
+                XCTAssertEqual(result as? [String], [value, value, value, "test"], "\(id), native popover: \(native)")
+            }
+        }
+        if nativePopover == true {
+            let centered = try await web.evaluateJavaScript("""
+                modal.showPopover();
+                const r = modal.getBoundingClientRect();
+                [r.left, r.top]
+                """) as? [Double]
+            XCTAssertEqual(centered, [420, 300], "A centered modal with radio controls keeps its own placement")
+        }
+    }
+
     private func checkFallbackPosition(in web: WKWebView) async throws {
         var measured: [Double] = []
         for _ in 0..<35 {

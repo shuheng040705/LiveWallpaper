@@ -1,6 +1,6 @@
 import WebKit
 
-/// Keep Steam's floating filter list in the WebKit viewport coordinate system.
+/// Keep Steam's floating Workshop menus aligned with their controls.
 enum SteamWorkshopMenuLayout {
     static func install(in controller: WKUserContentController) {
         controller.addUserScript(WKUserScript(source: script, injectionTime: .atDocumentStart,
@@ -18,7 +18,10 @@ enum SteamWorkshopMenuLayout {
         // and Steam's compatibility stylesheet can center the box a second time.
         const style = document.createElement("style");
         style.textContent = `
-            [role="listbox"][popover], [role="listbox"][class~=":popover-open"] {
+            /* Filters are listboxes. Sort and search options are radio groups
+               inside a separate Floating UI positioner. */
+            [role="listbox"]:is([popover], [class~=":popover-open"]),
+            [data-floating-ui-focusable]:is([popover="manual"], [class~=":popover-open"]):has([role="radiogroup"]) {
                 margin: 0 !important;
                 right: auto !important;
                 bottom: auto !important;
