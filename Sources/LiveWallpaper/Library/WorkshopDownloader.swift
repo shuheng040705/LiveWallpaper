@@ -338,12 +338,17 @@ final class WorkshopDownloader: ObservableObject {
             // → 同 id 若处于可重来的终态(失败/取消),直接转交 retry 复用该条目重新排队。
             if let i = self.jobs.firstIndex(where: { $0.id == id }) {
                 switch self.jobs[i].state {
+                case .done:
+                    // Steam may have removed the files since this history entry finished.
+                    let root = self.libraryDirectoryOverride ?? PreferencesStore.shared.libraryRoot
+                    guard !LocalWallpaperProbe.isReady(at: root.appendingPathComponent(id)) else { return }
+                    fallthrough
                 case .failed, .cancelled:
                     self.jobs[i].preferSteamClient = preferSteamClient
                     self.jobs[i].expectedSteamID64 = expectedSteamID64
                     self.retryLocked(index: i, waitForSubscription: waitForSubscription)
                 default:
-                    break   // 排队中/下载中/已完成待移除:忽略重复请求(现状行为)
+                    break   // 正在排队或传输，复用现有任务。
                 }
                 return
             }

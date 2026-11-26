@@ -89,6 +89,14 @@ final class WorkshopSubscriptions: ObservableObject {
         else { toggle(item) }
     }
 
+    /// Recover a previously missed subscription only from an authenticated item response.
+    /// An existing transfer or explicit local cancellation keeps its own retry policy.
+    func recoverMissingWebsiteDownload(_ item: WorkshopWallpaper, hasDownloadRecord: Bool) {
+        guard item.isSubscribed == true, !hasDownloadRecord, overrides[item.id] == nil,
+              operations[item.id] == nil, !environment.installed(item.id) else { return }
+        confirmedWebsiteChange(item, subscribed: true)
+    }
+
     /// Steam has confirmed the change, so only the local registry, transfer and files need updating.
     func confirmedWebsiteChange(_ item: WorkshopWallpaper, subscribed: Bool) {
         guard WallpaperUninstallPolicy.isSteamWorkshopID(item.id) else { return }

@@ -179,9 +179,8 @@ enum SteamSubscription {
         // 同名旧 Cookie 不能同时进请求头。sessionid 必须与 POST body 完全一致；若 header 里出现
         // 两份不同值，Steam 会返回未登录/CSRF 失败，看起来像“Cookie 过一会儿失效”。
         let sessionCandidates = steam.filter { $0.name == "sessionid" && !$0.value.isEmpty }
-        let loginCandidates = steam.filter { $0.name.hasPrefix("steamLoginSecure") && !$0.value.isEmpty }
         guard let session = preferredCookie(sessionCandidates),
-              let login = preferredCookie(loginCandidates, preferredExactName: "steamLoginSecure") else {
+              let login = communityLoginCookie(in: cookies) else {
             return nil
         }
         return AuthenticatedSession(
@@ -190,6 +189,16 @@ enum SteamSubscription {
             cookies: [session, login],
             steamID64: steamID64(fromSecureCookieValue: login.value)
         )
+    }
+
+    // Authenticated reads only need the login cookie. A missing CSRF sessionid
+    // prevents a native POST, but Steam can still confirm a subscription in its page.
+    static func communityLoginCookie(in cookies: [HTTPCookie]) -> HTTPCookie? {
+        let candidates = cookies.filter {
+            $0.domain.trimmingCharacters(in: CharacterSet(charactersIn: ".")).lowercased() == "steamcommunity.com"
+                && $0.name.hasPrefix("steamLoginSecure") && !$0.value.isEmpty
+        }
+        return preferredCookie(candidates, preferredExactName: "steamLoginSecure")
     }
 
     private static func preferredCookie(

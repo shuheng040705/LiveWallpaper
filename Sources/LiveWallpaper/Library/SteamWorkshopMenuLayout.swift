@@ -23,6 +23,14 @@ enum SteamWorkshopMenuLayout {
                 right: auto !important;
                 bottom: auto !important;
             }
+            /* Steam's browse sidebar blurs the backdrop, creating a fixed-position
+               containing block for its in-page popover fallback. Its translate()
+               is already relative to the viewport. Release the containing block
+               while the list is open so scrolling only moves it once. */
+            .Panel:has([role="listbox"][class~=":popover-open"]) {
+                -webkit-backdrop-filter: none !important;
+                backdrop-filter: none !important;
+            }
         `;
         if (document.documentElement) document.documentElement.appendChild(style);
         else document.addEventListener("DOMContentLoaded", () => document.head.appendChild(style), { once: true });

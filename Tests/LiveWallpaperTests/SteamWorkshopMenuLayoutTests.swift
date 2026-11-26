@@ -78,6 +78,62 @@ final class SteamWorkshopMenuLayoutTests: XCTestCase {
         XCTAssertEqual(unrelated, [716, 379])
     }
 
+    func testScrollingFilteredBrowseKeepsSidebarMenuAttachedInBothDirections() async throws {
+        let configuration = WKWebViewConfiguration()
+        configuration.websiteDataStore = .nonPersistent()
+        SteamWorkshopMenuLayout.install(in: configuration.userContentController)
+        let web = WKWebView(frame: CGRect(x: 0, y: 0, width: 900, height: 580), configuration: configuration)
+        web.loadHTMLString("""
+            <style>
+              body { margin:0; height:2600px }
+              .Panel { margin:200px 0 0 24px; width:300px; height:1500px;
+                       backdrop-filter:blur(2px); -webkit-backdrop-filter:blur(2px) }
+              .filter { padding:560px 10px 0 }
+              #trigger { width:280px; height:36px }
+              #menu { display:none; position:fixed; top:0; left:0; width:280px; height:132px }
+              #menu[class~=":popover-open"] { display:block }
+              [role="option"] { height:33px }
+            </style>
+            <div class="Panel"><div class="filter">
+              <div role="combobox" id="trigger" aria-controls="menu">Age Rating</div>
+              <div role="listbox" id="menu"><div role="option" id="everyone">Everyone</div></div>
+            </div></div>
+            <script>
+              const trigger = document.getElementById('trigger'), menu = document.getElementById('menu');
+              function place() {
+                const r = trigger.getBoundingClientRect();
+                const y = r.bottom + 2 + menu.offsetHeight <= innerHeight ? r.bottom + 2 : r.top - 2 - menu.offsetHeight;
+                menu.style.transform = 'translate(' + r.left + 'px,' + y + 'px)';
+              }
+              window.addEventListener('scroll', place);
+            </script>
+            """, baseURL: URL(string: "https://steamcommunity.com/workshop/browse/?appid=431960&requiredtags%5B%5D=Questionable"))
+        for _ in 0..<100 where web.isLoading { try await Task.sleep(for: .milliseconds(30)) }
+        _ = try await web.evaluateJavaScript("menu.classList.add(':popover-open'); true")
+        for scroll in [440, 540, 280, 500] {
+            let values = try await web.evaluateJavaScript("""
+                (() => {
+                    window.scrollTo(0, \(scroll)); place();
+                    const b = trigger.getBoundingClientRect(), m = menu.getBoundingClientRect();
+                    const hit = document.elementFromPoint(m.left + 10, m.top + 10);
+                    return [scrollY, m.left - b.left, m.top - b.bottom, b.top - m.bottom,
+                            hit?.id === 'everyone' ? 1 : 0];
+                })()
+                """)
+            let position = try XCTUnwrap(values as? [Double])
+            XCTAssertEqual(position[0], Double(scroll), accuracy: 0.5)
+            XCTAssertEqual(position[1], 0, accuracy: 0.5)
+            XCTAssertEqual(scroll == 280 ? position[3] : position[2], 2, accuracy: 0.5)
+            XCTAssertEqual(position[4], 1)
+        }
+        let restored = try await web.evaluateJavaScript("""
+            menu.classList.remove(':popover-open');
+            getComputedStyle(menu.closest('.Panel')).getPropertyValue('-webkit-backdrop-filter') === 'blur(2px)' ||
+                getComputedStyle(menu.closest('.Panel')).backdropFilter === 'blur(2px)'
+            """)
+        XCTAssertEqual(restored as? Bool, true)
+    }
+
     private func checkFallbackPosition(in web: WKWebView) async throws {
         var measured: [Double] = []
         for _ in 0..<35 {

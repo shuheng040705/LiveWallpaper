@@ -67,6 +67,35 @@ final class WorkshopDownloaderTests: XCTestCase {
     }
 
     @MainActor
+    func testNewSubscriptionCanRestoreFilesDespiteCompletedDownloadHistory() throws {
+        let (client, root) = try makeDownloaderFixture()
+        defer { client.shutdown(); try? FileManager.default.removeItem(at: root) }
+        let id = "1234567890"
+        let installed = root.appendingPathComponent("library").appendingPathComponent(id)
+        try Data().write(to: root.appendingPathComponent("release." + id))
+        func requestAndWaitForInstall() {
+            let done = expectation(description: "A new download installs the wallpaper")
+            var finished = false
+            var enqueued = false
+            let observer = client.$jobs.dropFirst().sink { jobs in
+                if jobs.first?.state == .queued { enqueued = true }
+                if enqueued, !finished, jobs.first?.state == .done {
+                    finished = true
+                    done.fulfill()
+                }
+            }
+            client.enqueue(id: id, title: "Test wallpaper")
+            wait(for: [done], timeout: 8)
+            observer.cancel()
+        }
+        requestAndWaitForInstall()
+        try FileManager.default.removeItem(at: installed)
+        requestAndWaitForInstall()
+        XCTAssertTrue(FileManager.default.fileExists(atPath: installed.appendingPathComponent("project.json").path))
+        XCTAssertEqual(client.jobs.map(\.id), [id])
+    }
+
+    @MainActor
     func testSteamCanFinishInWorkshopLogAfterConsoleTimeout() throws {
         let (downloader, root) = try makeDownloaderFixture(timeouts: .init(login: 2, commandStart: 1, noProgress: 2))
         defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }

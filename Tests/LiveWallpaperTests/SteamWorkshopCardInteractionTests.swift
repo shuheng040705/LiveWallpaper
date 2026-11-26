@@ -14,7 +14,7 @@ final class SteamWorkshopCardInteractionTests: XCTestCase {
         var events: [Bool] = []
     }
 
-    private func makeWindow(_ state: State) -> (NSPanel, WKWebView) {
+    private func makeWindow(_ state: State) async throws -> (NSPanel, WKWebView) {
         let bridge = SteamWorkshopSubscriptionBridge(lookup: { id, _ in
             state.reads.append(id)
             guard let result = state.server else { return nil }
@@ -31,6 +31,7 @@ final class SteamWorkshopCardInteractionTests: XCTestCase {
         window.isReleasedWhenClosed = false
         window.contentView = web
         window.orderBack(nil)
+        try await setAccount("76561198000000001", in: web)
         return (window, web)
     }
 
@@ -81,9 +82,64 @@ final class SteamWorkshopCardInteractionTests: XCTestCase {
         XCTFail("The expected verification never arrived")
     }
 
+    private func setAccount(_ account: String, in web: WKWebView) async throws {
+        let cookie = try XCTUnwrap(HTTPCookie(properties: [.name: "steamLoginSecure",
+            .value: account + "%7C%7Cfixture", .domain: ".steamcommunity.com", .path: "/", .secure: "TRUE"]))
+        await web.configuration.websiteDataStore.httpCookieStore.setCookie(cookie)
+    }
+
+    private func markCardSubscribed(in web: WKWebView) async throws {
+        _ = try await web.evaluateJavaScript("""
+            (() => {
+                const previous = document.querySelector('button');
+                const replacement = previous.cloneNode(true);
+                replacement.querySelector('svg').setAttribute('class', 'SVGIcon_Button SVGIcon_X');
+                previous.replaceWith(replacement);
+                return true;
+            })()
+            """)
+    }
+
+    func testSteamAcknowledgedCardEnqueuesWithoutAnotherNetworkRoundTrip() async throws {
+        let state = State()
+        let (window, web) = try await makeWindow(state)
+        defer { window.close() }
+        // No sessionid is required to read the account of an already-authenticated web page.
+        try await setAccount("76561198000000001", in: web)
+        let filtered = try XCTUnwrap(URL(string: browse.absoluteString + "&requiredtags%5B%5D=Questionable&p=1"))
+        try await load(web, at: filtered)
+        try await click(web, in: window)
+        try await markCardSubscribed(in: web)
+        try await waitFor { state.events == [true] }
+        // Subsequent server verification and hover changes must not duplicate this transfer.
+        state.server = true
+        _ = try await web.evaluateJavaScript("document.querySelector('svg').setAttribute('class','SVGIcon_Check'); true")
+        try await Task.sleep(for: .milliseconds(500))
+        XCTAssertEqual(state.events, [true])
+    }
+
+    func testAcknowledgedCardDoesNotCrossAccountsOrDownloadMerelyOnRender() async throws {
+        let state = State()
+        let (window, web) = try await makeWindow(state)
+        defer { window.close() }
+        try await setAccount("76561198000000001", in: web)
+        try await load(web, at: browse)
+        try await markCardSubscribed(in: web)
+        try await Task.sleep(for: .milliseconds(50))
+        XCTAssertTrue(state.events.isEmpty)
+        try await load(web, at: browse)
+        try await click(web, in: window)
+        try await waitFor { !state.reads.isEmpty }
+        try await setAccount("76561198000000002", in: web)
+        state.server = true
+        try await markCardSubscribed(in: web)
+        try await Task.sleep(for: .seconds(1))
+        XCTAssertTrue(state.events.isEmpty)
+    }
+
     func testConfirmedCardActionsSurviveNavigationAndUseTheClickedItem() async throws {
         let state = State()
-        let (window, web) = makeWindow(state)
+        let (window, web) = try await makeWindow(state)
         defer { window.close() }
         try await load(web, at: browse)
         state.server = true
@@ -99,7 +155,7 @@ final class SteamWorkshopCardInteractionTests: XCTestCase {
 
     func testRejectedCardUnsubscribeKeepsFilesAndScriptClicksDoNotStartVerification() async throws {
         let state = State()
-        let (window, web) = makeWindow(state)
+        let (window, web) = try await makeWindow(state)
         defer { window.close() }
         state.server = true
         try await load(web, at: browse, glyph: "Check")
@@ -118,15 +174,16 @@ final class SteamWorkshopCardInteractionTests: XCTestCase {
 
     func testRapidReversalOnlyFinishesLatestIntent() async throws {
         let state = State()
-        let (window, web) = makeWindow(state)
+        let (window, web) = try await makeWindow(state)
         defer { window.close() }
         try await load(web, at: browse)
         try await click(web, in: window)
         try await waitFor { !state.reads.isEmpty }
         state.server = false
-        _ = try await web.evaluateJavaScript("""
-            window.clicked = false; document.querySelector('svg').setAttribute('class', 'SVGIcon_X'); true
-            """)
+        // The original card disappeared before it displayed a successful result.
+        // A new page now offers Unsubscribe while the first status lookup is pending.
+        let home = try XCTUnwrap(URL(string: "https://steamcommunity.com/app/431960/workshop/"))
+        try await load(web, at: home, glyph: "X")
         try await click(web, in: window)
         try await waitFor { state.events == [false] }
         state.server = true

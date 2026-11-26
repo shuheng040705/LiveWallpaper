@@ -41,10 +41,15 @@ struct WorkshopView: View {
         .onAppear { subscriptions.refresh() }
         .task(id: browser.isLoading ? nil : SteamWorkshopSubscriptionBridge.itemID(in: browser.url)) {
             serverDetail = nil
-            guard !browser.isLoading, let id = SteamWorkshopSubscriptionBridge.itemID(in: browser.url),
-                  bridge.detail(for: browser.url) == nil else { return }
-            let item = await SteamWorkshopSubscriptionStatus.lookup(id: id, in: browser.webView)
-            if !Task.isCancelled { serverDetail = item }
+            guard !browser.isLoading, let id = SteamWorkshopSubscriptionBridge.itemID(in: browser.url) else { return }
+            if bridge.detail(for: browser.url) != nil, SteamSubscriptions.isInstalled(id) { return }
+            guard let item = await SteamWorkshopSubscriptionStatus.lookup(id: id, in: browser.webView),
+                  !Task.isCancelled, SteamWorkshopSubscriptionBridge.itemID(in: browser.url) == id else { return }
+            serverDetail = item
+            // A website click from an older build may never have reached the local queue.
+            // A fresh account-specific response lets us recover that item on its detail page.
+            let hasDownloadRecord = downloader.jobs.contains { $0.id == id } || SteamSubscriptionRegistry.wasConfirmedByApp(id)
+            subscriptions.recoverMissingWebsiteDownload(item, hasDownloadRecord: hasDownloadRecord)
         }
         .onReceive(NotificationCenter.default.publisher(for: .steamSubscriptionsDidChange)) { _ in subscriptions.refresh() }
         .sheet(isPresented: $showTransfers) { DownloadsView(embedded: true).frame(width: 620, height: 540) }

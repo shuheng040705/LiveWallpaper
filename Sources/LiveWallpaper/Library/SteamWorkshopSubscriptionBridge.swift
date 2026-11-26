@@ -16,6 +16,7 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
     private let lookup: (String, WKWebView) async -> WorkshopWallpaper?
     private var pending: [String: Task<Void, Never>] = [:]
     private var observers: [String: AnyCancellable] = [:]
+    private var cardGestures: [String: (token: String, subscribing: Bool, account: Task<String?, Never>)] = [:]
 
     init(lookup: @escaping (String, WKWebView) async -> WorkshopWallpaper? = SteamWorkshopSubscriptionStatus.lookup,
          onChange: @escaping (WorkshopWallpaper, Bool) -> Void) {
@@ -64,6 +65,21 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
               let webView = message.webView, let sourceURL = frame.request.url, SteamWorkshopBrowser.isSteamPage(sourceURL),
               let body = message.body as? [String: Any], let id = body["id"] as? String,
               body["app"] as? String == "431960", let kind = body["kind"] as? String else { return }
+        if kind == "cardSubscribed", let token = body["gesture"] as? String,
+           let title = body["title"] as? String, let gesture = cardGestures[id], gesture.subscribing, gesture.token == token {
+            let store = webView.configuration.websiteDataStore.httpCookieStore
+            Task { [weak self] in
+                guard let account = await gesture.account.value,
+                      await SteamWorkshopSubscriptionStatus.accountID(in: store) == account,
+                      let self, self.cardGestures[id]?.token == token else { return }
+                self.cancelCheck(id)
+                var item = WorkshopWallpaper(id: id, title: title.isEmpty ? id : title)
+                item.isSubscribed = true
+                Log.write("Steam 工坊：卡片确认订阅 \(id)，同步到下载中心")
+                self.onChange(item, true)
+            }
+            return
+        }
         if kind == "cancelCardIntent" {
             cancelCheck(id)
             return
@@ -72,7 +88,7 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
 
         if kind == "cardIntent" {
             guard WorkshopWebAddress.detailURL(id) != nil else { return }
-            verifyCardAction(id: id, subscribed: subscribed, webView: webView)
+            verifyCardAction(id: id, subscribed: subscribed, gesture: body["gesture"] as? String, webView: webView)
             return
         }
         guard Self.itemID(in: webView.url) == id, Self.itemID(in: sourceURL) == id,
@@ -96,16 +112,22 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
     private func cancelCheck(_ id: String) {
         pending.removeValue(forKey: id)?.cancel()
         observers[id] = nil
+        cardGestures.removeValue(forKey: id)?.account.cancel()
     }
 
     /// A card can disappear or be replaced as soon as Steam accepts a click. Keep
     /// the check on the native side and follow the last gesture for each item.
-    private func verifyCardAction(id: String, subscribed: Bool, webView: WKWebView) {
+    private func verifyCardAction(id: String, subscribed: Bool, gesture: String?, webView: WKWebView) {
         cancelCheck(id)
+        if let gesture {
+            let store = webView.configuration.websiteDataStore.httpCookieStore
+            cardGestures[id] = (gesture, subscribed, Task { await SteamWorkshopSubscriptionStatus.accountID(in: store) })
+        }
         // Never apply an outstanding gesture to the next account in this browser.
         observers[id] = SteamWebSession.shared.$steamID64.removeDuplicates().dropFirst().sink { [weak self] _ in
             self?.cancelCheck(id)
         }
+        let cardGesture = cardGestures[id]
         pending[id] = Task { [weak self, weak webView] in
             guard let self, let webView else { return }
             let deadline = ContinuousClock.now + .seconds(60)
@@ -116,8 +138,15 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
                 if let item = await self.lookup(id, webView), !Task.isCancelled {
                     lastResponse = item.isSubscribed
                     if item.isSubscribed == subscribed {
+                        if let gesture = cardGesture {
+                            let account = await gesture.account.value
+                            let active = await SteamWorkshopSubscriptionStatus.accountID(in: webView.configuration.websiteDataStore.httpCookieStore)
+                            guard !Task.isCancelled, self.cardGestures[id]?.token == gesture.token else { return }
+                            guard let account, active == account else { self.cancelCheck(id); return }
+                        }
                         self.cancelCheck(id)
                         if Self.itemID(in: webView.url) == id { self.current = item }
+                        Log.write("Steam 工坊：服务器确认作品 \(id) \(subscribed ? "已订阅" : "已退订")")
                         self.onChange(item, subscribed)
                         return
                     }
@@ -141,36 +170,72 @@ final class SteamWorkshopSubscriptionBridge: NSObject, ObservableObject, WKScrip
             const ids = url.searchParams.getAll("id");
             if (ids.length === 1 && /^\d{6,20}$/.test(ids[0])) return ids[0];
         }
-        function cardID(button) {
-            let depth = 0;
-            for (let node = button.parentElement; node && node !== document.body && depth++ < 8; node = node.parentElement) {
-                const links = node.querySelectorAll('a[href*="filedetails"]');
-                const ids = new Set(Array.from(links, link => itemID(new URL(link.href))).filter(Boolean));
+        const actionSelector = 'button[data-accent-color="green"], [role="button"][data-accent-color="green"]';
+        const watching = new Map();
+        function cardFor(button) {
+            for (let node = button.parentElement; node && node !== document.body; node = node.parentElement) {
+                const links = Array.from(node.querySelectorAll('a[href*="filedetails"]'));
+                const ids = new Set(links.map(link => itemID(new URL(link.href))).filter(Boolean));
                 if (ids.size > 1) return;
                 if (ids.size === 1 && (links.length > 1 || node.querySelector('a[href*="/myworkshopfiles"]') ||
-                    Array.from(links).some(link => link.querySelector("img")))) return ids.values().next().value;
+                    links.some(link => link.querySelector("img")))) {
+                    const id = ids.values().next().value;
+                    const title = links.find(link => itemID(new URL(link.href)) === id && link.textContent.trim());
+                    return {node, id, title: title?.textContent.trim() || id};
+                }
             }
         }
-        document.addEventListener("click", event => {
-            if (event.button !== 0 || !(event.target instanceof Element)) return;
-            const button = event.target.closest('button[data-accent-color="green"], [role="button"][data-accent-color="green"]');
-            if (!button || button.matches(':disabled, [aria-disabled="true"]') ||
-                button.closest('#highlightContent, .commentthread_area, #SubscribeItemBtn')) return;
+        function subscribed(button) {
             const plus = !!button.querySelector("svg.SVGIcon_Plus");
             const checked = !!button.querySelector("svg.SVGIcon_Check, svg.SVGIcon_X");
-            if (plus === checked) return;
+            return plus === checked ? undefined : checked;
+        }
+        function post(payload) {
+            window.webkit.messageHandlers.workshopSubscription.postMessage({app: "431960", ...payload});
+        }
+        // Steam's React mutation updates both the card action and its tick after the
+        // server acknowledges Subscribe. Follow only the card whose Plus was clicked.
+        function watchSubscription(card, gesture) {
+            const observer = new MutationObserver(() => {
+                if (!card.node.isConnected) { stop(); return; }
+                for (const button of card.node.querySelectorAll(actionSelector)) {
+                    if (subscribed(button) !== true || cardFor(button)?.id !== card.id) continue;
+                    stop();
+                    post({kind: "cardSubscribed", id: card.id, title: card.title, gesture});
+                    break;
+                }
+            });
+            const timer = setTimeout(stop, 60000);
+            function stop() {
+                observer.disconnect();
+                clearTimeout(timer);
+                watching.delete(card.id);
+            }
+            watching.set(card.id, stop);
+            observer.observe(card.node, {subtree: true, childList: true, attributes: true, attributeFilter: ["class"]});
+        }
+        addEventListener("pagehide", () => { for (const stop of watching.values()) stop(); });
+        document.addEventListener("click", event => {
+            if (event.button !== 0 || !(event.target instanceof Element)) return;
+            const button = event.target.closest(actionSelector);
+            if (!button || button.matches(':disabled, [aria-disabled="true"]') ||
+                button.closest('#highlightContent, .commentthread_area, #SubscribeItemBtn')) return;
+            const previous = subscribed(button);
+            if (previous === undefined) return;
             const page = new URL(location.href);
             const detail = itemID(page);
             const path = page.pathname.replace(/\/$/, "");
             if (!detail && !(path === "/app/431960/workshop" ||
                 ((path === "/workshop/browse" || path.endsWith("/myworkshopfiles")) &&
                  page.searchParams.get("appid") === "431960"))) return;
-            // A detail page can also carry cards for other authors' works. Only the
-            // primary detail button has a text label; quick buttons have an icon alone.
-            const id = detail && button.textContent.trim() ? detail : cardID(button);
-            if (id) window.webkit.messageHandlers.workshopSubscription.postMessage({
-                kind: event.isTrusted ? "cardIntent" : "cancelCardIntent", app: "431960", id, subscribed: plus
-            });
+            // A detail page may also contain cards linking to other items.
+            const card = detail && button.textContent.trim() ? undefined : cardFor(button);
+            const id = card?.id || detail;
+            if (!id || (!card && !button.textContent.trim())) return;
+            watching.get(id)?.();
+            const gesture = event.isTrusted ? crypto.randomUUID() : null;
+            if (card && !detail && !previous && gesture) watchSubscription(card, gesture);
+            post({kind: event.isTrusted ? "cardIntent" : "cancelCardIntent", id, subscribed: !previous, gesture});
         }, true);
     })();
     """#

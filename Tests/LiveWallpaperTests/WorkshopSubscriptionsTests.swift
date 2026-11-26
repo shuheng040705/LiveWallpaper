@@ -121,6 +121,23 @@ final class WorkshopSubscriptionsTests: XCTestCase {
     }
 
     @MainActor
+    func testServerConfirmedMissingSubscriptionIsRecoveredOnlyOnce() {
+        let f = Fixture()
+        let store = WorkshopSubscriptions(environment: f.environment)
+        var remote = item
+        store.recoverMissingWebsiteDownload(remote, hasDownloadRecord: false)
+        remote.isSubscribed = true
+        store.recoverMissingWebsiteDownload(remote, hasDownloadRecord: true)
+        f.installed = true
+        store.recoverMissingWebsiteDownload(remote, hasDownloadRecord: false)
+        XCTAssertTrue(f.events.isEmpty)
+        f.installed = false
+        store.recoverMissingWebsiteDownload(remote, hasDownloadRecord: false)
+        store.recoverMissingWebsiteDownload(remote, hasDownloadRecord: false)
+        XCTAssertEqual(f.events, ["download"])
+    }
+
+    @MainActor
     func testWebsiteConfirmationOnlyRunsLocalActions() {
         let fixture = Fixture()
         let store = WorkshopSubscriptions(environment: fixture.environment)

@@ -25,31 +25,38 @@ enum SteamWorkshopSubscriptionStatus {
         }
     }
 
-    private static func accountID(in store: WKHTTPCookieStore) async -> String? {
+    static func accountID(in store: WKHTTPCookieStore) async -> String? {
         let cookies = await store.allCookies()
-        return SteamSubscription.authenticatedSession(from: cookies)?.steamID64
+        guard let cookie = SteamSubscription.communityLoginCookie(in: cookies) else { return nil }
+        return SteamSubscription.steamID64(fromSecureCookieValue: cookie.value)
     }
 
     static let query = #"""
     if (location.origin !== "https://steamcommunity.com") return null;
-    const abort = new AbortController();
-    const timer = setTimeout(() => abort.abort(), 8000);
+    // Give the independent detail fallback its own time budget if a status request timed out.
+    async function request(url, headers) {
+        const abort = new AbortController();
+        const timer = setTimeout(() => abort.abort(), 8000);
+        try {
+            const response = await fetch(url, {credentials: "same-origin", redirect: "error", cache: "no-store",
+                signal: abort.signal, headers});
+            return response.ok ? await response.text() : null;
+        } finally { clearTimeout(timer); }
+    }
     async function read(name, parameters) {
         const url = new URL("/sharedfiles/actions", location.origin);
         url.searchParams.set("q", name);
         url.searchParams.set("qp", JSON.stringify(parameters));
-        const response = await fetch(url, {credentials: "same-origin", redirect: "error", cache: "no-store",
-            signal: abort.signal, headers: {"x-valve-request-type": "queryAction"}});
-        if (!response.ok) return null;
-        const payload = await response.json();
+        const text = await request(url, {"x-valve-request-type": "queryAction"});
+        if (!text) return null;
+        const payload = JSON.parse(text);
         return Array.isArray(payload.data) ? payload.data.find(row => row?.publishedfileid === id) : null;
     }
     async function readDetail() {
         const url = new URL("/sharedfiles/filedetails/", location.origin);
         url.searchParams.set("id", id);
-        const response = await fetch(url, {credentials: "same-origin", redirect: "error", cache: "no-store", signal: abort.signal});
-        if (!response.ok) return null;
-        const html = await response.text();
+        const html = await request(url);
+        if (!html) return null;
         const doc = new DOMParser().parseFromString(html, "text/html");
         if (!Array.from(doc.scripts).some(script =>
             /\bg_steamID\s*=\s*['"](\d+)['"]/.exec(script.textContent)?.[1] === account)) return null;
@@ -63,14 +70,12 @@ enum SteamWorkshopSubscriptionStatus {
             add.classList.contains("selected") === subscribed) return null;
         return {id, title: doc.querySelector(".workshopItemTitle")?.textContent.trim() || id, subscribed};
     }
-    try {
-        const [item, status] = await Promise.all([
-            read("GetUGCSummary", [[id]]), read("GetUserListStatus", [431960, 1, 0, [id]])
-        ]).catch(() => [null, null]);
-        if (!item || !status || typeof status.inlist !== "boolean") return await readDetail();
-        if (item?.consumer_appid !== 431960 || item?.file_type !== 0 || typeof item.title !== "string" ||
-            item.publishedfileid !== id) return null;
-        return {id, title: item.title, bytes: String(item.file_size || 0), subscribed: status.inlist};
-    } finally { clearTimeout(timer); }
+    const [item, status] = await Promise.all([
+        read("GetUGCSummary", [[id]]), read("GetUserListStatus", [431960, 1, 0, [id]])
+    ]).catch(() => [null, null]);
+    if (!item || !status || typeof status.inlist !== "boolean") return await readDetail();
+    if (item?.consumer_appid !== 431960 || item?.file_type !== 0 || typeof item.title !== "string" ||
+        item.publishedfileid !== id) return null;
+    return {id, title: item.title, bytes: String(item.file_size || 0), subscribed: status.inlist};
     """#
 }
