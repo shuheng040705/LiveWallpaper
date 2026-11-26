@@ -73,5 +73,49 @@ final class WebWallpaperHotspotsTests: XCTestCase {
         renderer.reloadInPlace()
         let disabled = await rects()
         XCTAssertEqual(disabled.map(pixels), [button])
+
+        func captures(_ point: CGPoint) async -> Bool {
+            let frames: [CGRect] = await withCheckedContinuation { continuation in
+                WebWallpaperHotspots.read(in: web, at: point) { continuation.resume(returning: $0) }
+            }
+            return frames.contains { $0.contains(point) }
+        }
+        let character = CGPoint(x: 0.6, y: 0.4)
+        let blank = CGPoint(x: 0.12, y: 0.2)
+        for runtime in [
+            "window.__rt5 = {hitTest: (x, y) => x === 240 && y === 80 ? 0 : null}",
+            "window.wallpaperInteraction = {candidates: (x,y) => x === 240 && y === 80 ? [{}] : []}",
+            "window.inspectPointerHit = (x,y) => ({selectedCandidate: x === 240 && y === 80 ? {} : null})",
+            "window.hitNameAt = (x,y) => x === 240 && y === 80 ? 'touch_head' : null"
+        ] {
+            _ = try await web.evaluateJavaScript("delete window.__rt5; delete window.wallpaperInteraction; delete window.inspectPointerHit; delete window.hitNameAt; " + runtime + "; true")
+            let hit = await captures(character), miss = await captures(blank)
+            XCTAssertTrue(hit, runtime)
+            XCTAssertFalse(miss, runtime)
+        }
+        _ = try await web.evaluateJavaScript("delete window.hitNameAt; true")
+        _ = try await web.evaluateJavaScript("""
+            window.__rt5 = {
+                touch: () => [{index:0, enabled:true},{index:1, enabled:true},{index:2, enabled:false}],
+                quad: i => i === 0 ? [{x:110,y:60},{x:150,y:60},{x:150,y:84},{x:110,y:84}]
+                                   : [{x:200,y:50},{x:250,y:80},{x:200,y:110},{x:150,y:80}],
+                hitTest: () => 0
+            }; true
+            """)
+        let declared = await rects()
+        XCTAssertEqual(declared.map(pixels), [CGRect(x: 110, y: 60, width: 40, height: 24), button])
+        _ = try await web.evaluateJavaScript("delete window.__rt5; true")
+        _ = try await web.evaluateJavaScript("""
+            const overlay = document.createElement('div');
+            overlay.style.cssText='position:fixed;inset:0';
+            document.body.append(overlay);
+            window.inspectPointerHit = (x, y) => ({selectedCandidate: x===240 && y===80 ? {} : null}); true
+            """)
+        let documentCapture = await captures(character), coveredBlank = await captures(blank)
+        XCTAssertTrue(documentCapture)
+        XCTAssertFalse(coveredBlank)
+        _ = try await web.evaluateJavaScript("delete window.inspectPointerHit; true")
+        let fullCanvas = await captures(character)
+        XCTAssertFalse(fullCanvas)
     }
 }

@@ -73,6 +73,18 @@ final class AudioPlayback: NSObject, AVAudioPlayerDelegate, @unchecked Sendable 
         }
     }
 
+    /// SceneScript thisScene.getLayer(...).play(). Only a sound in the active scene can play.
+    func playFromScript(id: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !paused, !muted, let group = groups.first(where: { $0.desc.id == id }),
+              !group.players.isEmpty else { return }
+        let player = group.players[group.current]
+        player.numberOfLoops = group.desc.playbackmode?.lowercased() == "loop" && group.players.count == 1 ? -1 : 0
+        player.currentTime = 0
+        player.play()
+    }
+
     func pause() {
         lock.lock(); paused = true; let gs = groups; lock.unlock()
         for g in gs { for p in g.players where p.isPlaying { p.pause() } }
@@ -162,7 +174,7 @@ final class AudioPlayback: NSObject, AVAudioPlayerDelegate, @unchecked Sendable 
         // 多曲组的一曲放完:按 playbackmode 挑下一首,random 模式插入 mintime..maxtime 静默。
         lock.lock()
         guard let g = groups.first(where: { $0.players.contains(where: { $0 === player }) }),
-              g.players.count > 1 else { lock.unlock(); return }
+              g.players.count > 1, g.desc.playbackmode?.lowercased() != "single" else { lock.unlock(); return }
         let random = (g.desc.playbackmode?.lowercased() == "random")
         let lo = g.desc.minTime, hi = max(g.desc.minTime, g.desc.maxTime)
         // 选下一曲:random 随机(避免立刻重复),否则顺序。

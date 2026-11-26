@@ -9,6 +9,11 @@ import JavaScriptCore
 ///   - 注入 createScriptProperties() 链式 shim,按「图层 scriptproperties 覆盖 > 脚本 addX 默认」解析属性;
 ///   - 每次刷新调用 update(currentValue),拿返回值(String / Vec3)。
 /// JSC 原生支持 new Date()。脚本抛错/用到不可用 API 时,调用方回退到旧近似(并 Log)。
+enum WECursorEvent: String, CaseIterable {
+    case enter = "cursorEnter", leave = "cursorLeave", move = "cursorMove"
+    case down = "cursorDown", up = "cursorUp", click = "cursorClick"
+}
+
 final class WEScript {
     /// 注入脚本上下文的 scene 对象元数据。这里保留的是 pkg 的局部变换，
     /// 因为 WE 脚本通过 `parent.origin + thisLayer.origin` 等方式自行组合父子坐标。
@@ -36,6 +41,11 @@ final class WEScript {
     /// 若 SceneRenderEngine.load 再建一遍，缓存引用会与 thisScene/getParent 的新注册表分叉。
     private var installedSceneLayerDefs: [SceneLayerDefinition]? = nil
     private let updateFn: JSValue?
+    private(set) var cursorEvents = Set<WECursorEvent>()
+    let requiresWritableBones: Bool
+    let readsCursorInput: Bool
+    let usesShared: Bool
+    private let cursorInputFn: JSValue?
     /// 脚本声明的属性最终值(name → JS 值),已套用图层覆盖。供调试 / 日志。
     private(set) var resolvedProps: [String: Any] = [:]
     /// JS 异常标记。用 class 引用盒,避免在 init 里 exceptionHandler 闭包过早捕获 self。
@@ -113,6 +123,9 @@ final class WEScript {
     ///        不注入会 TypeError 抛错 → 脚本失败 → 调用方退回旧画布快照(飘字根因 B)。
     init?(script: String, propertyOverrides: [String: Any], tag: String, canvas: SIMD2<Float> = SIMD2(1920, 1080)) {
         self.sourceTag = tag
+        requiresWritableBones = script.contains("setBoneTransform") || script.contains("applyBonePhysicsImpulse")
+        readsCursorInput = script.contains("input.cursor")
+        usesShared = script.contains("shared")
         // 纯局部检查(无 self):脚本是否用音频。供引擎决定采集音频 + 每帧喂频谱。
         self.usesAudio = script.contains("registerAudioBuffers") || script.contains("__audio")
         // 纯局部检查:脚本是否运行时建层(thisScene.createLayer,音频条 64 根 bar)。
@@ -137,6 +150,13 @@ final class WEScript {
         //    stripModuleSyntax 删掉了脚本对 WEMath/WEColor 等的 import,这些全局把它们补回来,
         //    复杂脚本(console.log / setInterval / 读写 thisLayer 等)才不会因缺全局抛错回退。
         context.evaluateScript(WEScript.preludeSource)
+        cursorInputFn = readsCursorInput ? context.evaluateScript("""
+            (function(wx, wy, sx, sy, pressed) {
+                input.cursorWorldPosition = new Vec3(wx, wy, 0);
+                input.cursorScreenPosition = new Vec2(sx, sy);
+                input.cursorLeftDown = pressed;
+            })
+            """) : nil
 
         // 0b) 注入 engine.canvasSize + engine.screenResolution(WE 的渲染画布尺寸,这里用场景
         //     orthogonalprojection w/h)。WE 挂件容器/时钟/日期/灵动岛/拖拽脚本第一行就读
@@ -188,9 +208,12 @@ final class WEScript {
             guard let f = ctx.objectForKeyedSubscript(n) else { return false }
             return !f.isUndefined && !f.isNull && f.isObject
         }
-        guard hasUpdate || hasGlobalFn(context, "mediaPropertiesChanged") || hasGlobalFn(context, "mediaTimelineChanged")
+        for event in WECursorEvent.allCases where hasGlobalFn(context, event.rawValue) {
+            cursorEvents.insert(event)
+        }
+        guard hasUpdate || !cursorEvents.isEmpty || hasGlobalFn(context, "mediaPropertiesChanged") || hasGlobalFn(context, "mediaTimelineChanged")
             || hasGlobalFn(context, "mediaPlaybackChanged") || hasGlobalFn(context, "mediaThumbnailChanged") else {
-            Log.write("WEScript[\(tag)] no update() nor media callback after eval")
+            Log.write("WEScript[\(tag)] no update() or supported callback after eval")
             return nil
         }
         self.updateFn = hasUpdate ? updateCandidate : nil
@@ -240,6 +263,36 @@ final class WEScript {
     /// 只读取字符串异常本身或标准 Error.message，不执行任意异常对象的 toString。读取 message
     /// 若碰到恶意 getter 再次抛错，exceptionHandler 会因 formattingException=true 仅记 hit，
     /// 不会覆盖原异常或递归格式化。
+    func setCursorInput(world: SIMD2<Float>, screen: SIMD2<Float>, pressed: Bool) {
+        guard readsCursorInput else { return }
+        _ = cursorInputFn?.call(withArguments: [world.x, world.y, screen.x, screen.y, pressed])
+    }
+
+    func setSoundLayerPlayback(_ play: @escaping @convention(block) (Int) -> Void) {
+        context.setObject(play, forKeyedSubscript: "__wePlaySoundLayer" as NSString)
+    }
+
+    /// Each property has its own JSContext. Only propagate keys the event actually changed.
+    static func changedShared(before: String, after: String) -> String? {
+        guard before != after,
+              let old = (try? JSONSerialization.jsonObject(with: Data(before.utf8))) as? NSDictionary,
+              let new = (try? JSONSerialization.jsonObject(with: Data(after.utf8))) as? [String: NSObject] else { return nil }
+        let delta = new.filter { key, value in !value.isEqual(old[key]) }
+        guard !delta.isEmpty, let data = try? JSONSerialization.data(withJSONObject: delta) else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    func dispatchCursor(_ event: WECursorEvent, world: SIMD2<Float>, local: SIMD2<Float>) {
+        guard cursorEvents.contains(event), let function = context.objectForKeyedSubscript(event.rawValue),
+              let vector = context.objectForKeyedSubscript("Vec3"),
+              let worldPosition = vector.construct(withArguments: [world.x, world.y, 0]),
+              let localPosition = vector.construct(withArguments: [local.x, local.y, 0]) else { return }
+        didFail = false
+        _ = function.call(withArguments: [["worldPosition": worldPosition,
+                                          "localPosition": localPosition, "hitBox": NSNull()] as [String: Any]])
+        if didFail { reportException() }
+    }
+
     private static func reportException(_ flag: Flag, tag: String) {
         guard flag.hit else { return }
         flag.formattingException = true
@@ -1119,7 +1172,8 @@ final class WEScript {
     };
     globalThis.input = globalThis.input || {
       cursorPosition: new Vec2(0, 0),
-      // cursorScreenPosition:WE 提供的「光标在屏幕的归一化位置 [0,1]」(土星 Dock 主控读它算触发区:
+      cursorLeftDown: false,
+      // cursorScreenPosition:光标相对屏幕左上角的像素位置(土星 Dock 主控读它算触发区:
       //   `3840 * input.cursorScreenPosition.x / engine.screenResolution.x`)。缺它则 Dock update() 读
       //   `cursorScreenPosition.x` 抛 TypeError → 整段 update 中断 → 图标显隐永不更新(任务栏关不掉)。
       //   headless 无真实光标 → 给 (0,0) 合理桩(光标在左上角,远离 Dock → isMouseInZone=false,Dock 不悬停)。
@@ -1280,8 +1334,7 @@ final class WEScript {
     ///
     /// 跨层写回:visible/alpha/color/origin/scale/angles 用 defineProperty 记脏(_v/_al/_c/_o/_s/_an),
     ///   getter 返当前值(默认或脚本写过的)、setter 记脏 → readLayerWrites() 只读回脚本写过的字段。
-    ///   play()/pause()/getVideoTexture()/getTextureAnimation() 给 no-op 桩(Dock 图标的点击/悬停音效层
-    ///   `getLayer("v1").play()` 不抛错;播放真由引擎控)。
+    ///   Registered sound layer play() requests are forwarded to AudioPlayback by the scene renderer.
     private static let installLayersSource = """
     (function() {
       var defs = globalThis.__weLayerDefs || [];
@@ -1321,7 +1374,8 @@ final class WEScript {
                   getMaterial: function(){ return null; },
                   getVideoTexture: function(){ return __weVideoStub; },
                   getTextureAnimation: function(){ return __weAnimationStub; },
-                  play: function(){}, pause: function(){}, stop: function(){} };
+                  play: function(){ if (typeof __wePlaySoundLayer === 'function') __wePlaySoundLayer(this.id); },
+                  pause: function(){}, stop: function(){} };
         if (!Number.isFinite(o._baseAlpha)) o._baseAlpha = 1;
         Object.defineProperty(o, 'visible', { get: function(){ return this._v === null ? this._baseVisible : this._v; }, set: function(v){ this._v = !!v; }, configurable: true, enumerable: true });
         Object.defineProperty(o, 'alpha',   { get: function(){ return this._al === null ? this._baseAlpha : this._al; }, set: function(v){ this._al = +v; }, configurable: true, enumerable: true });

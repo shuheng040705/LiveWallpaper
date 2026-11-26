@@ -1,15 +1,19 @@
 import AppKit
 
-/// Owns the original mouse click over one interactive wallpaper region. The panel is
-/// below ordinary application windows and never changes the active app or key window.
+enum WallpaperPointerPhase: String {
+    case down, drag, up, cancel, hover
+}
+
+/// A nonactivating recipient at the desktop icon level, immediately below app windows.
+/// AppKit keeps sending drags and the release to the surface that received mouseDown.
 final class WebWallpaperHotspotPanel: NSPanel {
     private final class ClickSurface: NSView {
-        let onClick: (CGPoint) -> Void
-        private var press: CGPoint?
+        let onPointer: (WallpaperPointerPhase, CGPoint) -> Void
+        private var lastPoint: CGPoint?
         private let modifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
 
-        init(frame: CGRect, onClick: @escaping (CGPoint) -> Void) {
-            self.onClick = onClick
+        init(frame: CGRect, onPointer: @escaping (WallpaperPointerPhase, CGPoint) -> Void) {
+            self.onPointer = onPointer
             super.init(frame: frame)
         }
 
@@ -17,28 +21,32 @@ final class WebWallpaperHotspotPanel: NSPanel {
         override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 
         override func mouseDown(with event: NSEvent) {
-            press = nil
-            guard event.clickCount == 1, event.modifierFlags.intersection(modifiers).isEmpty else { return }
-            press = window?.convertPoint(toScreen: event.locationInWindow)
+            cancelPress()
+            guard event.clickCount == 1, event.modifierFlags.intersection(modifiers).isEmpty,
+                  let point = window?.convertPoint(toScreen: event.locationInWindow) else { return }
+            lastPoint = point
+            onPointer(.down, point)
         }
 
         override func mouseDragged(with event: NSEvent) {
-            guard let start = press, let point = window?.convertPoint(toScreen: event.locationInWindow) else { return }
-            if hypot(point.x - start.x, point.y - start.y) > 4 { press = nil }
+            guard lastPoint != nil, let point = window?.convertPoint(toScreen: event.locationInWindow) else { return }
+            lastPoint = point
+            onPointer(.drag, point)
         }
 
         override func mouseUp(with event: NSEvent) {
-            defer { press = nil }
-            guard let start = press, let window, event.modifierFlags.intersection(modifiers).isEmpty else { return }
-            let point = window.convertPoint(toScreen: event.locationInWindow)
-            guard window.frame.contains(point), hypot(point.x - start.x, point.y - start.y) <= 4 else { return }
-            onClick(point)
+            guard lastPoint != nil, let point = window?.convertPoint(toScreen: event.locationInWindow) else { return }
+            lastPoint = nil
+            onPointer(event.modifierFlags.intersection(modifiers).isEmpty ? .up : .cancel, point)
         }
 
-        func cancelPress() { press = nil }
+        func cancelPress() {
+            if let point = lastPoint { onPointer(.cancel, point) }
+            lastPoint = nil
+        }
     }
 
-    init(frame: CGRect, onClick: @escaping (CGPoint) -> Void) {
+    init(frame: CGRect, onPointer: @escaping (WallpaperPointerPhase, CGPoint) -> Void) {
         super.init(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
                    backing: .buffered, defer: false)
         level = .init(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
@@ -53,7 +61,7 @@ final class WebWallpaperHotspotPanel: NSPanel {
         isMovable = false
         isReleasedWhenClosed = false
         animationBehavior = .none
-        contentView = ClickSurface(frame: CGRect(origin: .zero, size: frame.size), onClick: onClick)
+        contentView = ClickSurface(frame: CGRect(origin: .zero, size: frame.size), onPointer: onPointer)
     }
 
     override var canBecomeKey: Bool { false }
@@ -70,5 +78,10 @@ final class WebWallpaperHotspotPanel: NSPanel {
             (contentView as? ClickSurface)?.cancelPress()
             if isVisible { orderOut(nil) }
         }
+    }
+
+    override func close() {
+        (contentView as? ClickSurface)?.cancelPress()
+        super.close()
     }
 }

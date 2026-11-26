@@ -770,9 +770,8 @@ struct SceneDocument {
     /// library/init/applyUserProperties 之前拿到它；否则脚本看到空的 engine.userProperties，
     /// “静止点/视差强度/草摆/人物摆动”等控件只改 UI、不改运行时。
     var scriptUserProperties: [String: WallpaperProperty.Value] = [:]
-    /// ⭐有 cursor 互动脚本回调(cursorClick/cursorDown/cursorMove/cursorEnter)的对象 id 集。
-    /// 供互动 hit-test + 台前调度点击穿透判定(这些对象的 bbox=可点击区,不只 puppet 角色)。
-    var interactiveIds: Set<Int> = []
+    /// Explicitly non-solid layers still render but never receive SceneScript cursor events.
+    var nonSolidIds = Set<Int>()
     var emitters: [ParticleEmitterDesc] = []
     // 声音对象(ObjectParser.cpp:206-221)。解析存下;播放未实现(见返回说明)。
     var sounds: [SoundDesc] = []
@@ -1289,6 +1288,11 @@ struct SceneDocument {
                         tl.baseLocalAngles = angleBaseOf[id] ?? .zero
                         tl.parentAbsAngle = parentAbsoluteAngle(id)
                     }
+                    // Text widgets can bind drag/hover callbacks to visibility and scale, like image layers.
+                    if let script = Self.parseVectorScript(obj["visible"], tag: "vis:\(tl.name)", canvas: canvas, layerObject: obj),
+                       !script.cursorEvents.isEmpty { tl.visibleScript = script }
+                    if let script = Self.parseVectorScript(obj["scale"], tag: "scale:\(tl.name)", canvas: canvas, layerObject: obj),
+                       !script.cursorEvents.isEmpty { tl.scaleScript = script }
                     installDynamicAncestor(id, on: &tl)
                 }
                 // 文本层特效(2026-06-11):此前 parseTextLayer 硬编码 effects:[] → 时钟/日期/Day 上的
@@ -2282,11 +2286,9 @@ struct SceneDocument {
         doc.scriptUserProperties = scriptUserProperties
         doc.ambientColor = VecParse.f3(general["ambientcolor"], default: .zero)   // lwe 默认 vec3(0);读 pkg 真值,不硬编码
         doc.timeStageConfig = timeStageConfig
-        // ⭐互动:扫每个对象所有字段的 script 字符串,含 cursor 回调(cursorClick/cursorDown/cursorMove/cursorEnter)
-        //   即「可点击/可交互对象」(WE 命名脚本回调机制)。其 bbox=点击判定区,供台前调度穿透+反应动画 hit-test。
-        doc.interactiveIds = Set(objects.compactMap { obj -> Int? in
-            guard let id = (obj["id"] as? NSNumber)?.intValue, Self.objectHasCursorScript(obj) else { return nil }
-            return id
+        doc.nonSolidIds = Set(objects.compactMap { object in
+            guard (VecParse.unwrap(object["solid"]) as? NSNumber)?.boolValue == false else { return nil }
+            return (object["id"] as? NSNumber)?.intValue
         })
         doc.hasCursorRipple = hasCursorRipple
         doc.cursorRippleLayerCutoff = cursorRippleCutoff
@@ -2382,20 +2384,6 @@ struct SceneDocument {
     /// 返回**渲染缺口**用户可读描述(reason 含 🔴 的真问题项:composelayer跳过/文本脚本失败/解码失败/
     /// 挂未实现特效等)。供 SceneDocument.renderGaps + UI 弹窗。合法跳过(visible=false/instanced/light/sound)不计入。
     @discardableResult
-    /// 对象是否含 cursor 互动脚本回调(递归扫所有字段的 script 字符串)。WE 互动=命名回调 cursorClick/cursorDown 等,
-    /// 分散在 .visible.script / .animationlayers[].visible.script / .effects[].passes[].constantshadervalues.X.script 等字段。
-    static func objectHasCursorScript(_ obj: [String: Any]) -> Bool {
-        func scan(_ v: Any) -> Bool {
-            if let s = v as? String {
-                return s.contains("cursorClick") || s.contains("cursorDown") || s.contains("cursorMove") || s.contains("cursorEnter")
-            }
-            if let d = v as? [String: Any] { return d.values.contains(where: scan) }
-            if let a = v as? [Any] { return a.contains(where: scan) }
-            return false
-        }
-        return scan(obj)
-    }
-
     private static func writeCoverageReport(objects: [[String: Any]], layers: [LayerDesc],
                                             emitters: [ParticleEmitterDesc], sounds: [SoundDesc],
                                             projectLayers: [ProjectLayerDesc], postChain: [LayerEffect],

@@ -772,7 +772,14 @@ final class SceneRenderEngine {
     }
 
     private(set) var canvas: SIMD2<Float> = SIMD2(1920, 1080)
-    private var interactiveIds: Set<Int> = []   // 有 cursor 互动脚本回调的对象 id(互动 hit-test/台前调度穿透用)
+    private var cursorTargets: [Int] = [] // Layer indices in draw order
+    private var cursorScripts: [Int: [WEScript]] = [:]
+    private var inputScripts: [WEScript] = []
+    private var sharedCursorRecipients: [WEScript] = []
+    private var hoveredLayer: Int?
+    private var pressedLayer: Int?
+    private var lastScriptPointer: SIMD2<Float>?
+    var hasCursorTargets: Bool { !has3DScene && !cursorTargets.isEmpty }
     private(set) var clearColor: MTLClearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
     private var ambientColor: SIMD3<Float> = .zero   // general.ambientcolor(lwe 默认 vec3(0));喂 LIGHTING 材质 g_LightAmbientColor
     private var layers: [GPULayer] = []
@@ -1104,7 +1111,6 @@ final class SceneRenderEngine {
         let np = Self.parseNowPlaying(from: document.sounds)
         nowPlayingTitle = np.title; nowPlayingArtist = np.artist
         canvas = SIMD2(document.canvasWidth, document.canvasHeight)
-        interactiveIds = document.interactiveIds
         // 审计修复#6:canvas 任一维 ≤0 时 matOrtho 的 2/width 产生 inf/NaN → mvp 全坏(空屏/崩)。
         // 守卫:非正尺寸回退到安全默认 1920×1080。proj 与 ndcScale/像素坐标据此一致计算。
         if !(canvas.x > 0 && canvas.y > 0) {
@@ -2638,6 +2644,7 @@ final class SceneRenderEngine {
                 Log.write("xlayer: \(crossLayerScripts.count) controller(s) (\(logicScripts.count) logic-layer); \(document.scriptLayerDefs.count) scene objects / \(layerIndexById.count) render targets; changed=\(changed)")
             }
         }
+        configureCursorScripts(nonSolidIds: document.nonSolidIds)
         lastUpdateTime = -1
         prewarmFXPipelines(document: document)
         let cbmLayers = layers.filter { $0.colorBlendMode > 0 }
@@ -2730,7 +2737,7 @@ final class SceneRenderEngine {
         !particleGroups.isEmpty || hasVideo || hasEffects || hasText
             || hasScaleScript || hasOriginScript || hasAngleScript || hasAudioBars
             || hasInstancedBars || hasCursorRipple || has3DScene || hasKeyframeAnim || hasCameraAnim
-            || hasPuppetAnim
+            || hasPuppetAnim || hasCursorTargets
     }
     var isAnimated: Bool { hasParallax || hasContinuousAnimation }
     private var hasScaleScript = false
@@ -3204,6 +3211,7 @@ final class SceneRenderEngine {
     /// cameraParallaxEnabled 只控制 WE 相机视差通道，不能把交互光标一并归中。
     /// 视差位移 = 鼠标影响 × 每层 parallaxDepth(WE 鼠标驱动、静止归中,无自动漂移)。camerashake 不渲染(对齐 lwe)。
     func update(time: Double, mouseNorm: SIMD2<Float>, cameraParallaxEnabled: Bool = true) {
+        updateScriptPointer(SIMD2(mouseNorm.x + 1, 1 - mouseNorm.y) * 0.5)
         guard !layers.isEmpty || !particleGroups.isEmpty else { return }
         let _perfUpdateT0 = perfNow()
         let _perfSkinSnapshot = perfSkin, _perfPartSnapshot = perfPart   // WP_PERF:本帧 skin/part 增量基线
@@ -6688,34 +6696,142 @@ final class SceneRenderEngine {
     /// `framebufferOnly` 的 drawable —— 平铺 GPU 上其未定义/平铺显存会在桌面合成时泄漏成彩色噪点/
     /// 黑线(只在实时出现,离屏 .shared 纹理正常,已实测确认)。改为:先渲到可读中间纹理(= 已验证
     /// 干净的离屏路径),再用**单次 clear+全屏 blit** 呈现到 drawable(整张被清空+100% 覆盖,无残留)。
-    /// ⭐互动 hit-test(2026-06-25):给屏幕归一化光标(mouseNorm [-1,1] y上),返回命中的可交互对象 pkg id(无→nil)。
-    /// 可交互=puppet 角色(身体可点)。坐标:屏幕→画布 UV(同 cursorUV 逻辑,扣 cover via aspectMouse)→画布像素,
-    /// 与 GPULayer.origin(originPx 画布像素)同系,bbox 命中(origin±sizePx/2)。供①台前调度穿透(光标在交互对象上→
-    /// 窗口吃点击不弹台前调度)②反应动画(点击对象→cursorClick,阶段2)共用。WP_INTERACT_DBG 打印命中诊断。
-    func interactiveHitAt(mouseNorm: SIMD2<Float>) -> Int? {
-        guard canvas.x > 0, canvas.y > 0 else { return nil }
-        let pointerOffset = cursorUVOffset
-        let uvx = min(1, max(0, (mouseNorm.x / aspectMouse.x + 1) * 0.5 + pointerOffset.x))
-        let uvy = min(1, max(0, (mouseNorm.y / aspectMouse.y + 1) * 0.5 + pointerOffset.y))
-        // cc 用场景像素 **y 向下**(对齐 GPULayer.origin=originPx 的 y 向下,SceneModel.LayerDesc.originPx 注释);
-        //   uvy 是 y 向上 → (1-uvy)。(白泽夢中心命中是中心对称没暴露 y 反;白影非中心 hitbox 才暴露,故此修。)
-        let cc = SIMD2<Float>(uvx * canvas.x, (1 - uvy) * canvas.y)
-        let dbg = WPEnv.vars["WP_INTERACT_DBG"] != nil
-        // 可交互对象 = puppet 角色 **或** 有 cursor 脚本回调的对象(脸/耳朵/花朵等 hitbox,多为 image/model 非 puppet)。topmost 优先。
-        for layer in layers.reversed() where layer.puppetMesh != nil || interactiveIds.contains(layer.id) {
-            let hx = abs(layer.sizePx.x) * 0.5, hy = abs(layer.sizePx.y) * 0.5
-            guard hx > 1, hy > 1 else { continue }   // 退化 bbox(无尺寸)跳过
-            if abs(cc.x - layer.origin.x) <= hx, abs(cc.y - layer.origin.y) <= hy {
-                if dbg { Log.write("INTERACT hit id=\(layer.id) name=\(layer.name) cc=(\(Int(cc.x)),\(Int(cc.y))) origin=(\(Int(layer.origin.x)),\(Int(layer.origin.y))) half=(\(Int(hx)),\(Int(hy)))") }
-                return layer.id
+    private func configureCursorScripts(nonSolidIds: Set<Int>) {
+        cursorTargets.removeAll()
+        cursorScripts.removeAll()
+        hoveredLayer = nil
+        pressedLayer = nil
+        lastScriptPointer = nil
+        var allScripts = logicScripts
+        for i in layers.indices {
+            let layer = layers[i]
+            var scripts = [layer.scaleScript, layer.originScript, layer.angleScript, layer.visibleScript,
+                           layer.alphaScript, layer.colorScript, layer.instancedBarsScript].compactMap { $0 }
+            if case .script(let script) = layer.text?.desc.kind { scripts.append(script) }
+            for effect in layer.effects {
+                for pass in effect.weScriptsPerPass { scripts.append(contentsOf: pass.values) }
+            }
+            allScripts += scripts
+            let authored = scripts.filter { !$0.cursorEvents.isEmpty }
+            if authored.contains(where: \.requiresWritableBones) {
+                addLoadGap("图层「\(layer.name)」使用骨骼拖动或物理冲量，当前场景渲染器仅支持读取骨骼动画。")
+            }
+            let callbacks = authored.filter { !$0.requiresWritableBones }
+            if !callbacks.isEmpty && !nonSolidIds.contains(layer.id) {
+                cursorTargets.append(i)
+                cursorScripts[i] = callbacks
             }
         }
-        if dbg {
-            let cand = layers.filter { $0.puppetMesh != nil || interactiveIds.contains($0.id) }
-                .map { "\($0.name)#\($0.id)@(\(Int($0.origin.x)),\(Int($0.origin.y)))±(\(Int(abs($0.sizePx.x) / 2)),\(Int(abs($0.sizePx.y) / 2)))" }
-            Log.write("INTERACT miss cc=(\(Int(cc.x)),\(Int(cc.y))) cand=\(cand.joined(separator: " "))")
+        for script in allScripts where !script.cursorEvents.isEmpty && script.usesLayerAPI {
+            script.setSoundLayerPlayback { [weak audioPlayback] id in audioPlayback?.playFromScript(id: id) }
         }
-        return nil
+        inputScripts = allScripts.filter(\.readsCursorInput)
+        sharedCursorRecipients = allScripts.filter(\.usesShared)
+    }
+
+    // Screen coordinates are top-left normalized, as used by the shared desktop input router.
+    // Hit-test the actual model/view/projection output, including camera motion and final blit crop.
+    // Texture-space local positions are in the unscaled image's pixels.
+    private func cursorTransform(for i: Int) -> CGAffineTransform? {
+        let m = layers[i].mvp
+        guard !has3DScene, abs(m.columns.0.w) < 0.00001, abs(m.columns.1.w) < 0.00001,
+              abs(m.columns.3.w) > 0.00001 else { return nil }
+        let sx = aspectMouse.x * 0.5, sy = -aspectMouse.y * 0.5, w = m.columns.3.w
+        let t = CGAffineTransform(a: CGFloat(m.columns.0.x / w * sx), b: CGFloat(m.columns.0.y / w * sy),
+                                  c: CGFloat(m.columns.1.x / w * sx), d: CGFloat(m.columns.1.y / w * sy),
+                                  tx: CGFloat(0.5 + (m.columns.3.x / w - 2 * cursorUVOffset.x) * sx),
+                                  ty: CGFloat(0.5 + (m.columns.3.y / w - 2 * cursorUVOffset.y) * sy))
+        guard abs(t.a * t.d - t.b * t.c) > 1e-12 else { return nil }
+        return t
+    }
+
+    private static let cursorQuad = CGRect(x: -0.5, y: -0.5, width: 1, height: 1)
+    private func hitLayer(at point: CGPoint) -> Int? {
+        guard CGRect(x: 0, y: 0, width: 1, height: 1).contains(point) else { return nil }
+        return cursorTargets.reversed().first { i in
+            guard layers[i].visible, let transform = cursorTransform(for: i) else { return false }
+            return Self.cursorQuad.contains(point.applying(transform.inverted()))
+        }
+    }
+
+    func cursorHotspots(at point: CGPoint?) -> [CGRect] {
+        guard let point, let i = hitLayer(at: point), let transform = cursorTransform(for: i) else { return [] }
+        let rect = Self.cursorQuad.applying(transform)
+        // Full-screen effects may observe desktop input, but their panels must never cover Finder.
+        let viewportInterior = CGRect(x: 0.01, y: 0.01, width: 0.98, height: 0.98)
+        if rect.contains(viewportInterior) { return [] }
+        if abs(transform.b) < 1e-6 && abs(transform.c) < 1e-6 { return [rect] }
+        // A rotated quad's bounding rectangle includes desktop. Only claim a rectangle inside it.
+        let inverse = transform.inverted()
+        let local = point.applying(inverse)
+        let r = min((0.5 - abs(local.x)) / (abs(inverse.a) + abs(inverse.c)),
+                    (0.5 - abs(local.y)) / (abs(inverse.b) + abs(inverse.d)))
+        guard r > 0, r.isFinite else { return [] }
+        return [CGRect(x: point.x - r, y: point.y - r, width: 2 * r, height: 2 * r)]
+    }
+
+    func interactiveHitAt(mouseNorm: SIMD2<Float>) -> Int? {
+        let point = CGPoint(x: CGFloat(mouseNorm.x + 1) / 2, y: CGFloat(1 - mouseNorm.y) / 2)
+        return hitLayer(at: point).map { layers[$0].id }
+    }
+
+    private func worldPointer(_ point: SIMD2<Float>) -> SIMD2<Float> {
+        let ndc = SIMD2(2 * point.x - 1, 1 - 2 * point.y) / aspectMouse + 2 * cursorUVOffset
+        let p = proj.inverse * SIMD4(ndc.x, ndc.y, 0, 1)
+        return SIMD2(p.x, p.y) / p.w
+    }
+
+    private func updateScriptPointer(_ point: SIMD2<Float>, force: Bool = false) {
+        guard !inputScripts.isEmpty, !has3DScene, force || lastScriptPointer != point else { return }
+        lastScriptPointer = point
+        let world = worldPointer(point)
+        let screen = point * canvas // engine.screenResolution uses canvas pixels
+        for s in inputScripts { s.setCursorInput(world: world, screen: screen, pressed: pressedLayer != nil) }
+    }
+
+    func routeCursor(_ phase: WallpaperPointerPhase, at point: CGPoint) {
+        let position = SIMD2(Float(point.x), Float(point.y))
+        let hit = hitLayer(at: point)
+        func send(_ event: WECursorEvent, to index: Int?) {
+            guard let i = index, let scripts = cursorScripts[i], let t = cursorTransform(for: i) else { return }
+            let p = point.applying(t.inverted())
+            let local = (SIMD2(Float(p.x), Float(p.y)) + 0.5) * layers[i].baseSize
+            let world = worldPointer(position)
+            for script in scripts where script.cursorEvents.contains(event) {
+                let before = script.usesShared ? script.sharedJSON() : nil
+                script.dispatchCursor(event, world: world, local: local)
+                if let before {
+                    let after = script.sharedJSON()
+                    if let delta = WEScript.changedShared(before: before, after: after) {
+                        for recipient in sharedCursorRecipients where recipient !== script { recipient.injectShared(delta) }
+                    }
+                }
+            }
+        }
+        func hover(_ target: Int?) {
+            guard target != hoveredLayer else { return }
+            send(.leave, to: hoveredLayer)
+            hoveredLayer = target
+            send(.enter, to: target)
+        }
+        switch phase {
+        case .down:
+            pressedLayer = hit
+            updateScriptPointer(position, force: true)
+            hover(hit)
+            send(.down, to: hit)
+        case .drag, .hover:
+            updateScriptPointer(position)
+            hover(hit)
+            send(.move, to: pressedLayer ?? hit)
+        case .up, .cancel:
+            let captured = pressedLayer
+            pressedLayer = nil
+            updateScriptPointer(position, force: true)
+            send(.up, to: captured)
+            if phase == .up, captured == hit { send(.click, to: captured) }
+            hover(phase == .up ? hit : nil)
+        }
     }
 
     @discardableResult

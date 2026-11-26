@@ -4,7 +4,11 @@ import WebKit
 /// Desktop clicks are observed in the normal desktop. Stage Manager requires a real
 /// nonactivating event recipient over each hotspot before the mouse goes down.
 final class WebWallpaperInput {
-    private weak var webView: WKWebView?
+    private weak var view: NSView?
+    private let readHotspots: (CGPoint?, @escaping ([CGRect]) -> Void) -> Void
+    private let onPointer: (WallpaperPointerPhase, CGPoint) -> Void
+    private let observesUnclaimedDesktop: Bool
+    private var onObservedDown: ((CGPoint) -> Void)?
     private let isEnabled: () -> Bool
     private var monitor: Any?
     private var localMovement: Any?
@@ -20,9 +24,29 @@ final class WebWallpaperInput {
         CFPreferencesGetAppBooleanValue("GloballyEnabled" as CFString, "com.apple.WindowManager" as CFString, nil)
     }
 
-    init(webView: WKWebView, isEnabled: @escaping () -> Bool) {
-        self.webView = webView
+    convenience init(webView: WKWebView, isEnabled: @escaping () -> Bool) {
+        self.init(view: webView, isEnabled: { [weak webView] in
+            isEnabled() && webView?.url?.scheme == WebRenderer.scheme && webView?.url?.host == "wp"
+        }, observesUnclaimedDesktop: true, readHotspots: { [weak webView] point, completion in
+            guard let webView else { completion([]); return }
+            WebWallpaperHotspots.read(in: webView, at: point, completion: completion)
+        }, onPointer: { [weak webView] phase, point in
+            if let webView { Self.dispatch(phase, at: point, in: webView) }
+        })
+        onObservedDown = { [weak webView] point in
+            guard let webView else { return }
+            Self.dispatch(phases: ["down"], at: point, in: webView, checkCanvasHit: true, completion: nil)
+        }
+    }
+
+    init(view: NSView, isEnabled: @escaping () -> Bool, observesUnclaimedDesktop: Bool = false,
+         readHotspots: @escaping (CGPoint?, @escaping ([CGRect]) -> Void) -> Void,
+         onPointer: @escaping (WallpaperPointerPhase, CGPoint) -> Void) {
+        self.view = view
         self.isEnabled = isEnabled
+        self.observesUnclaimedDesktop = observesUnclaimedDesktop
+        self.readHotspots = readHotspots
+        self.onPointer = onPointer
         monitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .leftMouseUp, .leftMouseDragged, .mouseMoved]) { [weak self] event in
             if event.type == .mouseMoved { self?.hoverChanged(event) }
             else { self?.handle(event) }
@@ -42,7 +66,6 @@ final class WebWallpaperInput {
         if let localMovement { NSEvent.removeMonitor(localMovement) }
         monitor = nil
         localMovement = nil
-        press = nil
         timer?.invalidate()
         timer = nil
         invalidateHotspots()
@@ -51,6 +74,8 @@ final class WebWallpaperInput {
     deinit { stop() }
 
     func invalidateHotspots() {
+        if let press { onPointer(.cancel, press) }
+        press = nil
         generation &+= 1
         reading = false
         nextRead = 0
@@ -59,14 +84,13 @@ final class WebWallpaperInput {
     }
 
     private var usesHotspots: Bool {
-        guard Self.stageManagerEnabled, isEnabled(), let webView, let window = webView.window,
-              window.isVisible, window.isOnActiveSpace,
-              webView.url?.scheme == WebRenderer.scheme, webView.url?.host == "wp" else { return false }
+        guard Self.stageManagerEnabled, isEnabled(), let window = view?.window,
+              window.isVisible, window.isOnActiveSpace else { return false }
         return true
     }
 
-    private func refresh() {
-        guard usesHotspots, let webView, let window = webView.window else {
+    private func refresh(exposedPoint: CGPoint? = nil) {
+        guard usesHotspots, let view, let window = view.window else {
             if reading || !panels.isEmpty { invalidateHotspots() }
             return
         }
@@ -77,21 +101,21 @@ final class WebWallpaperInput {
         guard !reading, now >= nextRead else { return }
         let revision = generation
         reading = true
-        WebWallpaperHotspots.read(in: webView) { [weak self, weak webView, weak window] rects in
+        readHotspots(exposedPoint ?? exposedLocation()) { [weak self, weak view, weak window] rects in
             guard let self, self.generation == revision else { return }
             self.reading = false
-            guard self.usesHotspots, let webView, let window, let screen = window.screen else {
+            guard self.usesHotspots, let view, let window, let screen = window.screen else {
                 self.invalidateHotspots()
                 return
             }
             guard NSEvent.pressedMouseButtons == 0 else { return }
             let frames = rects.compactMap { normalized -> CGRect? in
-                let bounds = webView.bounds
-                let y = webView.isFlipped ? normalized.minY : 1 - normalized.maxY
+                let bounds = view.bounds
+                let y = view.isFlipped ? normalized.minY : 1 - normalized.maxY
                 let rect = CGRect(x: bounds.minX + normalized.minX * bounds.width,
                                   y: bounds.minY + y * bounds.height,
                                   width: normalized.width * bounds.width, height: normalized.height * bounds.height)
-                let frame = window.convertToScreen(webView.convert(rect, to: nil)).intersection(screen.visibleFrame)
+                let frame = window.convertToScreen(view.convert(rect, to: nil)).intersection(screen.visibleFrame)
                 return frame.isEmpty ? nil : frame
             }
             self.nextRead = ProcessInfo.processInfo.systemUptime + (frames.isEmpty ? 0.75 : 0.12)
@@ -100,9 +124,10 @@ final class WebWallpaperInput {
                 if index < self.panels.count {
                     self.panels[index].update(frame: frame)
                 } else {
-                    self.panels.append(WebWallpaperHotspotPanel(frame: frame) { [weak self] point in
-                        guard let self, self.usesHotspots else { return }
-                        self.click(at: point)
+                    self.panels.append(WebWallpaperHotspotPanel(frame: frame) { [weak self] phase, point in
+                        guard let self, phase == .cancel || self.usesHotspots,
+                              let location = self.location(at: point, clamped: true) else { return }
+                        self.onPointer(phase, location)
                     })
                 }
             }
@@ -111,7 +136,7 @@ final class WebWallpaperInput {
     }
 
     private func updatePanelVisibility() {
-        guard !panels.isEmpty, let screen = webView?.window?.screen else { return }
+        guard !panels.isEmpty, let screen = view?.window?.screen else { return }
         let pointer = NSEvent.mouseLocation
         let overHotspot = panels.contains { $0.frame.contains(pointer) }
         let modifiers = NSEvent.modifierFlags.intersection([.shift, .option, .control, .command])
@@ -123,45 +148,68 @@ final class WebWallpaperInput {
     }
 
     private func hoverChanged(_ event: NSEvent) {
-        guard !panels.isEmpty, NSEvent.pressedMouseButtons == 0 else { return }
-        guard event.type == .flagsChanged || event.timestamp >= nextHoverCheck else { return }
-        nextHoverCheck = event.timestamp + 0.025
-        updatePanelVisibility()
+        guard NSEvent.pressedMouseButtons == 0,
+              event.type == .flagsChanged || event.timestamp >= nextHoverCheck else { return }
+        nextHoverCheck = event.timestamp + 0.035
+        guard let window = view?.window, window.isVisible, window.isOnActiveSpace, isEnabled(),
+              let screen = window.screen else { return }
+        guard screen.visibleFrame.contains(NSEvent.mouseLocation), let pos = exposedLocation() else { return }
+        if Self.stageManagerEnabled {
+            // Re-evaluate the point under a moving cursor even if the last sample was blank.
+            nextRead = 0
+            refresh(exposedPoint: pos)
+        }
+        if observesUnclaimedDesktop && event.type == .mouseMoved { onPointer(.hover, pos) }
+    }
+
+    private func exposedLocation() -> CGPoint? {
+        let point = NSEvent.mouseLocation
+        guard let screen = view?.window?.screen, screen.visibleFrame.contains(point), let pos = location(at: point),
+              Self.canRoute(at: point, on: screen, ignoring: Set(panels.filter(\.isVisible).map(\.windowNumber))) else { return nil }
+        return pos
     }
 
     private func handle(_ event: NSEvent) {
-        if event.type == .leftMouseDragged {
-            press = nil
-            return
-        }
-        let start = press
-        press = nil
-        guard !Self.stageManagerEnabled, event.type == .leftMouseDown || start != nil,
-              isEnabled(), let window = webView?.window as? DesktopWindow,
-              window.isVisible, window.isOnActiveSpace, let screen = window.screen,
-              event.modifierFlags.intersection([.control, .shift, .option, .command]).isEmpty,
-              event.clickCount == 1, let cgEvent = event.cgEvent else { return }
-
-        // Quartz uses the main display's top-left origin even with another display above it.
-        let quartzPoint = cgEvent.location
-        let point = CGPoint(x: quartzPoint.x, y: CGDisplayBounds(CGMainDisplayID()).height - quartzPoint.y)
-        let target = pid_t(clamping: cgEvent.getIntegerValueField(.eventTargetUnixProcessID))
-        guard screen.visibleFrame.contains(point), Self.canRoute(at: point, on: screen, target: target) else { return }
+        guard let cgEvent = event.cgEvent else { return }
+        let quartz = cgEvent.location
+        let point = CGPoint(x: quartz.x, y: CGDisplayBounds(CGMainDisplayID()).height - quartz.y)
         if event.type == .leftMouseDown {
-            press = point
+            if let press { onPointer(.cancel, press) }
+            press = nil
+            guard (!Self.stageManagerEnabled || observesUnclaimedDesktop), isEnabled(),
+                  let window = view?.window as? DesktopWindow, window.isVisible, window.isOnActiveSpace,
+                  let screen = window.screen, screen.visibleFrame.contains(point),
+                  event.clickCount == 1, event.modifierFlags.intersection([.control, .shift, .option, .command]).isEmpty,
+                  let pos = location(at: point) else { return }
+            let target = pid_t(clamping: cgEvent.getIntegerValueField(.eventTargetUnixProcessID))
+            guard Self.canRoute(at: point, on: screen, target: target) else { return }
+            // A global monitor observes Finder's click. It does not take it away from
+            // Stage Manager on full-screen canvases without authored hit geometry.
+            press = pos
+            if Self.stageManagerEnabled, let onObservedDown { onObservedDown(pos) }
+            else { onPointer(.down, pos) }
             return
         }
-
-        guard let start, hypot(point.x - start.x, point.y - start.y) <= 4 else { return }
-        click(at: point)
+        guard let last = press else { return }
+        let pos = location(at: point, clamped: true) ?? last
+        if event.type == .leftMouseDragged {
+            press = pos
+            onPointer(.drag, pos)
+        } else if event.type == .leftMouseUp {
+            press = nil
+            onPointer(event.modifierFlags.intersection([.control, .shift, .option, .command]).isEmpty ? .up : .cancel, pos)
+        }
     }
 
-    private func click(at point: CGPoint) {
-        guard let webView, let window = webView.window else { return }
-        let local = webView.convert(window.convertPoint(fromScreen: point), from: nil)
-        if let location = Self.normalizedPoint(local, in: webView.bounds, flipped: webView.isFlipped) {
-            Self.dispatchClick(at: location, in: webView)
+    private func location(at point: CGPoint, clamped: Bool = false) -> CGPoint? {
+        guard let view, let window = view.window else { return nil }
+        let local = view.convert(window.convertPoint(fromScreen: point), from: nil)
+        let bounds = view.bounds
+        guard clamped, bounds.width > 0, bounds.height > 0 else {
+            return Self.normalizedPoint(local, in: bounds, flipped: view.isFlipped)
         }
+        return CGPoint(x: min(1, max(0, (local.x - bounds.minX) / bounds.width)),
+                       y: min(1, max(0, (view.isFlipped ? local.y - bounds.minY : bounds.maxY - local.y) / bounds.height)))
     }
 
     static func normalizedPoint(_ point: CGPoint, in bounds: CGRect, flipped: Bool) -> CGPoint? {
@@ -170,8 +218,8 @@ final class WebWallpaperInput {
                        y: (flipped ? point.y - bounds.minY : bounds.maxY - point.y) / bounds.height)
     }
 
-    private static func canRoute(at point: CGPoint, on screen: NSScreen, target: pid_t = 0,
-                                 placingPanels panels: Set<Int>? = nil) -> Bool {
+    static func canRoute(at point: CGPoint, on screen: NSScreen, target: pid_t = 0,
+                                 placingPanels panels: Set<Int>? = nil, ignoring skipped: Set<Int> = []) -> Bool {
         let desktopOwners = ["com.apple.finder", "com.apple.dock", "com.apple.WindowManager"]
         let icons = Int(CGWindowLevelForKey(.desktopIconWindow))
         let background = Int(CGWindowLevelForKey(.desktopWindow))
@@ -180,7 +228,7 @@ final class WebWallpaperInput {
         var foundBackdrop = false
 
         while hit > 0, visited.insert(hit).inserted {
-            if panels?.contains(hit) == true {
+            if panels?.contains(hit) == true || skipped.contains(hit) {
                 hit = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: hit)
                 continue
             }
@@ -238,38 +286,67 @@ final class WebWallpaperInput {
         return role as? String
     }
 
-    /// Use viewport CSS coordinates (including on Retina) and hit-test the actual canvas
-    /// or DOM element. Only the local wallpaper receives the event, including if the page
-    /// navigates between scheduling and evaluating the script.
-    static func dispatchClick(at normalized: CGPoint, in webView: WKWebView,
-                              completion: ((Any?, Error?) -> Void)? = nil) {
-        guard normalized.x.isFinite, normalized.y.isFinite,
-              (0...1).contains(normalized.x), (0...1).contains(normalized.y),
+    static func dispatch(_ phase: WallpaperPointerPhase, at point: CGPoint, in webView: WKWebView,
+                         completion: ((Any?, Error?) -> Void)? = nil) {
+        dispatch(phases: [phase.rawValue], at: point, in: webView, completion: completion)
+    }
+
+    static func dispatchClick(at point: CGPoint, in webView: WKWebView, completion: ((Any?, Error?) -> Void)? = nil) {
+        dispatch(phases: ["down", "up"], at: point, in: webView, completion: completion)
+    }
+
+    private static func dispatch(phases: [String], at point: CGPoint, in webView: WKWebView,
+                                 checkCanvasHit: Bool = false, completion: ((Any?, Error?) -> Void)?) {
+        guard point.x.isFinite, point.y.isFinite, (0...1).contains(point.x), (0...1).contains(point.y),
               webView.url?.scheme == WebRenderer.scheme, webView.url?.host == "wp" else {
             completion?(false, nil)
             return
         }
         let script = """
-        (() => {
-          if (location.protocol !== 'lwwp:' || location.hostname !== 'wp') return false;
-          const x = Math.min(innerWidth - 1, \(normalized.x) * innerWidth);
-          const y = Math.min(innerHeight - 1, \(normalized.y) * innerHeight);
-          const target = document.elementFromPoint(x, y);
-          if (!target) return false;
-          const options = {clientX:x, clientY:y, button:0, bubbles:true, cancelable:true,
-                           composed:true, view:window, detail:1};
-          const pointer = (name, buttons) => target.dispatchEvent(new PointerEvent(name, {
-            ...options, buttons, pointerId:1, pointerType:'mouse', isPrimary:true
-          }));
-          const mouse = (name, buttons) => target.dispatchEvent(new MouseEvent(name, {...options, buttons}));
-          const compatible = pointer('pointerdown', 1);
-          if (compatible) mouse('mousedown', 1);
-          pointer('pointerup', 0);
-          if (compatible) mouse('mouseup', 0);
-          mouse('click', 0);
-          return true;
-        })()
+        if (location.protocol !== 'lwwp:' || location.hostname !== 'wp') return false;
+        const x = Math.min(innerWidth - 1, nx * innerWidth), y = Math.min(innerHeight - 1, ny * innerHeight);
+        const hit = document.elementFromPoint(x, y);
+        if (checkCanvasHit) {
+            \(WebWallpaperHotspots.canvasProbe)
+            // An exposed full-screen canvas without a hit map may react to every desktop click.
+            // Known runtimes have an explicit empty-space result, which belongs to the system.
+            if (canvasHit(hit, x, y) === false) return false;
+        }
+        for (const phase of phases) {
+            let press = window.__lwDesktopPress;
+            const target = (phase === 'down' || phase === 'hover') ? hit : press?.target;
+            if (!target) return false;
+            const options = {clientX:x, clientY:y, button:0, bubbles:true, cancelable:true,
+                             composed:true, view:window, detail:1};
+            const pointer = (name, buttons) => target.dispatchEvent(new PointerEvent(name, {
+                ...options, button:name==='pointermove' ? -1 : 0, buttons, pointerId:1, pointerType:'mouse', isPrimary:true
+            }));
+            const mouse = (name, buttons) => target.dispatchEvent(new MouseEvent(name, {...options, buttons}));
+            if (phase === 'down') {
+                press = window.__lwDesktopPress = {target, x, y, clicked:true, compatible:true};
+                press.compatible = pointer('pointerdown', 1);
+                if (press.compatible) mouse('mousedown', 1);
+            } else if (phase === 'hover' || phase === 'drag') {
+                const buttons = phase === 'drag' ? 1 : 0;
+                if (buttons && Math.hypot(x-press.x, y-press.y) > 4) press.clicked = false;
+                pointer('pointermove', buttons);
+                if (!buttons || press.compatible) mouse('mousemove', buttons);
+            } else {
+                delete window.__lwDesktopPress;
+                if (phase === 'cancel') { pointer('pointercancel', 0); continue; }
+                pointer('pointerup', 0);
+                if (press.compatible) mouse('mouseup', 0);
+                if (press.clicked && hit === target && Math.hypot(x-press.x, y-press.y) <= 4) mouse('click', 0);
+            }
+        }
+        return true;
         """
-        webView.evaluateJavaScript(script, completionHandler: completion)
+        webView.callAsyncJavaScript(script, arguments: ["phases": phases, "nx": point.x, "ny": point.y, "checkCanvasHit": checkCanvasHit],
+                                    in: nil, in: .page) { result in
+            switch result {
+            case .success(let value): completion?(value, nil)
+            case .failure(let error): completion?(nil, error)
+            }
+        }
     }
 }

@@ -41,7 +41,7 @@ final class WebWallpaperInputTests: XCTestCase {
         <!doctype html><style>body{margin:0} canvas{position:fixed;left:50%;top:0;width:50%;height:100%}</style>
         <canvas id="stage"></canvas><script>
         window.received = [];
-        for (const name of ['pointerdown','mousedown','pointerup','mouseup','click']) {
+        for (const name of ['pointerdown','mousedown','pointerup','mouseup','click','pointermove','mousemove','pointercancel']) {
           document.querySelector('canvas').addEventListener(name, event => received.push(
             [event.type,event.target.id,event.clientX,event.clientY,event.buttons].join(':')));
         }
@@ -68,5 +68,27 @@ final class WebWallpaperInputTests: XCTestCase {
         let events = try await view.evaluateJavaScript("window.received") as? [String]
         XCTAssertEqual(events, ["pointerdown:stage:300:50:1", "mousedown:stage:300:50:1",
                                 "pointerup:stage:300:50:0", "mouseup:stage:300:50:0", "click:stage:300:50:0"])
+
+        func send(_ phase: WallpaperPointerPhase, _ point: CGPoint) async -> Bool {
+            await withCheckedContinuation { completion in
+                WebWallpaperInput.dispatch(phase, at: point, in: view) { value, _ in
+                    completion.resume(returning: value as? Bool == true)
+                }
+            }
+        }
+        _ = try await view.evaluateJavaScript("received.length = 0")
+        // Keep the original canvas as the event recipient when the pointer leaves it.
+        let outsideCanvas = CGPoint(x: 0.25, y: 0.25)
+        for (phase, point) in [(WallpaperPointerPhase.down, coordinate), (.drag, outsideCanvas), (.up, outsideCanvas),
+                               (.hover, coordinate), (.down, coordinate), (.cancel, coordinate)] {
+            let delivered = await send(phase, point)
+            XCTAssertTrue(delivered)
+        }
+        let drag = try await view.evaluateJavaScript("received") as? [String]
+        XCTAssertEqual(drag, ["pointerdown:stage:300:50:1", "mousedown:stage:300:50:1",
+                              "pointermove:stage:100:50:1", "mousemove:stage:100:50:1",
+                              "pointerup:stage:100:50:0", "mouseup:stage:100:50:0",
+                              "pointermove:stage:300:50:0", "mousemove:stage:300:50:0",
+                              "pointerdown:stage:300:50:1", "mousedown:stage:300:50:1", "pointercancel:stage:300:50:0"])
     }
 }

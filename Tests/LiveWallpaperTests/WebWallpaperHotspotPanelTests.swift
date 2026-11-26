@@ -4,11 +4,13 @@ import XCTest
 
 @MainActor
 final class WebWallpaperHotspotPanelTests: XCTestCase {
-    func testHotspotMouseSequenceUsesScreenCoordinatesAndExcludesDrags() throws {
+    func testHotspotForwardsOriginalPressDragReleaseAndCancellation() throws {
         _ = NSApplication.shared
-        var clicks: [CGPoint] = []
-        let panel = WebWallpaperHotspotPanel(frame: CGRect(x: 40, y: 90, width: 80, height: 50)) {
-            clicks.append($0)
+        var phases: [WallpaperPointerPhase] = []
+        var points: [CGPoint] = []
+        let panel = WebWallpaperHotspotPanel(frame: CGRect(x: 40, y: 90, width: 80, height: 50)) { phase, point in
+            phases.append(phase)
+            points.append(point)
         }
         defer { panel.close() }
         let surface = try XCTUnwrap(panel.contentView)
@@ -29,6 +31,8 @@ final class WebWallpaperHotspotPanelTests: XCTestCase {
         surface.mouseDown(with: try event(.leftMouseDown, local))
         panel.setReceivingClicks(false)
         surface.mouseUp(with: try event(.leftMouseUp, local))
-        XCTAssertEqual(clicks, [panel.convertPoint(toScreen: local)])
+        XCTAssertEqual(phases, [.down, .up, .down, .drag, .up, .down, .cancel])
+        XCTAssertEqual(points[3], panel.convertPoint(toScreen: CGPoint(x: 38, y: 19)))
+        XCTAssertEqual(points.first, panel.convertPoint(toScreen: local))
     }
 }
