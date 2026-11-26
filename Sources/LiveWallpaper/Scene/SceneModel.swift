@@ -425,6 +425,12 @@ enum WEVisibilityResolver {
 
 /// 一个待渲染图层的描述(尚未解码纹理)。
 struct LayerDesc {
+    var ownsCursorCallbacks: Bool {
+        if [visibleScript, alphaScript, colorScript, scaleScript, originScript, angleScript, instancedBarsScript]
+            .contains(where: { $0?.cursorEvents.isEmpty == false }) { return true }
+        if case .script(let script) = text?.kind, !script.cursorEvents.isEmpty { return true }
+        return effects.contains { $0.weScriptsPerPass.contains { $0.values.contains { !$0.cursorEvents.isEmpty } } }
+    }
     var usesBoneScript: Bool {
         let fields = [visibleScript, alphaScript, colorScript, scaleScript, originScript, angleScript,
                       ancestorOriginScript, instancedBarsScript]
@@ -779,6 +785,7 @@ struct SceneDocument {
     var scriptUserProperties: [String: WallpaperProperty.Value] = [:]
     /// Explicitly non-solid layers still render but never receive SceneScript cursor events.
     var nonSolidIds = Set<Int>()
+    var cursorPropagationStops = Set<Int>()
     var emitters: [ParticleEmitterDesc] = []
     // 声音对象(ObjectParser.cpp:206-221)。解析存下;播放未实现(见返回说明)。
     var sounds: [SoundDesc] = []
@@ -2295,6 +2302,10 @@ struct SceneDocument {
         doc.timeStageConfig = timeStageConfig
         doc.nonSolidIds = Set(objects.compactMap { object in
             guard (VecParse.unwrap(object["solid"]) as? NSNumber)?.boolValue == false else { return nil }
+            return (object["id"] as? NSNumber)?.intValue
+        })
+        doc.cursorPropagationStops = Set(objects.compactMap { object in
+            guard (VecParse.unwrap(object["disablepropagation"]) as? NSNumber)?.boolValue == true else { return nil }
             return (object["id"] as? NSNumber)?.intValue
         })
         doc.hasCursorRipple = hasCursorRipple

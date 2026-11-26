@@ -107,6 +107,15 @@ struct PuppetMesh {
     private let boneWt: [SIMD4<Float>]      // 每顶点 4 个权重(和=1)
     // 骨骼:
     let scriptBones: [SceneBonePose.Bone]
+    private let hitBoxes: PuppetHitBoxes?
+    var hasHitBoxes: Bool { hitBoxes != nil }
+
+    /// Layer-centred pixels, +Y upwards, just like the skinned vertex data.
+    func hitBoxName(at point: SIMD2<Float>) -> String? {
+        guard let hitBoxes else { return nil }
+        return hitBoxes.name(at: point, using: hitBoxes.drawnPose ?? worldBind)
+    }
+
     private let parent: [Int]
     private let localBind: [simd_float4x4]  // 每骨局部 bind(父相对)
     private let worldBind: [simd_float4x4]  // 累乘后的世界 bind
@@ -645,6 +654,7 @@ struct PuppetMesh {
                 // 父链累乘 world + 普通蒙皮(虹膜不变形,只标记被盖顶点 → unitVertsOccluded uv.y=−10 → 片元 discard)。
                 var world = [simd_float4x4](repeating: matrix_identity_float4x4, count: nb)
                 for b in 0..<nb { let p = parent[b]; world[b] = (p >= 0 && p < nb) ? world[p] * local[b] : local[b] }
+                hitBoxes?.drawnPose = world
                 var skinned = [SIMD2<Float>](repeating: .zero, count: rawPos.count)
                 for i in 0..<rawPos.count {
                     let p4 = SIMD4<Float>(rawPos[i].x, rawPos[i].y, 0, 1)
@@ -850,6 +860,7 @@ struct PuppetMesh {
         let shallowType = sclera.contains { $0.minSyF >= 0.05 }
         if shallowType {
             // 普通蒙皮到 world 空间(挤压留到顶点级)。
+            hitBoxes?.drawnPose = world
             var skinned = [SIMD2<Float>](repeating: .zero, count: rawPos.count)
             for i in 0..<rawPos.count {
                 let p4 = SIMD4<Float>(rawPos[i].x, rawPos[i].y, 0, 1)
@@ -1091,6 +1102,7 @@ struct PuppetMesh {
 
     /// 共享顶点蒙皮:skin[b] = world[b]·invBind[b],逐顶点 4 骨加权,输出单位空间 [x,y,u,v]。
     func skinVerts(world: [simd_float4x4]) -> [Float] {
+        hitBoxes?.drawnPose = world
         let nb = world.count
         var skinned = [SIMD2<Float>](repeating: .zero, count: rawPos.count)
         for i in 0..<rawPos.count {
@@ -1190,7 +1202,7 @@ struct PuppetMesh {
             return p
         }
         let mdlsRaw2 = mdlsRaw   // 供 MDAT 上界
-        let mdls = verOK(mdlsRaw, ["0004", "0002"])
+        let mdls = verOK(mdlsRaw, ["0004", "0003", "0002"])
         let mdla = verOK(mdlaRaw, ["0006", "0005"])
         let mdatRaw = findTag([0x4D,0x44,0x41,0x54], from: markerSize)   // "MDAT"(部件间挂点)
         let mdat = verOK(mdatRaw, ["0001"])
@@ -1325,18 +1337,21 @@ struct PuppetMesh {
         // ---- MDLS 骨骼:u8 + u32(ptr) + u32 boneCount;每骨 cstr name+u32 id+i32 parent+u32(matBytes)+16f 矩阵(行主序)+ JSON cstr ----
         var parent = [Int](); var localBind = [simd_float4x4]()
         var scriptBones: [SceneBonePose.Bone] = []
+        var hitBoxes: PuppetHitBoxes?
         if let m = mdls {
             let hdrEnd = m + 8 + 1 + 4     // 跳 magic(8) + u8 flag + u32 ptr
             let boneCount = Int(u32(hdrEnd))
             var o = hdrEnd + 4
             let mdlsEnd = min(b.count, mdlaRaw ?? b.count)
             if boneCount > 0 && boneCount < 4096 {
+                var names: [Range<Int>] = []
                 for _ in 0..<boneCount {
                     // MDLS stores a NUL-terminated author name before the object id (including empty names).
                     let start = o
                     while o < mdlsEnd, b[o] != 0 { o += 1 }
                     guard o < mdlsEnd else { break }
                     let nameEnd = o
+                    names.append(start..<nameEnd)
                     o += 1
                     guard o + 12 + 64 <= mdlsEnd, u32(o + 8) == 64 else { break }
                     o += 4 // object id, independent of bone index/name
@@ -1363,6 +1378,12 @@ struct PuppetMesh {
                         scriptBones.append(.init(name: name, parent: par, bind: mat, physics: .init(metadata as? [String: Any] ?? [:])))
                     }
                     if o < mdlsEnd { o += 1 }
+                }
+                let sectionEnd = Int(u32(m + 9))
+                if parent.count == boneCount, o < sectionEnd, sectionEnd <= mdlsEnd {
+                    let version = Int(b[m + 7] - 48)
+                    hitBoxes = PuppetHitBoxes.decode(b[o..<sectionEnd], version: version,
+                                                      names: names.map { String(decoding: b[$0], as: UTF8.self) })
                 }
             }
         }
@@ -1583,7 +1604,7 @@ struct PuppetMesh {
         return PuppetMesh(size: size, indices: indices,
                           drawGroups: drawGroups, clippingMasks: clippingMasks,
                           rawPos: rawPos, uv: uv,
-                          boneIdx: bIdx, boneWt: bWt, scriptBones: scriptBones, parent: parent,
+                          boneIdx: bIdx, boneWt: bWt, scriptBones: scriptBones, hitBoxes: hitBoxes, parent: parent,
                           localBind: localBind, worldBind: worldBind, invBind: invBind,
                           anims: anims, attachments: attachments)
     }

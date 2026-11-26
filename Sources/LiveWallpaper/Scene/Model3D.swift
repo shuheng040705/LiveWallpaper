@@ -13,6 +13,36 @@ final class Scene3DScriptHost {
     private var currents: [String: SIMD3<Float>] = [:] // 每脚本当前值(逐 tick 演进:支持累积/状态脚本)
     private var texts: [String: String] = [:]          // 文字脚本(text 属性)的字符串结果
     private(set) var registered = 0
+    private var cursorHandlers: [Int: [WECursorEvent: [JSValue]]] = [:]
+    private(set) var readsInput = false
+    private(set) var visibility: [Int: Bool] = [:]
+    private var visibleKeys: [String: Int] = [:]
+
+    var cursorLayerIds: Set<Int> { Set(cursorHandlers.keys) }
+
+    func dispatchCursor(_ event: WECursorEvent, hit: SceneCursorHit) {
+        guard let handlers = cursorHandlers[hit.id]?[event] else { return }
+        for fn in handlers {
+            if let argument = hit.argument(in: ctx) { _ = fn.call(withArguments: [argument]) }
+        }
+    }
+
+    func setInput(screen: SIMD2<Float>, pressed: Bool) {
+        guard readsInput || !cursorHandlers.isEmpty, let input = ctx.objectForKeyedSubscript("input"),
+              let vec = ctx.objectForKeyedSubscript("Vec2") else { return }
+        input.setObject(vec.construct(withArguments: [screen.x, screen.y]), forKeyedSubscript: "cursorScreenPosition" as NSString)
+        input.setObject(pressed, forKeyedSubscript: "cursorLeftDown" as NSString)
+    }
+
+    func setViewport(canvas: SIMD2<Float>, pixels: SIMD2<Float>) {
+        guard let engine = ctx.objectForKeyedSubscript("engine"), let vec = ctx.objectForKeyedSubscript("Vec2") else { return }
+        engine.setObject(vec.construct(withArguments: [pixels.x, pixels.y]), forKeyedSubscript: "screenResolution" as NSString)
+        engine.setObject(vec.construct(withArguments: [canvas.x, canvas.y]), forKeyedSubscript: "canvasSize" as NSString)
+    }
+
+    func setSoundLayerPlayback(_ play: @escaping @convention(block) (Int) -> Void) {
+        ctx.setObject(play, forKeyedSubscript: "__wePlaySoundLayer" as NSString)
+    }
 
     /// 太阳系 Main 模拟(VSOP87D 日心模拟)用 `Date.now()`(墙钟毫秒)算时间步进:
     ///   `realDeltaMs = clamp(now - lastRealTime, 0, 100)`、`deltaSeconds = realDeltaMs/1000 * actualTimeMultiplier`、
@@ -45,6 +75,12 @@ final class Scene3DScriptHost {
     init() {
         ctx.exceptionHandler = { _, _ in }
         ctx.evaluateScript(WEScript.preludeSource)
+        let setVisible: @convention(block) (Int, Bool) -> Void = { [weak self] id, value in
+            self?.visibility[id] = value
+        }
+        ctx.setObject(setVisible, forKeyedSubscript: "__weSetVisible" as NSString)
+        let getVisible: @convention(block) (Int) -> Bool = { [weak self] id in self?.visibility[id] ?? true }
+        ctx.setObject(getVisible, forKeyedSubscript: "__weGetVisible" as NSString)
         // storage 桩(时间倍率/单位脚本 id=859/860 用 storage.get/set 存档;prelude 只定义 localStorage)。
         // 与 localStorage 同构,本地内存即可(单会话无需持久化);缺它会让倍率脚本走 catch 分支(默认值仍对)。
         ctx.evaluateScript("""
@@ -89,9 +125,24 @@ final class Scene3DScriptHost {
         ctx.setObject(ov, forKeyedSubscript: "__wePropOverrides" as NSString)
         ctx.evaluateScript(WEScript.shimSource)            // 重定义 createScriptProperties(读本脚本的覆盖)
         let body = WEScript.stripModuleSyntax(source)
-        let wrapped = "(function(){ try {\n\(body)\nreturn {u:(typeof update!=='undefined')?update:null, i:(typeof init!=='undefined')?init:null}; } catch(e){ return {u:null,i:null}; } })()"
+        let callbacks = WECursorEvent.allCases.map { e in
+            "\(e.rawValue):typeof \(e.rawValue)==='function'?\(e.rawValue):null"
+        }.joined(separator: ",")
+        let wrapped = """
+            (function(thisLayer) { return (function() {
+              \(body)
+              return {u:typeof update==='function'?update:null, i:typeof init==='function'?init:null, \(callbacks)};
+            })(); })(thisScene.getLayer(\(id)))
+            """
         guard let r = ctx.evaluateScript(wrapped), r.isObject else { return }
+        if !readsInput { readsInput = source.range(of: #"\binput\b"#, options: .regularExpression) != nil }
+        for event in WECursorEvent.allCases {
+            if let fn = r.objectForKeyedSubscript(event.rawValue), fn.isObject {
+                cursorHandlers[id, default: [:]][event, default: []].append(fn)
+            }
+        }
         let u = r.objectForKeyedSubscript("u"); let i = r.objectForKeyedSubscript("i")
+        if prop == "visible" { visibleKeys[Self.key(id, prop)] = id }
         handles[Self.key(id, prop)] = Handle(update: (u?.isObject == true) ? u : nil,
                                              initFn: (i?.isObject == true) ? i : nil)
         currents[Self.key(id, prop)] = staticValue
@@ -102,8 +153,8 @@ final class Scene3DScriptHost {
         for (key, h) in handles {
             guard let i = h.initFn else { continue }
             let c = currents[key] ?? .zero
-            let v = ctx.evaluateScript("({x:\(c.x),y:\(c.y),z:\(c.z)})")!
-            _ = i.call(withArguments: [v])
+            if let id = visibleKeys[key] { _ = i.call(withArguments: [visibility[id] ?? true]) }
+            else if let v = ctx.evaluateScript("new Vec3(\(c.x),\(c.y),\(c.z))") { _ = i.call(withArguments: [v]) }
         }
     }
 
@@ -123,8 +174,14 @@ final class Scene3DScriptHost {
         }
         for (key, h) in handles {
             guard let u = h.update else { continue }
+            if let id = visibleKeys[key] {
+                if let result = u.call(withArguments: [visibility[id] ?? true]), result.isBoolean || result.isNumber {
+                    visibility[id] = result.toBool()
+                }
+                continue
+            }
             let c = currents[key] ?? .zero
-            let arg = ctx.evaluateScript("({x:\(c.x),y:\(c.y),z:\(c.z)})")!
+            let arg = ctx.evaluateScript("new Vec3(\(c.x),\(c.y),\(c.z))")!
             guard let ret = u.call(withArguments: [arg]) else { continue }
             // 文字脚本(text/textzhen 等属性)update() 返回 string → 存 texts(供 HUD 文字层用)。
             if ret.isString { texts[key] = ret.toString() ?? ""; continue }
@@ -170,21 +227,14 @@ final class Scene3DScriptHost {
         return [Float(x.isFinite ? x : 0), Float(y.isFinite ? y : 0), Float(z.isFinite ? z : 0)]
     }
     func hasUniform(_ key: String) -> Bool { uniformHandles[key] != nil }
-    /// 评估某层的 visible 脚本(读宿主 shared)→ bool。无 visible 脚本则返 nil(用静态可见性)。
-    /// 太阳系灵动岛/通知等容器靠 visible 脚本条件显隐;静态壁纸无交互→默认隐藏,其子层(边框等)随之隐藏。
-    func evalLayerVisible(id: Int) -> Bool? {
-        guard let h = handles[Self.key(id, "visible")], let u = h.update else { return nil }
-        let arg = ctx.evaluateScript("true")!
-        guard let ret = u.call(withArguments: [arg]), !ret.isUndefined, !ret.isNull else { return nil }
-        if ret.isBoolean { return ret.toBool() }
-        if ret.isNumber { return ret.toDouble() != 0 }
-        return nil
-    }
 
     // MARK: - thisScene.getLayer 真实层 + 回灌(太阳系 Main 模拟用 getLayer(name).origin=轨道位置 驱动行星)
     /// 安装真实场景层:name/id→层对象,origin/scale/angles 用 defineProperty 记脏(_o/_s/_a)。
     /// 让 Main 模拟的 `thisScene.getLayer(name).origin = 计算位置` 命中真层、被 readLayerOverrides 读回。
     func installLayers(_ defs: [[String: Any]]) {
+        for definition in defs {
+            if let id = definition["id"] as? Int { visibility[id] = definition["visible"] as? Bool ?? true }
+        }
         ctx.setObject(defs, forKeyedSubscript: "__weLayerDefs" as NSString)
         ctx.evaluateScript(Self.installDirtyLayersSource)
     }
@@ -209,13 +259,16 @@ final class Scene3DScriptHost {
       var defs = globalThis.__weLayerDefs || [];
       var layers = {}; var list = [];
       function mk(d) {
-        var o = { id: d.id, name: String(d.name||''), visible: true, alpha: 1, text: '',
+        var o = { id: d.id, name: String(d.name||''), alpha: 1, text: '',
                   _o: null, _s: null, _a: null,
                   color: new Vec4(1,1,1,1), parallaxDepth: new Vec2(0,0),
+                  play: function(){ if(globalThis.__wePlaySoundLayer) __wePlaySoundLayer(this.id); },
                   getMaterial: function(){ return null; } };
-        Object.defineProperty(o, 'origin', { get: function(){ return this._o || new Vec3(0,0,0); }, set: function(v){ this._o = v; }, configurable: true });
-        Object.defineProperty(o, 'scale',  { get: function(){ return this._s || new Vec3(1,1,1); }, set: function(v){ this._s = v; }, configurable: true });
-        Object.defineProperty(o, 'angles', { get: function(){ return this._a || new Vec3(0,0,0); }, set: function(v){ this._a = v; }, configurable: true });
+        Object.setPrototypeOf(o, globalThis.thisLayer);
+        Object.defineProperty(o, 'visible', {get(){return __weGetVisible(this.id);}, set(v){__weSetVisible(this.id,!!v);}});
+        Object.defineProperty(o, 'origin', { get: function(){ return this._o || new Vec3(...(d.origin || [0,0,0])); }, set: function(v){ this._o = v; }, configurable: true });
+        Object.defineProperty(o, 'scale',  { get: function(){ return this._s || new Vec3(...(d.scale || [1,1,1])); }, set: function(v){ this._s = v; }, configurable: true });
+        Object.defineProperty(o, 'angles', { get: function(){ return this._a || new Vec3(...(d.angles || [0,0,0])); }, set: function(v){ this._a = v; }, configurable: true });
         return o;
       }
       for (var i=0;i<defs.length;i++){ var d=defs[i]||{}; var o=mk(d); layers[String(d.id)]=o; if(o.name) layers[o.name]=o; list.push(o); }
@@ -260,17 +313,17 @@ final class Scene3DScriptHost {
 
 // MARK: - MDLV0023 3D 几何模型(太阳系/土星等透视场景的行星/天空盒/环)
 //
-// 与 PuppetMesh 的 MDLV(80字节蒙皮顶点)不同:这些是**纯几何 3D 模型**,顶点 **48 字节**
-// (pos float3 + normal float3 + tangent float4 + uv float2),vfmt=15。逐字节逆向 + 多文件交叉
-// 验证(s1.mdl 8064顶点法线单位长、索引合法、文件大小自洽)。
+// 静态 3D 模型的每个子网格独立声明顶点格式。
+// 0x9 为 20 字节的位置及 UV；0xf 为 48 字节，依次包含位置、法线、切线及 UV。
 //
 // 格式(小端):
 //  [0:9]  "MDLV0023"\0
 //  [9]    u32 version(15)   [13] u32 unk(1)   [17] u32 submeshCount
 //  每 submesh:material cstr(null结尾) + u32 reserved + 3f bboxMin + 3f bboxMax
-//             + u32 vfmt + u32 vertexBytes + 顶点[vertexBytes/48] + u32 indexBytes + u16[indexBytes/2]
+//             + u32 vfmt + u32 vertexBytes + vertex payload + u32 indexBytes + index payload
 //             + (非末尾)若干 0x00 padding
 struct MDLGeometry {
+    let bounds: SceneModelBounds
     struct Submesh { let material: String; let indexStart: Int; let indexCount: Int }
     let positions: [SIMD3<Float>]
     let normals: [SIMD3<Float>]
@@ -292,7 +345,6 @@ struct MDLGeometry {
 
     static func parse(_ data: Data) -> MDLGeometry? {
         let b = [UInt8](data)
-        let stride = 48
         guard b.count >= 21, let magic = String(bytes: b[0..<8], encoding: .ascii),
               magic == "MDLV0023" || magic == "MDLV0021" else { return nil }
         func u32(_ o: Int) -> UInt32 {
@@ -307,6 +359,7 @@ struct MDLGeometry {
         guard submeshCount > 0, submeshCount < 4096 else { return nil }
 
         var positions = [SIMD3<Float>](), normals = [SIMD3<Float>](), uvs = [SIMD2<Float>]()
+        var bounds: SceneModelBounds?
         var indices = [UInt32](), submeshes = [MDLGeometry.Submesh]()
         for si in 0..<submeshCount {
             // material cstr
@@ -316,17 +369,32 @@ struct MDLGeometry {
             let material = String(bytes: b[mstart..<o], encoding: .utf8) ?? ""
             o += 1                        // NUL
             _ = u32(o); o += 4            // reserved
-            o += 24                       // bbox min(3f)+max(3f)
-            _ = u32(o); o += 4            // vfmt
+            guard o + 24 <= b.count else { return nil }
+            let box = SceneModelBounds(min: SIMD3(f32(o), f32(o + 4), f32(o + 8)),
+                                       max: SIMD3(f32(o + 12), f32(o + 16), f32(o + 20)))
+            if box.min.x.isFinite && box.min.y.isFinite && box.min.z.isFinite &&
+                box.max.x.isFinite && box.max.y.isFinite && box.max.z.isFinite &&
+                box.min.x <= box.max.x && box.min.y <= box.max.y && box.min.z <= box.max.z {
+                if bounds == nil { bounds = box } else { bounds?.include(box) }
+            }
+            o += 24
+            let format = u32(o); o += 4
+            // 0x9 is position + UV (e.g. the stock Techno models). 0xf adds
+            // the authored normal and tangent before the UV. This is per mesh.
+            guard format == 0x9 || format == 0xf else { return nil }
+            let hasNormals = format == 0xf
+            let stride = hasNormals ? 48 : 20
             let vbl = Int(u32(o)); o += 4
             guard vbl > 0, vbl % stride == 0, o + vbl + 4 <= b.count else { return nil }
             let nv = vbl / stride
             let vbase = positions.count
             for vi in 0..<nv {
                 let vo = o + vi * stride
-                positions.append(SIMD3(f32(vo), f32(vo + 4), f32(vo + 8)))
-                normals.append(SIMD3(f32(vo + 12), f32(vo + 16), f32(vo + 20)))
-                uvs.append(SIMD2(f32(vo + 40), f32(vo + 44)))   // tangent xyzw @[24:40], uv @[40:48]
+                let position = SIMD3(f32(vo), f32(vo + 4), f32(vo + 8))
+                guard position.x.isFinite, position.y.isFinite, position.z.isFinite else { return nil }
+                positions.append(position)
+                normals.append(hasNormals ? SIMD3(f32(vo + 12), f32(vo + 16), f32(vo + 20)) : .zero)
+                uvs.append(SIMD2(f32(vo + stride - 8), f32(vo + stride - 4)))
             }
             o += vbl
             let ibl = Int(u32(o)); o += 4
@@ -341,9 +409,25 @@ struct MDLGeometry {
                 let idx: UInt32 = idxSize == 4
                     ? (UInt32(b[io]) | (UInt32(b[io+1]) << 8) | (UInt32(b[io+2]) << 16) | (UInt32(b[io+3]) << 24))
                     : (UInt32(b[io]) | (UInt32(b[io+1]) << 8))
-                indices.append(UInt32(vbase) + idx)
+                guard Int(idx) < nv, let vertex = UInt32(exactly: vbase + Int(idx)) else { return nil }
+                indices.append(vertex)
             }
             o += ibl
+            if !hasNormals {
+                // Recover smooth normals from the actual indexed surface. Area
+                // weighting preserves the normal of split faces and planar quads.
+                for triangle in Swift.stride(from: istart, to: indices.count - 2, by: 3) {
+                    let a = Int(indices[triangle]), b = Int(indices[triangle + 1]), c = Int(indices[triangle + 2])
+                    let normal = simd_cross(positions[b] - positions[a], positions[c] - positions[a])
+                    normals[a] += normal
+                    normals[b] += normal
+                    normals[c] += normal
+                }
+                for i in vbase..<positions.count {
+                    let length = simd_length(normals[i])
+                    normals[i] = length.isFinite && length > 0 ? normals[i] / length : SIMD3(0, 0, 1)
+                }
+            }
             submeshes.append(.init(material: material, indexStart: istart, indexCount: ni))
             // 非末尾 submesh 后有 0x00 padding(数量不定)→ 跳到下一个非零字节。
             if si < submeshCount - 1 {
@@ -351,7 +435,8 @@ struct MDLGeometry {
             }
         }
         guard !positions.isEmpty, !indices.isEmpty else { return nil }
-        return MDLGeometry(positions: positions, normals: normals, uvs: uvs, indices: indices, submeshes: submeshes)
+        let box = bounds ?? SceneModelBounds(min: SIMD3(repeating: -131072), max: SIMD3(repeating: 131072))
+        return MDLGeometry(bounds: box, positions: positions, normals: normals, uvs: uvs, indices: indices, submeshes: submeshes)
     }
 }
 
@@ -416,7 +501,8 @@ final class Scene3DRuntime {
     private(set) var uiRoots: Set<Int> = []                   // 屏幕 UI 根容器 id(其下层走正交屏幕坐标)
     private var nodes: [Int: NodeInfo] = [:]
     private var nodeOrder: [Int] = []
-    private let host: Scene3DScriptHost?
+    let host: Scene3DScriptHost?
+    private(set) var modelCursorIds: Set<Int> = []
     var scriptCount: Int { host?.registered ?? 0 }
     /// 任一**模型**的节点祖先链含脚本驱动的 origin/angles(=有限时长关键帧入场:从下升起+倾入再 hold)。
     /// 土星(3589454154):全部件挂在根 459 下,459.origin/angles 是 Vec3 关键帧脚本(t0→t30 升起+倾入,t>30 hold
@@ -484,10 +570,7 @@ final class Scene3DRuntime {
     /// 评估所有节点 visible 脚本(读宿主 shared)→ 返回**自身 visible 脚本判定为 false 的节点 id 集**。
     /// 太阳系灵动岛/通知/媒体面板等靠 visible 脚本条件显隐;静态壁纸无交互→脚本判 false→该子树隐藏。
     func hiddenNodeIds() -> Set<Int> {
-        guard let h = host else { return [] }
-        var hidden = Set<Int>()
-        for id in nodeOrder { if h.evalLayerVisible(id: id) == false { hidden.insert(id) } }
-        return hidden
+        Set(host?.visibility.compactMap { $0.value ? nil : $0.key } ?? [])
     }
     /// 该层或任一祖先在 hidden 集里 → 隐藏(WE 父组 visible 继承,含脚本判定)。
     func isHiddenByAncestor(_ id: Int, hidden: Set<Int>) -> Bool {
@@ -581,6 +664,18 @@ final class Scene3DRuntime {
         let h: Scene3DScriptHost? = WPEnv.vars["WP_NO_3D_SCRIPTS"] == nil ? Scene3DScriptHost() : nil
         var hasHeliocentricSim = false   // 日心太阳系模拟(Main 写 shared.currentFocus)→ 启用 Date.now() sim 时钟,行星公转
         if let h = h {
+            let definitions: [[String: Any]] = objects.compactMap { object in
+                guard let id = intOf(object["id"]) else { return nil }
+                func components(_ key: String, _ fallback: SIMD3<Float>) -> [Float] {
+                    let v = Self.f3(object[key], fallback)
+                    return [v.x, v.y, v.z]
+                }
+                return ["id": id, "name": object["name"] as? String ?? "",
+                        "visible": VecParse.parseVisibleBool(object["visible"]),
+                        "origin": components("origin", .zero), "angles": components("angles", .zero),
+                        "scale": components("scale", .one)]
+            }
+            h.installLayers(definitions)
             for o in objects {
                 guard let id = intOf(o["id"]) else { continue }
                 for (prop, v) in o {
@@ -591,16 +686,12 @@ final class Scene3DRuntime {
                     // 调试覆盖(默认遵 pkg 值):mode(1中点log/2线性/3/4真比例)、initialFocus(0总览 1-13天体)。
                     if let m = WPEnv.vars["WP_SOLAR_MODE"], let mv = Double(m), sp["mode"] != nil { sp["mode"] = mv }
                     if let fc = WPEnv.vars["WP_SOLAR_FOCUS"], let fv = Double(fc), sp["initialFocus"] != nil { sp["initialFocus"] = fv }
-                    let sv: SIMD3<Float> = (prop == "scale") ? SIMD3(1, 1, 1) : Self.f3(d["value"], .zero)
+                    let sv = Self.f3(d["value"], prop == "scale" ? .one : .zero)
                     h.register(id: id, prop: prop, source: src, scriptProps: sp, staticValue: sv)
                 }
             }
             // 仅日心太阳系启用 sim 时钟(Date.now() 随 engine.runtime 推进 → 行星公转);WP_NO_SOLAR_ORBIT=1 关。
             if hasHeliocentricSim && WPEnv.vars["WP_NO_SOLAR_ORBIT"] == nil { h.enableSimClock() }
-            // 安装真实场景层(name/id→层对象),让 Main 模拟 thisScene.getLayer(name).origin=轨道位置 命中真层。
-            var ldefs: [[String: Any]] = []
-            for o in objects { if let id = intOf(o["id"]) { ldefs.append(["id": id, "name": (o["name"] as? String) ?? ""]) } }
-            h.installLayers(ldefs)
             h.runInit()
             // 轨道显示层(guidao/guidao2 effect):注册其 effect uniform 脚本(读 shared 算椭圆参数)。
             for o in objects {
@@ -690,9 +781,10 @@ final class Scene3DRuntime {
                 }
             }
         }
+        let cursorIds = h?.cursorLayerIds ?? []
         for o in objects {
             guard let id = intOf(o["id"]), let modelPath = o["model"] as? String else { continue }
-            if !modelVisible(o["visible"]) { continue }
+            if !modelVisible(o["visible"]) && cursorIds.isEmpty && h?.readsInput != true { continue }
             let geo: MDLGeometry
             if let g = geoCache[modelPath] { geo = g }
             else if let d = source.data(for: modelPath), let g = MDLGeometry.parse(d) { geoCache[modelPath] = g; geo = g }
@@ -707,6 +799,7 @@ final class Scene3DRuntime {
             if nm == "sun" && sunModelId == nil { sunModelId = id }
             models.append(Model3DObject(id: id, name: nm, meshPath: modelPath,
                                         geometry: geo, world: matrix_identity_float4x4, materials: mats))
+            if cursorIds.contains(id), VecParse.parseVisibleBool(o["solid"]) { modelCursorIds.insert(id) }
         }
         // 场景光源(WE 3D 光照:ldirectional/lpoint;color/intensity/radius 取 pkg,缺省 WE 默认)。
         // 光源 id 也是节点 → world 由 recompute 求出,光源世界位置/方向喂 frag 做 N·L 漫反射昼夜终止线。

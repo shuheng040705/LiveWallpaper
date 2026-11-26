@@ -35,7 +35,7 @@ final class SceneBoneScriptTests: XCTestCase {
         XCTAssertNil(runtime.runScalar(current: 0, simTime: 0))
         runtime.bindBones([71: rig])
         XCTAssertEqual(runtime.runScalar(current: 0, simTime: 0), 2)
-        runtime.dispatchCursor(.click, world: SIMD2(50, 150), local: SIMD2(0,0))
+        runtime.dispatchCursor(.click, hit: .init(id: 1, world: SIMD3(50, 150, 0), local: .zero))
         let result = try XCTUnwrap(rig.transform(1, inScene: true))
         XCTAssertEqual(result.columns.3.x, 50, accuracy: 1e-4)
         XCTAssertEqual(result.columns.3.y, 150, accuracy: 1e-4)
@@ -75,7 +75,7 @@ final class SceneBoneScriptTests: XCTestCase {
         s.setSceneLayers([.init(id: 9, name: "chimes", parentId: nil, visible: true, alpha: 1,
                                color: SIMD4(repeating: 1), origin: .zero, scale: .one, angles: .zero, size: .zero)])
         s.bindBones([9: rig])
-        s.dispatchCursor(.click, world: .zero, local: .zero)
+        s.dispatchCursor(.click, hit: .init(id: 1, world: .zero, local: .zero))
         XCTAssertEqual(rig.transform(1, inScene: false)?.columns.3.x, 14)
         var invalid = matrix_identity_float4x4
         invalid.columns.3.x = .nan
@@ -120,7 +120,7 @@ final class SceneBoneScriptTests: XCTestCase {
             """, propertyOverrides: [:], tag: "unpublished animated triangle"))
         s.setTemplateLayerIdentity(id: 17, name: "mobile", parentId: nil, visible: true, alpha: 1, color: .one)
         s.bindBones([17: rig])
-        s.dispatchCursor(.down, world: .init(28, 10), local: .zero)
+        s.dispatchCursor(.down, hit: .init(id: 1, world: SIMD3(28, 10, 0), local: .zero))
         let result = mesh.skinVerts(world: rig.world)
         for i in 0..<3 {
             let offset = 4 * i

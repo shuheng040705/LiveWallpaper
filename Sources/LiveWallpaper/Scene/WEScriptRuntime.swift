@@ -14,6 +14,24 @@ enum WECursorEvent: String, CaseIterable {
     case down = "cursorDown", up = "cursorUp", click = "cursorClick"
 }
 
+/// Coordinates captured against the geometry that received the pointer.
+struct SceneCursorHit {
+    let id: Int
+    var world: SIMD3<Float>
+    var local: SIMD3<Float>
+    var hitBox: String?
+    var imageIndex: Int?
+
+    func argument(in context: JSContext) -> [String: Any]? {
+        guard let vec = context.objectForKeyedSubscript("Vec3"),
+              let w = vec.construct(withArguments: [world.x, world.y, world.z]),
+              let l = vec.construct(withArguments: [local.x, local.y, local.z]) else { return nil }
+        var result: [String: Any] = ["worldPosition": w, "localPosition": l, "button": 0]
+        if let hitBox { result["hitBox"] = hitBox }
+        return result
+    }
+}
+
 final class WEScript {
     /// 注入脚本上下文的 scene 对象元数据。这里保留的是 pkg 的局部变换，
     /// 因为 WE 脚本通过 `parent.origin + thisLayer.origin` 等方式自行组合父子坐标。
@@ -293,14 +311,11 @@ final class WEScript {
         return String(data: data, encoding: .utf8)
     }
 
-    func dispatchCursor(_ event: WECursorEvent, world: SIMD2<Float>, local: SIMD2<Float>) {
+    func dispatchCursor(_ event: WECursorEvent, hit: SceneCursorHit) {
         guard cursorEvents.contains(event), let function = context.objectForKeyedSubscript(event.rawValue),
-              let vector = context.objectForKeyedSubscript("Vec3"),
-              let worldPosition = vector.construct(withArguments: [world.x, world.y, 0]),
-              let localPosition = vector.construct(withArguments: [local.x, local.y, 0]) else { return }
+              let argument = hit.argument(in: context) else { return }
         didFail = false
-        _ = function.call(withArguments: [["worldPosition": worldPosition,
-                                          "localPosition": localPosition, "hitBox": NSNull()] as [String: Any]])
+        _ = function.call(withArguments: [argument])
         if didFail { reportException() }
     }
 

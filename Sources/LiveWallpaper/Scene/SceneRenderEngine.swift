@@ -628,7 +628,7 @@ final class SceneRenderEngine {
     private struct Material3DGPU { let tex: MTLTexture?; let color: SIMD3<Float>; let brightness: Float; let alpha: Float; let translucent: Bool; let lighting: Bool }
     private struct Submesh3DGPU { let mat: Material3DGPU; let start: Int; let count: Int }
     // lit=接收方向光 N·L + 阴影(仅行星);castsShadow=作为环影 caster(土星环/陨石)。
-    private struct Model3DGPU { let id: Int; let vb: MTLBuffer; let ib: MTLBuffer; var world: simd_float4x4; let submeshes: [Submesh3DGPU]; var lit: Bool = false; var castsShadow: Bool = false }
+    private struct Model3DGPU { let id: Int; let bounds: SceneModelBounds; let vb: MTLBuffer; let ib: MTLBuffer; var world: simd_float4x4; let submeshes: [Submesh3DGPU]; var lit: Bool = false; var castsShadow: Bool = false }
     // 方向光阴影(土星)运行参数:由 build3DModels 从 Scene3DRuntime 算出。
     private var scene3DLightDir = SIMD3<Float>(-1, 0, 0)   // 指向太阳(世界)
     private var scene3DLightVP = matrix_identity_float4x4  // 阴影正交相机 view·proj
@@ -661,6 +661,7 @@ final class SceneRenderEngine {
     private var sunSpriteTex: [Int: MTLTexture] = [:]       // 太阳精灵 id → 纹理
     private struct GodUGPU { var sunUV: SIMD2<Float>; var weight: Float; var decay: Float; var density: Float; var exposure: Float }
     private struct SunUGPU { var centerUV: SIMD2<Float>; var sizeUV: SIMD2<Float>; var brightness: Float; var pad: Float = 0; var tint: SIMD3<Float> }
+    private var scene3DHiddenModels = Set<Int>()
     private var scene3DHidden: Set<Int> = []               // visible 脚本判为隐藏的节点(灵动岛/通知等条件UI)
     private var scene3DSceneTex: MTLTexture?                // render3D 中间纹理(轨道后处理读它)
     private var scene3DSceneTex2: MTLTexture?               // 内→外 轨道链式第二中间纹理
@@ -780,12 +781,21 @@ final class SceneRenderEngine {
     private var viewportScripts: [WEScript] = []
     private var screenResolution = SIMD2<Float>.zero
     private var sharedCursorRecipients: [WEScript] = []
-    private var hoveredLayer: Int?
-    private var pressedLayer: Int?
+    private var cursorStops = Set<Int>()
+    private var nonSolidCursorIds = Set<Int>()
+    private var interactiveModelIds = Set<Int>()
+    private var hostCursorIds = Set<Int>()
+    private var hoverHits: [Int: SceneCursorHit] = [:]
+    private var pressHits: [Int: SceneCursorHit] = [:]
+    private var hoverOrder: [Int] = []
+    private var pressOrder: [Int] = []
+    private var lastEventPoint: CGPoint?
     private var cursorLeftDown = false
     private var lastScriptPointer: SIMD2<Float>?
     private var lastScriptWorld: SIMD2<Float>?
-    var needsDesktopInput: Bool { !inputScripts.isEmpty || (!has3DScene && !cursorTargets.isEmpty) }
+    var needsDesktopInput: Bool {
+        !inputScripts.isEmpty || !cursorScripts.isEmpty || !hostCursorIds.isEmpty || scene3DRuntime?.host?.readsInput == true
+    }
     private(set) var clearColor: MTLClearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
     private var ambientColor: SIMD3<Float> = .zero   // general.ambientcolor(lwe 默认 vec3(0));喂 LIGHTING 材质 g_LightAmbientColor
     private var layers: [GPULayer] = []
@@ -1168,6 +1178,8 @@ final class SceneRenderEngine {
         // orthogonalprojection=null → isPerspective。加载 .mdl 几何 + 材质 + 世界矩阵,建 viewProj。
         // 成功则**只渲 3D 模型**(2D UI 叠加后续再做),早返回跳过 2D 图层/粒子/特效装配(零回归:仅 3D 场景命中)。
         models3D = []
+        scene3DRuntime = nil
+        scene3DHiddenModels.removeAll()
         if document.camera.isPerspective {
             let cam = document.camera
             let aspect = canvas.x / canvas.y
@@ -1239,7 +1251,7 @@ final class SceneRenderEngine {
             // 缺口B:有 visibleScript 的层即使静态 visible=false 也要建(否则脚本永远点不亮);
             // 其每帧由脚本决定显隐(绘制门控 layers[i].visible)。无脚本的静态隐藏层仍跳过(零变化)。
             // 跨层 FBO 生产层(compositeProducerIds)即使无脚本静态隐藏也建(见上)。
-            guard layer.visible || layer.visibleScript != nil || compositeProducerIds.contains(layer.id) else { continue }
+            guard layer.visible || layer.visibleScript != nil || layer.ownsCursorCallbacks || compositeProducerIds.contains(layer.id) else { continue }
 
             let tex: MTLTexture
             var texFlags: TexFlags? = nil   // 图层贴图的真实 WE flags(驱动主 pass + 特效 g_Texture0 采样器)
@@ -1809,6 +1821,7 @@ final class SceneRenderEngine {
                let parsedMesh = PuppetMesh.parse(blob, size: size, readScriptBones: usesBones), parsedMesh.indices.count >= 3,
                size.x >= 1, size.y >= 1 {
                 var mesh = parsedMesh
+                if layer.ownsCursorCallbacks && mesh.hasHitBoxes { puppetMesh = mesh }
                 if usesBones, !mesh.scriptBones.isEmpty {
                     let pose = SceneBonePose(bones: mesh.scriptBones)
                     pose.layerToScene = model * simd_float4x4(diagonal: SIMD4(1 / size.x, 1 / size.y, 1, 1))
@@ -2658,7 +2671,7 @@ final class SceneRenderEngine {
                 Log.write("xlayer: \(crossLayerScripts.count) controller(s) (\(logicScripts.count) logic-layer); \(document.scriptLayerDefs.count) scene objects / \(layerIndexById.count) render targets; changed=\(changed)")
             }
         }
-        configureCursorScripts(nonSolidIds: document.nonSolidIds)
+        configureCursorScripts(nonSolidIds: document.nonSolidIds, stops: document.cursorPropagationStops)
         lastUpdateTime = -1
         prewarmFXPipelines(document: document)
         let cbmLayers = layers.filter { $0.colorBlendMode > 0 }
@@ -3225,7 +3238,7 @@ final class SceneRenderEngine {
     /// cameraParallaxEnabled 只控制 WE 相机视差通道，不能把交互光标一并归中。
     /// 视差位移 = 鼠标影响 × 每层 parallaxDepth(WE 鼠标驱动、静止归中,无自动漂移)。camerashake 不渲染(对齐 lwe)。
     func update(time: Double, mouseNorm: SIMD2<Float>, cameraParallaxEnabled: Bool = true) {
-        guard !layers.isEmpty || !particleGroups.isEmpty else { return }
+        guard !layers.isEmpty || !particleGroups.isEmpty || has3DScene else { return }
         let _perfUpdateT0 = perfNow()
         let _perfSkinSnapshot = perfSkin, _perfPartSnapshot = perfPart   // WP_PERF:本帧 skin/part 增量基线
         // 审计修复#2:在 update 起点推进缓冲轮换索引,保证本帧的写(update 末尾)与读(随后 encode)
@@ -5346,7 +5359,7 @@ final class SceneRenderEngine {
         // 模型烘焙到 settled 时刻(居中好构图;土星自转 10.5h/圈,逐帧模型无可见运动反而相机漂移)。
         // 但**宿主逐帧 tick**(脚本≤200=土星)→ HUD 文字(时钟/距离/角度)live 更新;模型世界保持烘焙(render3D 不重算模型)。
         // WP_NO_3D_LIVE=1 退回全冻结。WP_3D_LIVE_MODELS=1 让模型也逐帧(取景会漂,调试用)。
-        scene3DPerFrame = WPEnv.vars["WP_NO_3D_LIVE"] == nil && rt.scriptCount <= 200
+        scene3DPerFrame = WPEnv.vars["WP_NO_3D_LIVE"] == nil && (rt.scriptCount <= 200 || !rt.modelCursorIds.isEmpty || rt.host?.readsInput == true)
         // 入场动画(土星):脚本数少(非日心太阳系公转)且模型祖先链含 origin/angles 关键帧脚本(从下升起+倾入再 hold)
         //   → 从 t=0 起逐帧驱动模型(相机静态,动模型不漂);脚本在末关键帧后 hold=settled。WP_NO_3D_INTRO 退回烘焙冻结。
         // 排除:日心太阳系(脚本>200=scene3DPerFrame 已 false,且其行星 origin 无脚本走 getLayer 公转)、纯静态 3D(无关键帧脚本)。
@@ -5375,6 +5388,7 @@ final class SceneRenderEngine {
         }
         // 条件 UI(灵动岛/通知/媒体面板)靠 visible 脚本显隐;静态壁纸无交互→脚本判隐藏→其子层(边框等)随之隐。
         scene3DHidden = rt.hiddenNodeIds()
+        scene3DHiddenModels = Set(rt.models.filter { rt.isHiddenByAncestor($0.id, hidden: scene3DHidden) }.map(\.id))
         if !scene3DHidden.isEmpty { Log.write("3D hidden nodes(visible脚本判false): \(scene3DHidden.count)个") }
         if WPEnv.vars["WP_3D_DUMP"] != nil {
             // 诊断:写 shared 全量 JSON + 每个模型 world 的平移/缩放(判行星是 scale=0 还是位置在屏外)
@@ -5439,7 +5453,7 @@ final class SceneRenderEngine {
             // 行星(球体01)= 受光体(N·L + 接收环影);环/陨石 = caster。
             let lit = (rt.planetModelId == o.id)
             let caster = (rt.ringModelId == o.id) || (o.meshPath.contains("陨石"))
-            out.append(Model3DGPU(id: o.id, vb: vb, ib: ib, world: o.world, submeshes: subs, lit: lit, castsShadow: caster))
+            out.append(Model3DGPU(id: o.id, bounds: o.geometry.bounds, vb: vb, ib: ib, world: o.world, submeshes: subs, lit: lit, castsShadow: caster))
             if WPEnv.vars["WP_3D_DUMP"] != nil {
                 for (i, sm) in o.geometry.submeshes.enumerated() {
                     let mat = i < o.materials.count ? o.materials[i] : Model3DMaterial()
@@ -5494,6 +5508,12 @@ final class SceneRenderEngine {
         }
     }
 
+    private func modelRay(at point: CGPoint, captured: Bool = false) -> ScenePickRay? {
+        guard has3DScene else { return nil }
+        return ScenePickRay(screen: point, uvScale: blitUVScale, uvOffset: blitUVOffset,
+                            ndcScale: ndcScale, viewProjection: viewProj3D, allowOutsideImage: captured)
+    }
+
     /// 渲染 3D 模型:透视相机 + 深度缓冲。两遍:不透明(写深度)→ 透明(只读深度、alpha 混合)。
     private func render3D(commandBuffer cmd: MTLCommandBuffer, finalTarget: MTLTexture) {
         // 逐帧 live(土星):从 bakeTime+elapsed 续 tick 宿主 → HUD 文字(时钟/距离/角度)live 跳。
@@ -5510,9 +5530,17 @@ final class SceneRenderEngine {
             //   ③持续自转(土星行星/环/陨石,scene3DContinuousSpin):祖先链 angles 脚本 frametime 累积绕 Y 恒转,
             //     **settle 后仍逐帧 recompute**(相机静态不漂)→ 环不冻结。稳态环约 0.76°/s。WP_NO_RING_ANIM 退回冻结。
             let introActive = scene3DIntroModels && Double(currentTime) <= scene3DIntroSettle + 0.5
-            if scene3DSolarOrbit || introActive || scene3DContinuousSpin || scene3DLiveModels {
+            let interactive = !rt.modelCursorIds.isEmpty || rt.host?.readsInput == true || !hostCursorIds.isEmpty
+            if scene3DSolarOrbit || introActive || scene3DContinuousSpin || scene3DLiveModels || interactive {
                 rt.recompute()
                 for i in models3D.indices { if let wm = rt.worldsById[models3D[i].id] { models3D[i].world = wm } }
+            }
+        }
+        if let rt = scene3DRuntime, !hostCursorIds.isEmpty || rt.host?.readsInput == true {
+            let hidden = rt.hiddenNodeIds()
+            if hidden != scene3DHidden {
+                scene3DHidden = hidden
+                scene3DHiddenModels = Set(rt.models.filter { rt.isHiddenByAncestor($0.id, hidden: hidden) }.map(\.id))
             }
         }
         let w = finalTarget.width, h = finalTarget.height
@@ -5543,7 +5571,7 @@ final class SceneRenderEngine {
                 senc.label = "scene3d-shadow"
                 senc.setRenderPipelineState(shadowPL)
                 senc.setDepthStencilState(depthState3DWrite)
-                for m in models3D where m.castsShadow {
+                for m in models3D where m.castsShadow && !scene3DHiddenModels.contains(m.id) {
                     var su = U3GPU(); su.model = m.world; su.lightVP = scene3DLightVP
                     senc.setVertexBuffer(m.vb, offset: 0, index: 0)
                     senc.setVertexBytes(&su, length: MemoryLayout<U3GPU>.stride, index: 1)
@@ -5582,7 +5610,7 @@ final class SceneRenderEngine {
             enc.setDepthStencilState(translucentPass ? depthState3DNoWrite : depthState3DWrite)
             enc.setVertexBytes(&ndc, length: 8, index: 3)
             enc.setFragmentSamplerState(sampler, index: 0)
-            for m in models3D {
+            for m in models3D where !scene3DHiddenModels.contains(m.id) {
                 let mvp = viewProj3D * m.world
                 enc.setVertexBuffer(m.vb, offset: 0, index: 0)
                 // 阴影贴图槽(texture 1):受光行星才绑(否则绑兜底白阴影图避免未绑采样)。
@@ -5827,12 +5855,15 @@ final class SceneRenderEngine {
                     if dbg { Log.write("3D overlay: layers=\(layers.count) particleGroups=\(particleGroups.count)"); logged3DHud = true }
                     for i in layers.indices {
                         let id = layers[i].id
-                        // 被祖先(灵动岛等条件UI容器)的 visible 脚本判隐藏 → 不渲。
-                        if !scene3DHidden.isEmpty, rt.isHiddenByAncestor(id, hidden: scene3DHidden) { layers[i].visible = false; continue }
+                        // Keep the cursor geometry current even while a script or parent hides
+                        // the layer. The same layer may show itself again on a later click.
+                        if rt.host?.visibility[id] != nil {
+                            layers[i].visible = scene3DHidden.isEmpty || !rt.isHiddenByAncestor(id, hidden: scene3DHidden)
+                        }
                         // 纯色底(tex≤4)+ 有 effect 但没跑(geodraw 几何绘图等不在 manifest)→ effect 才是内容,
                         // 渲黑色 solidlayer 底会盖住场景(灵动岛边框黑块、轨道 1px 残渣)。跳过(geodraw 内容暂缺,胜于黑块)。
                         if layers[i].texture.width <= 4, layers[i].texture.height <= 4, !layers[i].effects.isEmpty, !layers[i].useWE {
-                            layers[i].visible = false; continue
+                            layers[i].visible = false
                         }
                         if rt.isScreenLayer(id) {
                             // 画布盒 = size × 局部scale(排除 3D 父缩放)。文字**适配进盒**(纵横比保持+按 align 放置,
@@ -6724,16 +6755,21 @@ final class SceneRenderEngine {
         return drawStaging
     }
 
-    /// 渲染一帧到 drawable(桌面实时)。
-    /// **关键**:绝不让 encodeFrame 的多 pass(含 .dontCare 加载/折射采样/混合读目标)直接写
-    /// `framebufferOnly` 的 drawable —— 平铺 GPU 上其未定义/平铺显存会在桌面合成时泄漏成彩色噪点/
-    /// 黑线(只在实时出现,离屏 .shared 纹理正常,已实测确认)。改为:先渲到可读中间纹理(= 已验证
-    /// 干净的离屏路径),再用**单次 clear+全屏 blit** 呈现到 drawable(整张被清空+100% 覆盖,无残留)。
-    private func configureCursorScripts(nonSolidIds: Set<Int>) {
+    private func configureCursorScripts(nonSolidIds: Set<Int>, stops: Set<Int>) {
+        cursorStops = stops
+        nonSolidCursorIds = nonSolidIds
+        let host = scene3DRuntime?.host
+        interactiveModelIds = scene3DRuntime?.modelCursorIds ?? []
+        hostCursorIds = (host?.cursorLayerIds ?? []).intersection(Set(layers.map(\.id)).union(interactiveModelIds)).subtracting(nonSolidIds)
+        host?.setViewport(canvas: canvas, pixels: canvas)
+        host?.setSoundLayerPlayback { [weak audioPlayback] id in audioPlayback?.playFromScript(id: id) }
         cursorTargets.removeAll()
         cursorScripts.removeAll()
-        hoveredLayer = nil
-        pressedLayer = nil
+        hoverHits.removeAll()
+        pressHits.removeAll()
+        lastEventPoint = nil
+        hoverOrder.removeAll()
+        pressOrder.removeAll()
         cursorLeftDown = false
         lastScriptPointer = nil
         var allScripts = logicScripts
@@ -6742,14 +6778,17 @@ final class SceneRenderEngine {
             var scripts = [layer.scaleScript, layer.originScript, layer.angleScript, layer.visibleScript,
                            layer.alphaScript, layer.colorScript, layer.instancedBarsScript].compactMap { $0 }
             if case .script(let script) = layer.text?.desc.kind { scripts.append(script) }
+            let propertyScriptCount = scripts.count
             for effect in layer.effects {
                 for pass in effect.weScriptsPerPass { scripts.append(contentsOf: pass.values) }
             }
             allScripts += scripts
-            let callbacks = scripts.filter { !$0.cursorEvents.isEmpty }
-            if !callbacks.isEmpty && !nonSolidIds.contains(layer.id) {
+            // Native 3D property scripts retain their module in the shared 3D host.
+            // Material scripts still belong to the render pass's own JS context.
+            let callbacks = scripts.dropFirst(hostCursorIds.contains(layer.id) ? propertyScriptCount : 0).filter { !$0.cursorEvents.isEmpty }
+            if (!callbacks.isEmpty || stops.contains(layer.id) || hostCursorIds.contains(layer.id)) && !nonSolidIds.contains(layer.id) {
                 cursorTargets.append(i)
-                cursorScripts[i] = callbacks
+                if !callbacks.isEmpty { cursorScripts[layer.id] = callbacks }
             }
         }
         boneLayerIndices = layers.indices.filter { layers[$0].bonePose != nil }
@@ -6774,50 +6813,119 @@ final class SceneRenderEngine {
     // Texture-space local positions are in the unscaled image's pixels.
     private func cursorTransform(for i: Int) -> CGAffineTransform? {
         let m = layers[i].mvp
-        guard !has3DScene, abs(m.columns.0.w) < 0.00001, abs(m.columns.1.w) < 0.00001,
+        guard abs(m.columns.0.w) < 0.00001, abs(m.columns.1.w) < 0.00001,
               abs(m.columns.3.w) > 0.00001 else { return nil }
         let sx = aspectMouse.x * 0.5, sy = -aspectMouse.y * 0.5, w = m.columns.3.w
-        let t = CGAffineTransform(a: CGFloat(m.columns.0.x / w * sx), b: CGFloat(m.columns.0.y / w * sy),
-                                  c: CGFloat(m.columns.1.x / w * sx), d: CGFloat(m.columns.1.y / w * sy),
-                                  tx: CGFloat(0.5 + (m.columns.3.x / w - 2 * cursorUVOffset.x) * sx),
-                                  ty: CGFloat(0.5 + (m.columns.3.y / w - 2 * cursorUVOffset.y) * sy))
+        guard !has3DScene || w > 0 else { return nil }
+        let t = CGAffineTransform(a: CGFloat(m.columns.0.x / w * ndcScale.x * sx), b: CGFloat(m.columns.0.y / w * ndcScale.y * sy),
+                                  c: CGFloat(m.columns.1.x / w * ndcScale.x * sx), d: CGFloat(m.columns.1.y / w * ndcScale.y * sy),
+                                  tx: CGFloat(0.5 + (m.columns.3.x / w * ndcScale.x - 2 * cursorUVOffset.x) * sx),
+                                  ty: CGFloat(0.5 + (m.columns.3.y / w * ndcScale.y - 2 * cursorUVOffset.y) * sy))
         guard abs(t.a * t.d - t.b * t.c) > 1e-12 else { return nil }
         return t
     }
 
     private static let cursorQuad = CGRect(x: -0.5, y: -0.5, width: 1, height: 1)
-    private func hitLayer(at point: CGPoint) -> Int? {
-        guard CGRect(x: 0, y: 0, width: 1, height: 1).contains(point) else { return nil }
-        return cursorTargets.reversed().first { i in
-            guard layers[i].visible, let transform = cursorTransform(for: i) else { return false }
-            return Self.cursorQuad.contains(point.applying(transform.inverted()))
+    private func imageCursorHit(_ i: Int, at point: CGPoint, includeBox: Bool, requireInside: Bool = true) -> SceneCursorHit? {
+        let layer = layers[i]
+        let normalized = SIMD2(Float(point.x), Float(point.y))
+        let local: SIMD2<Float>
+        if let transform = cursorTransform(for: i) {
+            let p = point.applying(transform.inverted())
+            local = SIMD2(Float(p.x), Float(p.y))
+        } else {
+            // A tilted image in a perspective scene is a projective quad. Invert
+            // its plane rather than treating its screen bounding box as clickable.
+            let m = layer.mvp
+            let xy = (SIMD2(2 * normalized.x - 1, 1 - 2 * normalized.y) / aspectMouse + 2 * cursorUVOffset) / ndcScale
+            let plane = simd_float3x3(columns: (
+                SIMD3(m.columns.0.x, m.columns.0.y, m.columns.0.w),
+                SIMD3(m.columns.1.x, m.columns.1.y, m.columns.1.w),
+                SIMD3(m.columns.3.x, m.columns.3.y, m.columns.3.w)))
+            guard abs(plane.determinant) > 1e-12 else { return nil }
+            let p = plane.inverse * SIMD3(xy.x, xy.y, 1)
+            guard p.z > 0, p.z.isFinite else { return nil }
+            local = SIMD2(p.x, p.y) / p.z
         }
+        guard local.x.isFinite, local.y.isFinite,
+              !requireInside || (abs(local.x) <= 0.5 && abs(local.y) <= 0.5) else { return nil }
+        let image = SIMD2(local.x + 0.5, 0.5 - local.y) * layer.baseSize
+        let world = worldPointer(normalized)
+        let mesh = layer.puppetMesh
+        let box = includeBox ? mesh.flatMap { $0.hitBoxName(at: local * $0.size) } : nil
+        return SceneCursorHit(id: layer.id, world: SIMD3(world.x, world.y, 0),
+                              local: SIMD3(image.x, image.y, 0), hitBox: box, imageIndex: i)
+    }
+
+    private struct CursorSample {
+        let id: Int
+        let hit: SceneCursorHit?
+    }
+
+    /// Keep misses for previously hovered or pressed layers. In particular, a blocker
+    /// suppresses visits below itself, but layers above it must still receive leave/up.
+    private func cursorPass(at point: CGPoint, includeBoxes: Bool, tracking: Set<Int> = []) -> [CursorSample] {
+        let uv = (SIMD2(Float(point.x), Float(point.y)) - 0.5) * blitUVScale + 0.5 + blitUVOffset
+        let inImage = (0...1).contains(point.x) && (0...1).contains(point.y)
+            && (0...1).contains(uv.x) && (0...1).contains(uv.y)
+        var samples: [CursorSample] = []
+        for i in cursorTargets.reversed() {
+            let id = layers[i].id
+            let hit = inImage ? imageCursorHit(i, at: point, includeBox: includeBoxes) : nil
+            if tracking.contains(id) || (hit != nil && (cursorScripts[id] != nil || hostCursorIds.contains(id))) {
+                samples.append(CursorSample(id: id, hit: hit))
+            }
+            if hit != nil, cursorStops.contains(id), layers[i].visible { return samples }
+        }
+        guard !interactiveModelIds.isEmpty else { return samples }
+        let ray = modelRay(at: point)
+        var models: [(depth: Float, sample: CursorSample)] = []
+        for model in models3D.reversed() {
+            let id = model.id
+            guard !nonSolidCursorIds.contains(id), interactiveModelIds.contains(id) || cursorStops.contains(id) else { continue }
+            let depth = (viewProj3D * model.world.columns.3).w
+            let hit = ray.flatMap { model.bounds.hit(id: id, world: model.world, depth: depth, ray: $0) }
+            if hit != nil || tracking.contains(id) {
+                let cursor = hit.map { SceneCursorHit(id: id, world: $0.world, local: $0.local) }
+                models.append((depth, CursorSample(id: id, hit: cursor)))
+            }
+        }
+        // Nearer model origins first, then reverse draw order for equal depths.
+        for (_, sample) in models.sorted(by: { $0.depth < $1.depth }) {
+            if interactiveModelIds.contains(sample.id) { samples.append(sample) }
+            if sample.hit != nil, cursorStops.contains(sample.id), !scene3DHiddenModels.contains(sample.id) { break }
+        }
+        return samples
     }
 
     func cursorHotspots(at point: CGPoint?) -> [CGRect] {
-        guard let point, let i = hitLayer(at: point), let transform = cursorTransform(for: i) else { return [] }
-        let rect = Self.cursorQuad.applying(transform)
-        // Full-screen effects may observe desktop input, but their panels must never cover Finder.
-        let viewportInterior = CGRect(x: 0.01, y: 0.01, width: 0.98, height: 0.98)
-        if rect.contains(viewportInterior) { return [] }
-        if abs(transform.b) < 1e-6 && abs(transform.c) < 1e-6 { return [rect] }
-        // A rotated quad's bounding rectangle includes desktop. Only claim a rectangle inside it.
-        let inverse = transform.inverted()
-        let local = point.applying(inverse)
-        let r = min((0.5 - abs(local.x)) / (abs(inverse.a) + abs(inverse.c)),
-                    (0.5 - abs(local.y)) / (abs(inverse.b) + abs(inverse.d)))
-        guard r > 0, r.isFinite else { return [] }
-        return [CGRect(x: point.x - r, y: point.y - r, width: 2 * r, height: 2 * r)]
+        guard let point else { return [] }
+        for sample in cursorPass(at: point, includeBoxes: true) {
+            guard let hit = sample.hit else { continue }
+            if hit.hitBox == nil, let i = hit.imageIndex, let transform = cursorTransform(for: i) {
+                let rect = Self.cursorQuad.applying(transform)
+                if rect.contains(CGRect(x: 0.01, y: 0.01, width: 0.98, height: 0.98)) { continue }
+                if cursorStops.isEmpty, abs(transform.b) < 1e-6, abs(transform.c) < 1e-6 { return [rect] }
+            }
+            // Only claim a small area at the tested cursor. Overlapping controls, tilted
+            // planes, and animated bones cannot safely claim their screen bounding boxes.
+            let size = screenResolution == .zero ? canvas : screenResolution
+            let dx = 2 / CGFloat(max(1, size.x)), dy = 2 / CGFloat(max(1, size.y))
+            return [CGRect(x: point.x - dx, y: point.y - dy, width: 2 * dx, height: 2 * dy)]
+        }
+        return []
     }
 
     func interactiveHitAt(mouseNorm: SIMD2<Float>) -> Int? {
         let point = CGPoint(x: CGFloat(mouseNorm.x + 1) / 2, y: CGFloat(1 - mouseNorm.y) / 2)
-        return hitLayer(at: point).map { layers[$0].id }
+        return cursorPass(at: point, includeBoxes: false).first?.id
     }
+
+    func sceneSharedJSON() -> String { scene3DRuntime?.sharedJSON() ?? "{}" }
 
     private func worldPointer(_ point: SIMD2<Float>) -> SIMD2<Float> {
         let ndc = SIMD2(2 * point.x - 1, 1 - 2 * point.y) / aspectMouse + 2 * cursorUVOffset
-        let p = proj.inverse * SIMD4(ndc.x, ndc.y, 0, 1)
+        let p = proj.inverse * SIMD4(ndc.x / ndcScale.x, ndc.y / ndcScale.y, 0, 1)
         return SIMD2(p.x, p.y) / p.w
     }
 
@@ -6825,69 +6933,123 @@ final class SceneRenderEngine {
         guard pixels.x > 0, pixels.y > 0, pixels != screenResolution else { return }
         screenResolution = pixels
         lastScriptPointer = nil
+        scene3DRuntime?.host?.setViewport(canvas: canvas, pixels: pixels)
         for script in viewportScripts { script.setScreenResolution(pixels) }
     }
 
     private func updateScriptPointer(_ point: SIMD2<Float>, force: Bool = false) {
-        guard !inputScripts.isEmpty, force || lastScriptPointer != point || hasCameraAnim else { return }
+        guard !inputScripts.isEmpty || scene3DRuntime?.host?.readsInput == true || !hostCursorIds.isEmpty, force || lastScriptPointer != point || hasCameraAnim else { return }
         // SceneScript defines world cursor coordinates only for 2D wallpapers.
         let world: SIMD2<Float> = has3DScene ? .zero : worldPointer(point)
         guard force || lastScriptPointer != point || lastScriptWorld != world else { return }
         lastScriptPointer = point
         lastScriptWorld = world
         let screen = point * (screenResolution == .zero ? canvas : screenResolution)
+        scene3DRuntime?.host?.setInput(screen: screen, pressed: cursorLeftDown)
         for s in inputScripts { s.setCursorInput(world: world, screen: screen, pressed: cursorLeftDown) }
     }
 
-    func routeCursor(_ phase: WallpaperPointerPhase, at point: CGPoint) {
-        let position = SIMD2(Float(point.x), Float(point.y))
-        let hit = hitLayer(at: point)
-        func send(_ event: WECursorEvent, to index: Int?) {
-            guard let i = index, let scripts = cursorScripts[i], let t = cursorTransform(for: i) else { return }
-            let p = point.applying(t.inverted())
-            let local = (SIMD2(Float(p.x), Float(p.y)) + 0.5) * layers[i].baseSize
-            let world = worldPointer(position)
-            for script in scripts where script.cursorEvents.contains(event) {
-                let before = script.usesShared ? script.sharedJSON() : nil
-                script.dispatchCursor(event, world: world, local: local)
-                if let before {
-                    let after = script.sharedJSON()
-                    if let delta = WEScript.changedShared(before: before, after: after) {
-                        for recipient in sharedCursorRecipients where recipient !== script { recipient.injectShared(delta) }
-                    }
-                }
+    private func sendCursor(_ event: WECursorEvent, to hit: SceneCursorHit) {
+        if has3DScene, hostCursorIds.contains(hit.id), let host = scene3DRuntime?.host {
+            host.dispatchCursor(event, hit: hit)
+        }
+        for script in cursorScripts[hit.id] ?? [] where script.cursorEvents.contains(event) {
+            let before = script.usesShared ? script.sharedJSON() : nil
+            script.dispatchCursor(event, hit: hit)
+            if let before, let delta = WEScript.changedShared(before: before, after: script.sharedJSON()) {
+                for recipient in sharedCursorRecipients where recipient !== script { recipient.injectShared(delta) }
             }
-        }
-        func hover(_ target: Int?) {
-            guard target != hoveredLayer else { return }
-            send(.leave, to: hoveredLayer)
-            hoveredLayer = target
-            send(.enter, to: target)
-        }
-        switch phase {
-        case .down:
-            cursorLeftDown = true
-            pressedLayer = hit
-            updateScriptPointer(position, force: true)
-            hover(hit)
-            send(.down, to: hit)
-        case .leave:
-            hover(nil)
-        case .drag, .hover:
-            updateScriptPointer(position)
-            hover(hit)
-            send(.move, to: hit)
-        case .up, .cancel:
-            let captured = pressedLayer
-            cursorLeftDown = false
-            pressedLayer = nil
-            updateScriptPointer(position, force: true)
-            send(.up, to: phase == .up ? hit : captured)
-            if phase == .up, captured == hit { send(.click, to: captured) }
-            hover(phase == .up ? hit : nil)
         }
     }
 
+    func routeCursor(_ phase: WallpaperPointerPhase, at point: CGPoint) {
+        let wasDown = cursorLeftDown
+        if phase == .down { cursorLeftDown = true }
+        if phase == .up || phase == .cancel { cursorLeftDown = false }
+        let position = SIMD2(Float(point.x), Float(point.y))
+        updateScriptPointer(position, force: wasDown != cursorLeftDown)
+
+        let withBox = wasDown || phase == .down
+        func reproject(_ previous: SceneCursorHit) -> SceneCursorHit {
+            if let i = previous.imageIndex,
+               let hit = imageCursorHit(i, at: point, includeBox: withBox, requireInside: false) { return hit }
+            if previous.imageIndex == nil, let model = models3D.first(where: { $0.id == previous.id }),
+               let ray = modelRay(at: point, captured: true),
+               let hit = model.bounds.projectCapture(id: model.id, world: model.world,
+                                                     depth: (viewProj3D * model.world.columns.3).w,
+                                                     ray: ray, previousLocal: previous.local) {
+                return SceneCursorHit(id: hit.id, world: hit.world, local: hit.local)
+            }
+            return previous
+        }
+        if phase == .cancel || phase == .leave {
+            if phase == .leave && !pressHits.isEmpty { return }  // the press owns the drag until release
+            if phase == .cancel {
+                for id in pressOrder { if let hit = pressHits[id] { sendCursor(.up, to: reproject(hit)) } }
+                pressHits.removeAll()
+                pressOrder.removeAll()
+            }
+            for id in hoverOrder { if let hit = hoverHits[id] { sendCursor(.leave, to: reproject(hit)) } }
+            hoverHits.removeAll()
+            hoverOrder.removeAll()
+            lastEventPoint = nil
+            return
+        }
+        let samples = cursorPass(at: point, includeBoxes: withBox, tracking: Set(hoverHits.keys).union(pressHits.keys))
+        let moved = point != lastEventPoint
+        lastEventPoint = point
+        if phase == .drag && !pressHits.isEmpty {
+            guard moved else { return }
+            let current = Dictionary(samples.compactMap(\.hit).map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            for id in pressOrder {
+                guard let previous = pressHits[id] else { continue }
+                let hit = current[id] ?? reproject(previous)
+                sendCursor(.move, to: hit)
+                pressHits[id] = hit
+            }
+            return
+        }
+
+        var visited = Set<Int>()
+        if phase == .down {
+            pressHits.removeAll()
+            pressOrder.removeAll()
+        }
+        for sample in samples where visited.insert(sample.id).inserted {
+            let id = sample.id
+            guard let hit = sample.hit else {
+                if phase == .up, let previous = pressHits[id] { sendCursor(.up, to: reproject(previous)) }
+                if let previous = hoverHits.removeValue(forKey: id) { sendCursor(.leave, to: reproject(previous)) }
+                continue
+            }
+            if hoverHits[id] == nil { sendCursor(.enter, to: hit) }
+            if moved { sendCursor(.move, to: hit) }
+            hoverHits[id] = hit
+            if phase == .down {
+                pressHits[id] = hit
+                pressOrder.append(id)
+                sendCursor(.down, to: hit)
+            } else if phase == .up {
+                sendCursor(.up, to: hit)
+                if pressHits[id] != nil { sendCursor(.click, to: hit) }
+            }
+        }
+        if phase == .up {
+            // An object may have become covered while it owned the press.
+            for id in pressOrder where !visited.contains(id) {
+                if let old = pressHits[id] { sendCursor(.up, to: reproject(old)) }
+            }
+            pressHits.removeAll()
+            pressOrder.removeAll()
+        }
+        hoverOrder = samples.compactMap { $0.hit?.id } + hoverOrder.filter { !visited.contains($0) }
+    }
+
+    /// 渲染一帧到 drawable(桌面实时)。
+    /// **关键**:绝不让 encodeFrame 的多 pass(含 .dontCare 加载/折射采样/混合读目标)直接写
+    /// `framebufferOnly` 的 drawable —— 平铺 GPU 上其未定义/平铺显存会在桌面合成时泄漏成彩色噪点/
+    /// 黑线(只在实时出现,离屏 .shared 纹理正常,已实测确认)。改为:先渲到可读中间纹理(= 已验证
+    /// 干净的离屏路径),再用**单次 clear+全屏 blit** 呈现到 drawable(整张被清空+100% 覆盖,无残留)。
     @discardableResult
     func render(to drawable: CAMetalDrawable, viewportSize: CGSize) -> Bool {
         guard let cmd = queue.makeCommandBuffer() else { return false }
