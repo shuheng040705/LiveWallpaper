@@ -37994,6 +37994,1040 @@
       }
      }
     ]
+   },
+   {
+    "combos": {
+     "BLENDMODE": "7"
+    },
+    "passes": [
+     {
+      "shader": "workshop/2795521260/effects/color_grading",
+      "target": null,
+      "bind": [],
+      "uniformMeta": {
+       "u_alpha": {
+        "material": "Opacity",
+        "default": 1,
+        "combo": null
+       },
+       "u_displayInitGamma": {
+        "material": "Initial display gamma",
+        "default": 2.2,
+        "combo": null
+       },
+       "u_displayGamma": {
+        "material": "Corrected display gamma",
+        "default": 2.2,
+        "combo": null
+       },
+       "u_channelMultiplier": {
+        "material": "Channel influence",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_brightness": {
+        "material": "Brightness",
+        "default": 0,
+        "combo": null
+       },
+       "u_contrast": {
+        "material": "Contrast",
+        "default": 0,
+        "combo": null
+       },
+       "u_exposure": {
+        "material": "Exposure",
+        "default": 0,
+        "combo": null
+       },
+       "u_blackLevel": {
+        "material": "Black level",
+        "default": 0,
+        "combo": null
+       },
+       "u_luminance": {
+        "material": "Luminance",
+        "default": 0,
+        "combo": null
+       },
+       "u_saturation": {
+        "material": "Saturation",
+        "default": 0,
+        "combo": null
+       },
+       "u_vibrance": {
+        "material": "Vibrance",
+        "default": 0,
+        "combo": null
+       },
+       "u_hueShift": {
+        "material": "Hue shift",
+        "default": 0,
+        "combo": null
+       },
+       "u_chroma": {
+        "material": "Chroma",
+        "default": 0,
+        "combo": null
+       },
+       "u_colorFilter": {
+        "material": "Color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_colorTemp": {
+        "material": "Color temperature",
+        "default": 0,
+        "combo": null
+       },
+       "u_whiteTint": {
+        "material": "White balance tint",
+        "default": 0,
+        "combo": null
+       },
+       "u_shadows": {
+        "material": "Shadows",
+        "default": 0,
+        "combo": null
+       },
+       "u_highlights": {
+        "material": "Highlights",
+        "default": 0,
+        "combo": null
+       },
+       "u_HSbalance": {
+        "material": "Balance",
+        "default": 0,
+        "combo": null
+       },
+       "u_shadowTint": {
+        "material": "Shadow tint",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_highlightTint": {
+        "material": "Highlight tint",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_gamma": {
+        "material": "Gamma adjustment",
+        "default": 0,
+        "combo": null
+       },
+       "u_gain": {
+        "material": "Gain adjustment",
+        "default": 0,
+        "combo": null
+       },
+       "u_lift": {
+        "material": "Lift adjustment",
+        "default": 0,
+        "combo": null
+       },
+       "u_LiftColorFilter": {
+        "material": "Lift color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_GammaColorFilter": {
+        "material": "Gamma color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_GainColorFilter": {
+        "material": "Gain color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_tollerance": {
+        "material": "Tollerance",
+        "default": 0.1,
+        "combo": null
+       },
+       "u_smooth": {
+        "material": "Smooth transition",
+        "default": 0.5,
+        "combo": null
+       },
+       "u_replaceBaseColor": {
+        "material": "1baseColor",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_baseHue": {
+        "material": "1hue",
+        "default": 1,
+        "combo": null
+       },
+       "u_baseSaturation": {
+        "material": "2saturation",
+        "default": 1,
+        "combo": null
+       },
+       "u_baseBrightness": {
+        "material": "3luminosity",
+        "default": 1,
+        "combo": null
+       },
+       "g_Texture0": {
+        "material": "framebuffer",
+        "default": null,
+        "combo": null
+       },
+       "g_Texture1": {
+        "material": "mask",
+        "default": null,
+        "combo": "MASK"
+       }
+      },
+      "targetScale": 1,
+      "vert": {
+       "metal": "workshop__2795521260__effects__color_grading__BLENDMODE-7_GAMMA-0_GREYSCALE-0_INVERTCOLOR-0_INVERTVALUE-0_LINEAR-0_MODE-0_TOOLS-0__vert.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_ModelViewProjectionMatrix",
+         "offset": 0,
+         "type": "mat4"
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      },
+      "frag": {
+       "metal": "workshop__2795521260__effects__color_grading__BLENDMODE-7_GAMMA-0_GREYSCALE-0_INVERTCOLOR-0_INVERTVALUE-0_LINEAR-0_MODE-0_TOOLS-0__frag.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "u_alpha",
+         "offset": 0,
+         "type": "float"
+        },
+        {
+         "name": "u_displayInitGamma",
+         "offset": 4,
+         "type": "float"
+        },
+        {
+         "name": "u_displayGamma",
+         "offset": 8,
+         "type": "float"
+        },
+        {
+         "name": "u_channelMultiplier",
+         "offset": 16,
+         "type": "vec3"
+        },
+        {
+         "name": "u_brightness",
+         "offset": 28,
+         "type": "float"
+        },
+        {
+         "name": "u_contrast",
+         "offset": 32,
+         "type": "float"
+        },
+        {
+         "name": "u_tollerance",
+         "offset": 36,
+         "type": "float"
+        },
+        {
+         "name": "u_smooth",
+         "offset": 40,
+         "type": "float"
+        }
+       ],
+       "samplers": [
+        {
+         "name": "g_Texture0",
+         "texIndex": 0,
+         "sampIndex": 0
+        }
+       ],
+       "ubuf": 0
+      }
+     }
+    ]
+   },
+   {
+    "combos": {
+     "GREYSCALE": "1"
+    },
+    "passes": [
+     {
+      "shader": "workshop/2795521260/effects/color_grading",
+      "target": null,
+      "bind": [],
+      "uniformMeta": {
+       "u_alpha": {
+        "material": "Opacity",
+        "default": 1,
+        "combo": null
+       },
+       "u_displayInitGamma": {
+        "material": "Initial display gamma",
+        "default": 2.2,
+        "combo": null
+       },
+       "u_displayGamma": {
+        "material": "Corrected display gamma",
+        "default": 2.2,
+        "combo": null
+       },
+       "u_channelMultiplier": {
+        "material": "Channel influence",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_brightness": {
+        "material": "Brightness",
+        "default": 0,
+        "combo": null
+       },
+       "u_contrast": {
+        "material": "Contrast",
+        "default": 0,
+        "combo": null
+       },
+       "u_exposure": {
+        "material": "Exposure",
+        "default": 0,
+        "combo": null
+       },
+       "u_blackLevel": {
+        "material": "Black level",
+        "default": 0,
+        "combo": null
+       },
+       "u_luminance": {
+        "material": "Luminance",
+        "default": 0,
+        "combo": null
+       },
+       "u_saturation": {
+        "material": "Saturation",
+        "default": 0,
+        "combo": null
+       },
+       "u_vibrance": {
+        "material": "Vibrance",
+        "default": 0,
+        "combo": null
+       },
+       "u_hueShift": {
+        "material": "Hue shift",
+        "default": 0,
+        "combo": null
+       },
+       "u_chroma": {
+        "material": "Chroma",
+        "default": 0,
+        "combo": null
+       },
+       "u_colorFilter": {
+        "material": "Color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_colorTemp": {
+        "material": "Color temperature",
+        "default": 0,
+        "combo": null
+       },
+       "u_whiteTint": {
+        "material": "White balance tint",
+        "default": 0,
+        "combo": null
+       },
+       "u_shadows": {
+        "material": "Shadows",
+        "default": 0,
+        "combo": null
+       },
+       "u_highlights": {
+        "material": "Highlights",
+        "default": 0,
+        "combo": null
+       },
+       "u_HSbalance": {
+        "material": "Balance",
+        "default": 0,
+        "combo": null
+       },
+       "u_shadowTint": {
+        "material": "Shadow tint",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_highlightTint": {
+        "material": "Highlight tint",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_gamma": {
+        "material": "Gamma adjustment",
+        "default": 0,
+        "combo": null
+       },
+       "u_gain": {
+        "material": "Gain adjustment",
+        "default": 0,
+        "combo": null
+       },
+       "u_lift": {
+        "material": "Lift adjustment",
+        "default": 0,
+        "combo": null
+       },
+       "u_LiftColorFilter": {
+        "material": "Lift color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_GammaColorFilter": {
+        "material": "Gamma color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_GainColorFilter": {
+        "material": "Gain color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_tollerance": {
+        "material": "Tollerance",
+        "default": 0.1,
+        "combo": null
+       },
+       "u_smooth": {
+        "material": "Smooth transition",
+        "default": 0.5,
+        "combo": null
+       },
+       "u_replaceBaseColor": {
+        "material": "1baseColor",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_baseHue": {
+        "material": "1hue",
+        "default": 1,
+        "combo": null
+       },
+       "u_baseSaturation": {
+        "material": "2saturation",
+        "default": 1,
+        "combo": null
+       },
+       "u_baseBrightness": {
+        "material": "3luminosity",
+        "default": 1,
+        "combo": null
+       },
+       "g_Texture0": {
+        "material": "framebuffer",
+        "default": null,
+        "combo": null
+       },
+       "g_Texture1": {
+        "material": "mask",
+        "default": null,
+        "combo": "MASK"
+       }
+      },
+      "targetScale": 1,
+      "vert": {
+       "metal": "workshop__2795521260__effects__color_grading__BLENDMODE-0_GAMMA-0_GREYSCALE-1_INVERTCOLOR-0_INVERTVALUE-0_LINEAR-0_MODE-0_TOOLS-0__vert.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_ModelViewProjectionMatrix",
+         "offset": 0,
+         "type": "mat4"
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      },
+      "frag": {
+       "metal": "workshop__2795521260__effects__color_grading__BLENDMODE-0_GAMMA-0_GREYSCALE-1_INVERTCOLOR-0_INVERTVALUE-0_LINEAR-0_MODE-0_TOOLS-0__frag.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "u_alpha",
+         "offset": 0,
+         "type": "float"
+        },
+        {
+         "name": "u_displayInitGamma",
+         "offset": 4,
+         "type": "float"
+        },
+        {
+         "name": "u_displayGamma",
+         "offset": 8,
+         "type": "float"
+        },
+        {
+         "name": "u_channelMultiplier",
+         "offset": 16,
+         "type": "vec3"
+        },
+        {
+         "name": "u_brightness",
+         "offset": 28,
+         "type": "float"
+        },
+        {
+         "name": "u_contrast",
+         "offset": 32,
+         "type": "float"
+        },
+        {
+         "name": "u_tollerance",
+         "offset": 36,
+         "type": "float"
+        },
+        {
+         "name": "u_smooth",
+         "offset": 40,
+         "type": "float"
+        }
+       ],
+       "samplers": [
+        {
+         "name": "g_Texture0",
+         "texIndex": 0,
+         "sampIndex": 0
+        }
+       ],
+       "ubuf": 0
+      }
+     }
+    ]
+   },
+   {
+    "combos": {
+     "GREYSCALE": "1",
+     "MASK": "1"
+    },
+    "passes": [
+     {
+      "shader": "workshop/2795521260/effects/color_grading",
+      "target": null,
+      "bind": [],
+      "uniformMeta": {
+       "u_alpha": {
+        "material": "Opacity",
+        "default": 1,
+        "combo": null
+       },
+       "u_displayInitGamma": {
+        "material": "Initial display gamma",
+        "default": 2.2,
+        "combo": null
+       },
+       "u_displayGamma": {
+        "material": "Corrected display gamma",
+        "default": 2.2,
+        "combo": null
+       },
+       "u_channelMultiplier": {
+        "material": "Channel influence",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_brightness": {
+        "material": "Brightness",
+        "default": 0,
+        "combo": null
+       },
+       "u_contrast": {
+        "material": "Contrast",
+        "default": 0,
+        "combo": null
+       },
+       "u_exposure": {
+        "material": "Exposure",
+        "default": 0,
+        "combo": null
+       },
+       "u_blackLevel": {
+        "material": "Black level",
+        "default": 0,
+        "combo": null
+       },
+       "u_luminance": {
+        "material": "Luminance",
+        "default": 0,
+        "combo": null
+       },
+       "u_saturation": {
+        "material": "Saturation",
+        "default": 0,
+        "combo": null
+       },
+       "u_vibrance": {
+        "material": "Vibrance",
+        "default": 0,
+        "combo": null
+       },
+       "u_hueShift": {
+        "material": "Hue shift",
+        "default": 0,
+        "combo": null
+       },
+       "u_chroma": {
+        "material": "Chroma",
+        "default": 0,
+        "combo": null
+       },
+       "u_colorFilter": {
+        "material": "Color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_colorTemp": {
+        "material": "Color temperature",
+        "default": 0,
+        "combo": null
+       },
+       "u_whiteTint": {
+        "material": "White balance tint",
+        "default": 0,
+        "combo": null
+       },
+       "u_shadows": {
+        "material": "Shadows",
+        "default": 0,
+        "combo": null
+       },
+       "u_highlights": {
+        "material": "Highlights",
+        "default": 0,
+        "combo": null
+       },
+       "u_HSbalance": {
+        "material": "Balance",
+        "default": 0,
+        "combo": null
+       },
+       "u_shadowTint": {
+        "material": "Shadow tint",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_highlightTint": {
+        "material": "Highlight tint",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_gamma": {
+        "material": "Gamma adjustment",
+        "default": 0,
+        "combo": null
+       },
+       "u_gain": {
+        "material": "Gain adjustment",
+        "default": 0,
+        "combo": null
+       },
+       "u_lift": {
+        "material": "Lift adjustment",
+        "default": 0,
+        "combo": null
+       },
+       "u_LiftColorFilter": {
+        "material": "Lift color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_GammaColorFilter": {
+        "material": "Gamma color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_GainColorFilter": {
+        "material": "Gain color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_tollerance": {
+        "material": "Tollerance",
+        "default": 0.1,
+        "combo": null
+       },
+       "u_smooth": {
+        "material": "Smooth transition",
+        "default": 0.5,
+        "combo": null
+       },
+       "u_replaceBaseColor": {
+        "material": "1baseColor",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_baseHue": {
+        "material": "1hue",
+        "default": 1,
+        "combo": null
+       },
+       "u_baseSaturation": {
+        "material": "2saturation",
+        "default": 1,
+        "combo": null
+       },
+       "u_baseBrightness": {
+        "material": "3luminosity",
+        "default": 1,
+        "combo": null
+       },
+       "g_Texture0": {
+        "material": "framebuffer",
+        "default": null,
+        "combo": null
+       },
+       "g_Texture1": {
+        "material": "mask",
+        "default": null,
+        "combo": "MASK"
+       }
+      },
+      "targetScale": 1,
+      "vert": {
+       "metal": "workshop__2795521260__effects__color_grading__BLENDMODE-0_GAMMA-0_GREYSCALE-1_INVERTCOLOR-0_INVERTVALUE-0_LINEAR-0_MASK-1_MODE-0_TOOLS-0__vert.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_ModelViewProjectionMatrix",
+         "offset": 0,
+         "type": "mat4"
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      },
+      "frag": {
+       "metal": "workshop__2795521260__effects__color_grading__BLENDMODE-0_GAMMA-0_GREYSCALE-1_INVERTCOLOR-0_INVERTVALUE-0_LINEAR-0_MASK-1_MODE-0_TOOLS-0__frag.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "u_alpha",
+         "offset": 0,
+         "type": "float"
+        },
+        {
+         "name": "u_displayInitGamma",
+         "offset": 4,
+         "type": "float"
+        },
+        {
+         "name": "u_displayGamma",
+         "offset": 8,
+         "type": "float"
+        },
+        {
+         "name": "u_channelMultiplier",
+         "offset": 16,
+         "type": "vec3"
+        },
+        {
+         "name": "u_brightness",
+         "offset": 28,
+         "type": "float"
+        },
+        {
+         "name": "u_contrast",
+         "offset": 32,
+         "type": "float"
+        },
+        {
+         "name": "u_tollerance",
+         "offset": 36,
+         "type": "float"
+        },
+        {
+         "name": "u_smooth",
+         "offset": 40,
+         "type": "float"
+        }
+       ],
+       "samplers": [
+        {
+         "name": "g_Texture0",
+         "texIndex": 0,
+         "sampIndex": 0
+        },
+        {
+         "name": "g_Texture1",
+         "texIndex": 1,
+         "sampIndex": 1
+        }
+       ],
+       "ubuf": 0
+      }
+     }
+    ]
+   },
+   {
+    "combos": {
+     "TOOLS": "1"
+    },
+    "passes": [
+     {
+      "shader": "workshop/2795521260/effects/color_grading",
+      "target": null,
+      "bind": [],
+      "uniformMeta": {
+       "u_alpha": {
+        "material": "Opacity",
+        "default": 1,
+        "combo": null
+       },
+       "u_displayInitGamma": {
+        "material": "Initial display gamma",
+        "default": 2.2,
+        "combo": null
+       },
+       "u_displayGamma": {
+        "material": "Corrected display gamma",
+        "default": 2.2,
+        "combo": null
+       },
+       "u_channelMultiplier": {
+        "material": "Channel influence",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_brightness": {
+        "material": "Brightness",
+        "default": 0,
+        "combo": null
+       },
+       "u_contrast": {
+        "material": "Contrast",
+        "default": 0,
+        "combo": null
+       },
+       "u_exposure": {
+        "material": "Exposure",
+        "default": 0,
+        "combo": null
+       },
+       "u_blackLevel": {
+        "material": "Black level",
+        "default": 0,
+        "combo": null
+       },
+       "u_luminance": {
+        "material": "Luminance",
+        "default": 0,
+        "combo": null
+       },
+       "u_saturation": {
+        "material": "Saturation",
+        "default": 0,
+        "combo": null
+       },
+       "u_vibrance": {
+        "material": "Vibrance",
+        "default": 0,
+        "combo": null
+       },
+       "u_hueShift": {
+        "material": "Hue shift",
+        "default": 0,
+        "combo": null
+       },
+       "u_chroma": {
+        "material": "Chroma",
+        "default": 0,
+        "combo": null
+       },
+       "u_colorFilter": {
+        "material": "Color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_colorTemp": {
+        "material": "Color temperature",
+        "default": 0,
+        "combo": null
+       },
+       "u_whiteTint": {
+        "material": "White balance tint",
+        "default": 0,
+        "combo": null
+       },
+       "u_shadows": {
+        "material": "Shadows",
+        "default": 0,
+        "combo": null
+       },
+       "u_highlights": {
+        "material": "Highlights",
+        "default": 0,
+        "combo": null
+       },
+       "u_HSbalance": {
+        "material": "Balance",
+        "default": 0,
+        "combo": null
+       },
+       "u_shadowTint": {
+        "material": "Shadow tint",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_highlightTint": {
+        "material": "Highlight tint",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_gamma": {
+        "material": "Gamma adjustment",
+        "default": 0,
+        "combo": null
+       },
+       "u_gain": {
+        "material": "Gain adjustment",
+        "default": 0,
+        "combo": null
+       },
+       "u_lift": {
+        "material": "Lift adjustment",
+        "default": 0,
+        "combo": null
+       },
+       "u_LiftColorFilter": {
+        "material": "Lift color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_GammaColorFilter": {
+        "material": "Gamma color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_GainColorFilter": {
+        "material": "Gain color filter",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_tollerance": {
+        "material": "Tollerance",
+        "default": 0.1,
+        "combo": null
+       },
+       "u_smooth": {
+        "material": "Smooth transition",
+        "default": 0.5,
+        "combo": null
+       },
+       "u_replaceBaseColor": {
+        "material": "1baseColor",
+        "default": "1 1 1",
+        "combo": null
+       },
+       "u_baseHue": {
+        "material": "1hue",
+        "default": 1,
+        "combo": null
+       },
+       "u_baseSaturation": {
+        "material": "2saturation",
+        "default": 1,
+        "combo": null
+       },
+       "u_baseBrightness": {
+        "material": "3luminosity",
+        "default": 1,
+        "combo": null
+       },
+       "g_Texture0": {
+        "material": "framebuffer",
+        "default": null,
+        "combo": null
+       },
+       "g_Texture1": {
+        "material": "mask",
+        "default": null,
+        "combo": "MASK"
+       }
+      },
+      "targetScale": 1,
+      "vert": {
+       "metal": "workshop__2795521260__effects__color_grading__BLENDMODE-0_GAMMA-0_GREYSCALE-0_INVERTCOLOR-0_INVERTVALUE-0_LINEAR-0_MODE-0_TOOLS-1__vert.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "g_ModelViewProjectionMatrix",
+         "offset": 0,
+         "type": "mat4"
+        }
+       ],
+       "samplers": [],
+       "ubuf": 0
+      },
+      "frag": {
+       "metal": "workshop__2795521260__effects__color_grading__BLENDMODE-0_GAMMA-0_GREYSCALE-0_INVERTCOLOR-0_INVERTVALUE-0_LINEAR-0_MODE-0_TOOLS-1__frag.metal",
+       "entry": "main0",
+       "uniforms": [
+        {
+         "name": "u_alpha",
+         "offset": 0,
+         "type": "float"
+        },
+        {
+         "name": "u_displayInitGamma",
+         "offset": 4,
+         "type": "float"
+        },
+        {
+         "name": "u_displayGamma",
+         "offset": 8,
+         "type": "float"
+        },
+        {
+         "name": "u_channelMultiplier",
+         "offset": 16,
+         "type": "vec3"
+        },
+        {
+         "name": "u_exposure",
+         "offset": 28,
+         "type": "float"
+        },
+        {
+         "name": "u_blackLevel",
+         "offset": 32,
+         "type": "float"
+        },
+        {
+         "name": "u_tollerance",
+         "offset": 36,
+         "type": "float"
+        },
+        {
+         "name": "u_smooth",
+         "offset": 40,
+         "type": "float"
+        }
+       ],
+       "samplers": [
+        {
+         "name": "g_Texture0",
+         "texIndex": 0,
+         "sampIndex": 0
+        }
+       ],
+       "ubuf": 0
+      }
+     }
+    ]
    }
   ]
  },

@@ -69,10 +69,11 @@ def main():
     before = len(manifest)
     print(f"当前 manifest: {before} keys")
 
-    scan = B.scan_post_workshop_effects()          # 全库 effects/workshop/ 引用 → (pkg, combo_sets)
+    bindings = {}
+    scan = B.scan_post_workshop_effects(bindings)          # 全库 effects/workshop/ 引用 → (pkg, combo_sets)
     # pkg-local 内置特效(effect.json 在 pkg 内、非 workshop 前缀、非 WE assets 内置;如「白影轻扬」3497488774
     # 的 fog)被 workshop scanner 漏掉 → 并入(setdefault:workshop 同名优先不覆盖)。同走 build_workshop_effect。
-    for k, v in B.scan_pkg_local_effects().items():
+    for k, v in B.scan_pkg_local_effects(bindings).items():
         scan.setdefault(k, v)
     builtin_combos = B.scene_combos()
     targets = sys.argv[1:]
@@ -92,13 +93,9 @@ def main():
             print(f"✗ {eff_key}: 全库 scene 未引用(scan 未命中),跳过")
             continue
         pkg_path = None
-        force_slots = set()
         combo_sets = builtin_combos.get(eff_key, set()) if is_builtin else scan[eff_key][1]
         if not is_builtin:
             pkg_path = scan[eff_key][0]
-            # scene 绑的覆盖贴图槽(effect.json 不声明、由 scene 绑)→ 供 sampler combo(texture_override 的
-            # g_Texture1 ENABLE)在转译期派生,否则变体无 g_Texture1、覆盖贴图永远采不到。
-            force_slots = B.scene_bound_slots_for(eff_key, pkg_path)
         # base({}) + scene 实际用到的 combo 组合,逐变体建(与 we_build_effects.main 同口径)。
         variants_in = [{}]
         for cs in sorted(combo_sets):
@@ -124,8 +121,9 @@ def main():
                 if is_builtin:
                     rec, err, misses = B.build_effect(eff_key, combos, ck)
                 else:
+                    slots = bindings[eff_key].get(tuple(sorted(combos.items())))
                     rec, err, misses = B.build_workshop_effect(
-                        eff_key, pkg_path, combos, ck, force_slots=force_slots
+                        eff_key, pkg_path, combos, ck, slots_by_pass=slots
                     )
                 if rec and rec["passes"] and any(pp.get("frag") for pp in rec["passes"]):
                     built.append({"combos": combos, "passes": rec["passes"]})

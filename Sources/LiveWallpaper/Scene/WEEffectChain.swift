@@ -526,7 +526,7 @@ final class WEEffectChain {
     func prewarm(effect: String, combos: [String: Any]) {
         if WPEnv.vars["WP_NO_FX_PREWARM"] != nil { return }
         guard let key = resolvedKey(effect), let edef = manifest[key],
-              let def = selectVariant(edef, combos: combos) else { return }
+              let def = Self.selectVariant(edef, combos: combos) else { return }
         for p in def.passes where p.vert != nil && p.frag != nil {
             _ = pipeline(p)
         }
@@ -1045,14 +1045,36 @@ final class WEEffectChain {
     // MARK: - 运行一条 effect 链
 
     /// 选与场景 combos 最匹配的变体(精确匹配优先,否则 base)。
-    private func selectVariant(_ def: EffectDef, combos: [String: Any]) -> Variant? {
+    static func selectVariant(_ def: EffectDef, combos: [String: Any]) -> Variant? {
         let want = combos.mapValues { v -> String in
             if let n = v as? NSNumber { return n.intValue == Int(n.doubleValue) ? "\(n.intValue)" : "\(n.floatValue)" }
             return "\(v)"
         }
+        // A shader compiled for normal blending replaces the image with its processed
+        // pixels. A shader compiled for screen, for example, mixes them with the input.
+        // Preserve that operation even when approximating other shader options.
+        let controlsBlend = def.variants.contains { $0.combos["BLENDMODE"] != nil }
+        let candidates: [Variant]
+        if controlsBlend {
+            var required = want["BLENDMODE"]
+            // Older manifests can represent normal blending only via the material default.
+            if required == "0", !def.variants.contains(where: { $0.combos["BLENDMODE"] == "0" }) {
+                required = nil
+            }
+            candidates = def.variants.filter { variant in
+                guard variant.combos["BLENDMODE"] == required else { return false }
+                // A masked permutation needs the matching input texture.
+                return ["MASK", "OPACITYMASK"].allSatisfy { key in
+                    guard let value = variant.combos[key], value != "0" else { return true }
+                    return want[key] == value
+                }
+            }
+        } else {
+            candidates = def.variants
+        }
         // 精确匹配(变体每个 combo 都被请求满足)优先,命中数越多越好。空变体作 score 0 兜底。
         var best: Variant? = nil; var bestScore = -1
-        for v in def.variants {
+        for v in candidates {
             if v.combos.isEmpty { if bestScore < 0 { best = v; bestScore = 0 }; continue }
             let ok = v.combos.allSatisfy { want[$0.key] == $0.value }
             if ok && v.combos.count > bestScore { best = v; bestScore = v.combos.count }
@@ -1064,14 +1086,14 @@ final class WEEffectChain {
         // 但关键 combo(TRANSPARENCY/BLENDMODE)保住 → 透明合成,白方块消失。WP_NO_PARTIAL_VARIANT=1 退回。
         if bestScore <= 0, WPEnv.vars["WP_NO_PARTIAL_VARIANT"] == nil {
             var partial: Variant? = nil; var ps = 0
-            for v in def.variants where !v.combos.isEmpty {
+            for v in candidates where !v.combos.isEmpty {
                 let sat = v.combos.filter { want[$0.key] == $0.value }.count
                 let score = sat - (v.combos.count - sat)   // 满足 − 违反
                 if sat > 0 && score > ps { partial = v; ps = score }
             }
             if let p = partial { return p }
         }
-        return best ?? def.variants.first
+        return best ?? (controlsBlend ? nil : candidates.first)
     }
 
     /// 渲染缺口检测(2026-06-19,用户政策弹窗):返回**请求了非默认值(≠0)但 manifest 无任何变体提供该
@@ -1150,7 +1172,7 @@ final class WEEffectChain {
              pointerXform: SIMD4<Float> = SIMD4(1, 0, -1, 1),
              poolKey: String = "",
              commandBuffer cmd: MTLCommandBuffer) -> MTLTexture? {
-        guard let key = comboAwareKey(effect, combos: combos), let edef = manifest[key], let def = selectVariant(edef, combos: combos) else {
+        guard let key = comboAwareKey(effect, combos: combos), let edef = manifest[key], let def = Self.selectVariant(edef, combos: combos) else {
             // 一次性诊断:manifest 缺失或变体不命中(静默失败的头号嫌疑),打出请求 combos vs 可用变体。
             let dk = "\(effect)|\(Self.comboInts(combos))"
             if diagLogged.insert(dk).inserted {

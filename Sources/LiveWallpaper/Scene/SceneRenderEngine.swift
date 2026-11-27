@@ -2316,7 +2316,7 @@ final class SceneRenderEngine {
                     let dedup = "\(e.weName)|\(bad.joined(separator: ","))"
                     if seenCombo.insert(dedup).inserted {
                         let shortName = (e.weName as NSString).lastPathComponent
-                        renderGapsBase.append("特效「\(shortName)」渲染变体缺失:\(bad.joined(separator: ", "))(回退默认变体,渲染可能不准,如图层「\(g.name)」)")
+                        renderGapsBase.append("特效「\(shortName)」渲染变体缺失:\(bad.joined(separator: ", "))(特效可能不完整,如图层「\(g.name)」)")
                     }
                 }
             }

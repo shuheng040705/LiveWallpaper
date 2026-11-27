@@ -380,7 +380,7 @@ def resolve_pass_shader(p, shaders_dir, file_reader):
                 shader_dir = SHARED_SHADERS
     return shader, mat_combos, mat_textures, shader_dir
 
-def build_effect_passes(edef, combos, ckey, shaders_dir, file_reader, tex_reader=None, force_slots=None):
+def build_effect_passes(edef, combos, ckey, shaders_dir, file_reader, tex_reader=None, force_slots=None, slots_by_pass=None):
     """通用 pass 构建:builtin 与 workshop 共用。shaders_dir = .vert/.frag 所在目录;
     force_slots:额外视为「已绑贴图」的槽索引集合——effect.json/material 常不声明覆盖贴图槽(由 scene 绑,
     转译时不可见),但 sampler combo(如 texture_override 的 g_Texture1 ENABLE,绑了才采样)需据此派生,
@@ -415,7 +415,9 @@ def build_effect_passes(edef, combos, ckey, shaders_dir, file_reader, tex_reader
         base, mat_combos, mat_textures, stage_dir = resolve_pass_shader(p, shaders_dir, file_reader)
         if not base:
             return None, f"pass {i} no shader", stage_misses
-        bound_slots = pass_bound_slots(p, mat_textures) | (force_slots or set())   # item 5:本 pass 占用的贴图槽(+ scene 绑的覆盖槽)
+        bound_slots = pass_bound_slots(p, mat_textures) | (force_slots or set())
+        if slots_by_pass:
+            bound_slots.update(slots_by_pass.get(i, ()))
         # item 3:texture0(slot 0)若绑定单通道 .tex(RG88/R8)→ 注入 TEX0FORMAT。texture0 名取
         # pass.textures[0] 或 material.textures[0](非空)。后处理 effect 的 slot0 多是离屏帧缓冲(无 .tex)→ 不注入。
         t0_name = None
@@ -445,7 +447,6 @@ def build_effect_passes(edef, combos, ckey, shaders_dir, file_reader, tex_reader
         # item 3:TEX0FORMAT 由材质纹理格式派生,等同 CPass 在拷贝 pass.combos 后 insert_or_assign,
         # 故置于最高优先级覆盖(仅当 texture0 为 RG88/R8 时存在;后处理 effect 普遍为空 → 无影响)。
         pass_combos.update(tex0_combo)
-        pck = combo_key(pass_combos)
         meta = {**extract_uniform_meta(vraw), **extract_uniform_meta(fraw)}  # uniform→{material,default}
         vsrc = T.strip_meta(vraw); fsrc = T.strip_meta(fraw)
         vary_locs = T.collect_varyings(vsrc, fsrc)
@@ -474,6 +475,11 @@ def build_effect_passes(edef, combos, ckey, shaders_dir, file_reader, tex_reader
                 stage_misses.append((i, base, stage))
                 continue
             msl, uniforms, samplers, ubuf = res
+            # The same shader can serve multiple passes with different scene texture
+            # bindings. Include its implicit sampler macros in the permutation name.
+            stage_source = vraw if stage == "vert" else fraw
+            sampler_combos = T.discover_sampler_combos(stage_source, pass_combos, bound_slots)
+            pck = combo_key({**sampler_combos, **pass_combos})
             mfile = safe_mfile(f"{entry}__{pck}__{stage}.metal")
             with open(os.path.join(MSL_DIR, mfile), "w") as f:
                 f.write(msl)
@@ -560,7 +566,7 @@ def scene_bound_slots_for(eff_key, pkg_path):
     visit(scene)
     return slots
 
-def build_workshop_effect(eff_key, pkg_path, combos, ckey, force_slots=None):
+def build_workshop_effect(eff_key, pkg_path, combos, ckey, force_slots=None, slots_by_pass=None):
     """workshop effect(shaders/材质/effect.json 在 pkg 内)。eff_key 如 'workshop/2822917890/bloom'。
     把 pkg 内 shaders/* 写到临时目录(保留 shaders/ 下的相对路径,供 #include 互引),按算法转译。
     force_slots:scene 绑的覆盖贴图槽(见 build_effect_passes),供 sampler combo 派生。"""
@@ -579,7 +585,8 @@ def build_workshop_effect(eff_key, pkg_path, combos, ckey, force_slots=None):
         return v.decode("utf-8", "ignore") if v is not None else None
     def tex_reader(rel):  # .tex 二进制(item 3 TEX0FORMAT),相对 pkg 根
         return files.get(rel.replace("\\", "/"))
-    return build_effect_passes(edef, combos, ckey, shdir, reader, tex_reader, force_slots=force_slots)
+    return build_effect_passes(edef, combos, ckey, shdir, reader, tex_reader, force_slots=force_slots,
+                               slots_by_pass=slots_by_pass)
 
 _shader_dir_cache = {}
 def _pkg_shader_dir(pkg_path, files):
@@ -595,7 +602,25 @@ def _pkg_shader_dir(pkg_path, files):
     _shader_dir_cache[pkg_path] = d
     return d
 
-def scan_post_workshop_effects():
+def record_scene_passes(effect, combo_sets, slots_by_combo):
+    """Record an effect's scene permutations and texture overrides per permutation and pass."""
+    for pass_index, scene_pass in enumerate(effect.get("passes") or []):
+        if not isinstance(scene_pass, dict):
+            continue
+        combos = {k: str(v) for k, v in (scene_pass.get("combos") or {}).items()}
+        if combos:
+            combo_sets.add(tuple(sorted(combos.items())))
+        textures = scene_pass.get("textures") or []
+        if any(isinstance(t, str) and "mask" in t.lower() for t in textures):
+            combos["MASK"] = "1"
+            combo_sets.add(tuple(sorted(combos.items())))
+        bound = {index for index, texture in enumerate(textures) if texture}
+        if slots_by_combo is not None and bound:
+            by_pass = slots_by_combo.setdefault(tuple(sorted(combos.items())), {})
+            by_pass.setdefault(pass_index, set()).update(bound)
+
+
+def scan_post_workshop_effects(bindings=None):
     """扫全库 scene.pkg,找任何 object 上引用 effects/workshop/.../ 的 effect。
     返回 {eff_key: (pkg_path, {combo_tuple,...})}:eff_key = 'effects/' 之后去掉 '/effect.json';
     combo_tuple 是该 effect 在某 scene 里 pass.combos 的 (k,v) 排序元组(变体)。
@@ -626,20 +651,8 @@ def scan_post_workshop_effects():
                     if key.endswith("/effect.json"):
                         key = key[:-len("/effect.json")]
                     rec = found.setdefault(key, [pkg, set()])
-                    for ps in (e.get("passes") or []):
-                        if not isinstance(ps, dict):
-                            continue
-                        c = ps.get("combos") or {}
-                        if c:
-                            rec[1].add(tuple(sorted((k, str(v)) for k, v in c.items())))
-                        # 隐式 MASK:pass 分配了含 "mask" 的纹理槽 → WE/lwe 自动开 MASK(ShaderUnit.cpp:545-556:
-                        # 带 "combo" 注解的采样器被绑贴图时注入 MASK=1)。内置 effects 循环已派生,workshop 此前漏了
-                        # → workshop pulse(打雷)等的 MASK 变体从没烘出 → 运行期回退无遮罩变体 → 整帧增亮不限定云带。
-                        # 这里照 pass.textures 派生:任一槽名含 "mask" → 在(各 combo 组合 + 空)基础上加 MASK:1 变体。
-                        texs = ps.get("textures") or []
-                        if any(isinstance(t, str) and "mask" in t.lower() for t in texs):
-                            cm = dict(c); cm["MASK"] = "1"
-                            rec[1].add(tuple(sorted((k, str(v)) for k, v in cm.items())))
+                    slots = bindings.setdefault(key, {}) if bindings is not None else None
+                    record_scene_passes(e, rec[1], slots)
                 for v in o.values():
                     visit(v)
             elif isinstance(o, list):
@@ -648,7 +661,7 @@ def scan_post_workshop_effects():
         visit(scene)
     return found
 
-def scan_pkg_local_effects():
+def scan_pkg_local_effects(bindings=None):
     """扫全库 scene.pkg,找 object 引用的 **pkg-local 自定义** effect —— 即 effect.json 在 pkg 内、
     但 effect 名既不在 WE assets 的内置 USED 列表里、路径也不含 'effects/workshop/' 的那一类
     (如 2B NieR 壁纸的 'effects/t2/...' 驱动头发/手臂畸变)。这类此前被两个 scanner 同时漏掉:
@@ -686,17 +699,8 @@ def scan_pkg_local_effects():
                     if f"effects/{key}/effect.json" not in files:  # effect.json 必须真在 pkg 内
                         continue
                     rec = found.setdefault(key, [pkg, set()])
-                    for ps in (e.get("passes") or []):
-                        if not isinstance(ps, dict):
-                            continue
-                        c = ps.get("combos") or {}
-                        if c:
-                            rec[1].add(tuple(sorted((k, str(v)) for k, v in c.items())))
-                        # 隐式 MASK(同 workshop scanner):pass 分配含 "mask" 的纹理槽 → 加 MASK:1 变体。
-                        texs = ps.get("textures") or []
-                        if any(isinstance(t, str) and "mask" in t.lower() for t in texs):
-                            cm = dict(c); cm["MASK"] = "1"
-                            rec[1].add(tuple(sorted((k, str(v)) for k, v in cm.items())))
+                    slots = bindings.setdefault(key, {}) if bindings is not None else None
+                    record_scene_passes(e, rec[1], slots)
                 for v in o.values():
                     visit(v)
             elif isinstance(o, list):
@@ -779,7 +783,8 @@ def main():
     # base + scene 实际用到的 combo 组合都建:per-pass material combos(VERTICAL 等)逐 pass 自带合并;
     # 整 effect 级 scene combos(ANTIALIAS/CLIP_* 等)base 不含,须按 scene 组合另建变体(否则视觉错)。
     ws_ok = []
-    for eff_key, (pkg_path, combo_sets) in sorted(scan_post_workshop_effects().items()):
+    bindings = {}
+    for eff_key, (pkg_path, combo_sets) in sorted(scan_post_workshop_effects(bindings).items()):
         variants_in = [{}]
         for cs in sorted(combo_sets):
             cd = {k: v for k, v in cs}
@@ -789,7 +794,8 @@ def main():
         for combos in variants_in:
             ck = combo_key(combos)
             try:
-                rec, err, misses = build_workshop_effect(eff_key, pkg_path, combos, ck)
+                slots = bindings[eff_key].get(tuple(sorted(combos.items())))
+                rec, err, misses = build_workshop_effect(eff_key, pkg_path, combos, ck, slots_by_pass=slots)
                 # 缺 .vert/.frag 文件的 stage(transpile_stage→None)逐条记录(不再静默 continue)
                 for (pi, sb, st) in misses:
                     fail.append((f"{eff_key}/{ck}", f"pass {pi} {sb}.{st} 缺 shader 文件"))
@@ -810,7 +816,8 @@ def main():
     # 与 workshop effect 共用 build_workshop_effect 的 pkg-shader 读取/转译路径;manifest key 用裸 effect 名
     # (如 't2',与运行时 SceneModel 取 'effects/' 后首段一致)。base + scene 实际 combo 组合都建,同 workshop。
     pl_ok = []
-    for eff_key, (pkg_path, combo_sets) in sorted(scan_pkg_local_effects().items()):
+    bindings = {}
+    for eff_key, (pkg_path, combo_sets) in sorted(scan_pkg_local_effects(bindings).items()):
         variants_in = [{}]
         for cs in sorted(combo_sets):
             cd = {k: v for k, v in cs}
@@ -820,7 +827,8 @@ def main():
         for combos in variants_in:
             ck = combo_key(combos)
             try:
-                rec, err, misses = build_workshop_effect(eff_key, pkg_path, combos, ck)
+                slots = bindings[eff_key].get(tuple(sorted(combos.items())))
+                rec, err, misses = build_workshop_effect(eff_key, pkg_path, combos, ck, slots_by_pass=slots)
                 for (pi, sb, st) in misses:
                     fail.append((f"{eff_key}/{ck}", f"pass {pi} {sb}.{st} 缺 shader 文件"))
                 if rec and rec["passes"] and any(pp.get("frag") for pp in rec["passes"]):
