@@ -46,15 +46,16 @@ class SceneTextureVariantTests(unittest.TestCase):
             with self.subTest(key=key):
                 path = f"effects/{key}/effect.json"
 
-                def package(passes):
-                    effects = [{"file": path, "passes": passes}]
+                def package(*instances):
+                    effects = [{"file": path, "passes": passes} for passes in instances]
                     return {"scene.json": json.dumps({"objects": [{"effects": effects}]}).encode(),
                             path: b"{}"}
 
                 packages = {
                     "a.pkg": package([{"combos": {"BLENDMODE": 7}}]),
-                    "b.pkg": package([{"combos": {"BLENDMODE": 7}, "textures": [None, "grain"]},
-                                      {"combos": {"TOOLS": 1}, "textures": [None, None, "masks/area"]}]),
+                    "b.pkg": package([{"combos": {"BLENDMODE": 7}, "textures": [None, "grain"]}],
+                                     [{"combos": {"TOOLS": 1}},
+                                      {"combos": {"LEVEL": 2}, "textures": [None, None, "masks/area"]}]),
                 }
                 bindings = {}
                 with patch.object(builder.glob, "glob", return_value=list(packages)), \
@@ -62,7 +63,7 @@ class SceneTextureVariantTests(unittest.TestCase):
                     source, combos = scan(bindings)[key]
                 self.assertEqual(source, "a.pkg")
                 blend = (("BLENDMODE", "7"),)
-                masked = (("MASK", "1"), ("TOOLS", "1"))
+                masked = (("LEVEL", "2"), ("MASK", "1"), ("TOOLS", "1"))
                 self.assertIn(masked, combos)
                 self.assertEqual(bindings[key], {blend: {0: {1}}, masked: {1: {2}}})
 

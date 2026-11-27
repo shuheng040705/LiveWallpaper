@@ -604,20 +604,34 @@ def _pkg_shader_dir(pkg_path, files):
 
 def record_scene_passes(effect, combo_sets, slots_by_combo):
     """Record an effect's scene permutations and texture overrides per permutation and pass."""
+    scene_combos = {}
+    scene_slots = {}
+    has_mask = False
     for pass_index, scene_pass in enumerate(effect.get("passes") or []):
         if not isinstance(scene_pass, dict):
             continue
         combos = {k: str(v) for k, v in (scene_pass.get("combos") or {}).items()}
+        scene_combos.update(combos)
         if combos:
             combo_sets.add(tuple(sorted(combos.items())))
         textures = scene_pass.get("textures") or []
         if any(isinstance(t, str) and "mask" in t.lower() for t in textures):
-            combos["MASK"] = "1"
+            has_mask = True
+            combos.setdefault("MASK", "1")
             combo_sets.add(tuple(sorted(combos.items())))
         bound = {index for index, texture in enumerate(textures) if texture}
         if slots_by_combo is not None and bound:
-            by_pass = slots_by_combo.setdefault(tuple(sorted(combos.items())), {})
-            by_pass.setdefault(pass_index, set()).update(bound)
+            scene_slots[pass_index] = bound
+    # SceneModel selects a whole-effect variant using settings from every pass.
+    if has_mask:
+        scene_combos.setdefault("MASK", "1")
+    requested = tuple(sorted(scene_combos.items()))
+    if requested:
+        combo_sets.add(requested)
+    if scene_slots:
+        by_pass = slots_by_combo.setdefault(requested, {})
+        for index, slots in scene_slots.items():
+            by_pass.setdefault(index, set()).update(slots)
 
 
 def scan_post_workshop_effects(bindings=None):
