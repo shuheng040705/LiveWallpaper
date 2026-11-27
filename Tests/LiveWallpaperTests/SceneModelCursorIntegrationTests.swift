@@ -106,7 +106,7 @@ final class SceneModelCursorIntegrationTests: XCTestCase {
     func testOverlappingModelsReceiveEventsInCameraOrderAndShareState() throws {
         for nearFirst in [true, false] {
             let engine = try load(Fixture(nearFirst: nearFirst))
-            XCTAssertTrue(engine.cursorHotspots(at: blank).isEmpty)
+            XCTAssertFalse(engine.containsCursorHotspot(at: blank))
             click(engine, at: center)
             let first = try state(engine)
             XCTAssertEqual(first["events"] as? [String], ["near.down", "far.down", "near.up", "near.click", "far.up", "far.click"])

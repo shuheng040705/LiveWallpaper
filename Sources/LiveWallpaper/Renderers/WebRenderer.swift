@@ -468,9 +468,9 @@ private extension WallpaperDesktopInput {
     convenience init(webView: WebWallpaperView, isEnabled: @escaping () -> Bool) {
         self.init(view: webView, isEnabled: { [weak webView] in
             isEnabled() && webView?.url?.scheme == WebRenderer.scheme && webView?.url?.host == "wp"
-        }, readHotspots: { [weak webView] point, completion in
-            guard let webView else { completion([]); return }
-            WebWallpaperHotspots.read(in: webView, at: point, completion: completion)
+        }, hitTest: { [weak webView] point, completion in
+            guard let webView else { completion(false); return }
+            WebWallpaperHotspots.contains(in: webView, at: point, completion: completion)
         }, onPointer: { [weak webView] phase, point, count in
             webView?.send(phase, at: point, clickCount: count)
         })

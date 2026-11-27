@@ -3,6 +3,17 @@ import XCTest
 @testable import LiveWallpaper
 
 final class WebWallpaperInputTests: XCTestCase {
+    func testGlobalMouseCopyAddressedToObserverFallsBackToWindowHitTesting() throws {
+        let event = try XCTUnwrap(CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown,
+                                          mouseCursorPosition: .zero, mouseButton: .left))
+        event.setIntegerValueField(.eventTargetUnixProcessID, value: Int64(getpid()))
+        XCTAssertEqual(WallpaperDesktopInput.globalEventTarget(event), 0)
+
+        let otherProcess = getppid()
+        event.setIntegerValueField(.eventTargetUnixProcessID, value: Int64(otherProcess))
+        XCTAssertEqual(WallpaperDesktopInput.globalEventTarget(event), otherProcess)
+    }
+
     func testRevealedFinderDesktopAcceptsHotspotsWithOrWithoutAccessibility() {
         let display = CGRect(x: -1440, y: -120, width: 1440, height: 900)
         XCTAssertTrue(WallpaperDesktopInput.isDesktopBackdrop(frame: display, display: display, finderRole: nil))

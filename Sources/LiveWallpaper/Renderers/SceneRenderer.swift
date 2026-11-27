@@ -96,7 +96,7 @@ final class SceneRenderer: WallpaperRenderer {
     private var metalLayer: CAMetalLayer?
     private var fallbackImageView: NSView?
     private var hostView: NSView?
-    private var desktopInput: WallpaperDesktopInput?
+    private(set) var desktopInput: WallpaperDesktopInput?
     private var cursorRevision = UUID() // Protected by renderLock
     private let engine: SceneRenderEngine?
     private var loaded = false
@@ -396,8 +396,9 @@ final class SceneRenderer: WallpaperRenderer {
         // ⚠ 异步加载期间用户可能又切了壁纸 → 本实例已被 stop()/即将析构。此时迟到的
         //   loadAsync 回调若照常 start(),会给一个已拆除的渲染器重新建 CVDisplayLink
         //   (显示链持有回调上下文、还会往已 shutdown 的 frameQueue 投任务)。必须挡住。
-        guard !isStopped, loaded, let engine else { return }
+        guard !isStopped else { return }
         installDesktopInput()
+        guard loaded, let engine else { return }
         if engine.isAnimated {
             startTime = CACurrentMediaTime()
             scaledSimTime = 0; lastWallTime = 0   // 播放速度累积器复位(避免跨次启动残留)
@@ -666,21 +667,28 @@ final class SceneRenderer: WallpaperRenderer {
         cursorRevision = revision
         let needsInput = engine?.needsDesktopInput == true
         renderLock.unlock()
-        guard needsInput, let hostView, hostView.window is DesktopWindow else { return }
+        guard let hostView, hostView.window is DesktopWindow else { return }
+        guard needsInput else {
+            desktopInput = WallpaperDesktopInput(view: hostView, isEnabled: { [weak self] in
+                guard let self else { return false }
+                return !self.isStopped && !self.paused
+            })
+            return
+        }
         desktopInput = WallpaperDesktopInput(view: hostView, isEnabled: { [weak self] in
             guard let self else { return false }
             return self.loaded && !self.isStopped && !self.paused
-        }, readHotspots: { [weak self] point, completion in
-            guard let self, let point else { completion([]); return }
+        }, hitTest: { [weak self] point, completion in
+            guard let self else { completion(false); return }
             let accepted = self.frameQueue.async { [weak self] in
-                guard let self else { DispatchQueue.main.async { completion([]) }; return }
+                guard let self else { DispatchQueue.main.async { completion(false) }; return }
                 self.renderLock.lock()
-                let frames = self.loaded && self.cursorRevision == revision
-                    ? self.engine?.cursorHotspots(at: point) ?? [] : []
+                let hit = self.loaded && self.cursorRevision == revision &&
+                    self.engine?.containsCursorHotspot(at: point) == true
                 self.renderLock.unlock()
-                DispatchQueue.main.async { completion(frames) }
+                DispatchQueue.main.async { completion(hit) }
             }
-            if !accepted { completion([]) }
+            if !accepted { completion(false) }
         }, onPointer: { [weak self] phase, point, _ in
             self?.frameQueue.async { [weak self] in
                 guard let self else { return }

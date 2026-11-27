@@ -308,6 +308,8 @@ final class VideoPlayerView: NSView {
 /// 视频(mp4)壁纸渲染器:AVQueuePlayer + AVPlayerLooper 实现无缝循环。
 final class VideoRenderer: WallpaperRenderer {
     private var view: VideoPlayerView?
+    private(set) var desktopInput: WallpaperDesktopInput?
+    private var paused = false
     private var player: AVQueuePlayer?
     private var looper: AVPlayerLooper?
     private var itemObs: NSKeyValueObservation?
@@ -424,9 +426,16 @@ final class VideoRenderer: WallpaperRenderer {
         if let p = player, p.rate != 0 { p.rate = Float(speed) }
     }
 
-    func start() { player?.rate = Float(WPEnv.vars["WP_NO_GENERAL_PROPS"] != nil ? 1.0 : GeneralWallpaperSettings.shared.speedMultiplier(itemID)) }
+    func start() {
+        if desktopInput == nil, let view, view.window is DesktopWindow {
+            desktopInput = WallpaperDesktopInput(view: view, isEnabled: { [weak self] in self?.paused == false })
+        }
+        resume()
+    }
 
     func stop() {
+        desktopInput?.stop()
+        desktopInput = nil
         loadGeneration &+= 1
         statusObs = nil
         presObs = nil
@@ -446,8 +455,13 @@ final class VideoRenderer: WallpaperRenderer {
         applyGeneralProps()
     }
 
-    func pause() { player?.pause() }
+    func pause() {
+        paused = true
+        desktopInput?.invalidateHotspots()
+        player?.pause()
+    }
     func resume() {
+        paused = false
         let speed = WPEnv.vars["WP_NO_GENERAL_PROPS"] != nil ? 1.0 : GeneralWallpaperSettings.shared.speedMultiplier(itemID)
         player?.rate = Float(speed)
     }

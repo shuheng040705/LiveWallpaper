@@ -4,24 +4,29 @@ import XCTest
 
 @MainActor
 final class WebWallpaperHotspotPanelTests: XCTestCase {
-    func testWallpaperPriorityOnlyClaimsASmallRegionOnTheCurrentDisplay() {
-        let viewport = CGSize(width: 1728, height: 1117)
-        let point = CGPoint(x: 0.43, y: 0.61)
-        let rect = WallpaperDesktopInput.pointerRegion(around: point, viewSize: viewport)
-        XCTAssertTrue(rect.contains(point))
-        XCTAssertEqual(rect.width * viewport.width, 12, accuracy: 0.001)
-        XCTAssertEqual(rect.height * viewport.height, 12, accuracy: 0.001)
-        let edge = WallpaperDesktopInput.pointerRegion(around: .zero, viewSize: viewport)
-        XCTAssertEqual(edge.origin, .zero)
-        XCTAssertEqual(edge.width * viewport.width, 6, accuracy: 0.001)
-        XCTAssertEqual(WallpaperDesktopInput.pointerRegion(around: point, viewSize: .zero), .zero)
+    func testRevealedDesktopLeavesHolesForDesktopItems() {
+        let first = CGRect(x: 0, y: 0, width: 90, height: 70)
+        let second = CGRect(x: 110, y: 10, width: 25, height: 25)
+        let icon = CGRect(x: 15, y: 15, width: 30, height: 30)
+        let widget = CGRect(x: 40, y: 40, width: 100, height: 75)
+        let regions = WallpaperDesktopInput.uncoveredRegions([first, second], excluding: [icon, widget])
+        // Check every pixel center, including the overlap between the two exclusions.
+        for y in 0..<100 {
+            for x in 0..<140 {
+                let point = CGPoint(x: CGFloat(x) + 0.5, y: CGFloat(y) + 0.5)
+                let expected = (first.contains(point) || second.contains(point)) && !icon.contains(point) && !widget.contains(point)
+                XCTAssertEqual(regions.contains { $0.contains(point) }, expected)
+            }
+        }
     }
 
     func testHotspotForwardsOriginalPressDragReleaseAndCancellation() throws {
         _ = NSApplication.shared
         var phases: [WallpaperPointerPhase] = []
         var points: [CGPoint] = []
-        let panel = WallpaperHotspotPanel(frame: CGRect(x: 40, y: 90, width: 80, height: 50)) { phase, point, _ in
+        var canStart = true
+        let panel = WallpaperHotspotPanel(frame: CGRect(x: 40, y: 90, width: 80, height: 50),
+                                         canStart: { _ in canStart }) { phase, point, _ in
             phases.append(phase)
             points.append(point)
         }
@@ -43,6 +48,10 @@ final class WebWallpaperHotspotPanelTests: XCTestCase {
         surface.mouseUp(with: try event(.leftMouseUp, local))
         surface.mouseDown(with: try event(.leftMouseDown, local))
         panel.setReceivingClicks(false)
+        surface.mouseUp(with: try event(.leftMouseUp, local))
+        canStart = false
+        surface.mouseDown(with: try event(.leftMouseDown, local))
+        surface.mouseDragged(with: try event(.leftMouseDragged, local))
         surface.mouseUp(with: try event(.leftMouseUp, local))
         XCTAssertEqual(phases, [.down, .up, .down, .drag, .up, .down, .cancel])
         XCTAssertEqual(points[3], panel.convertPoint(toScreen: CGPoint(x: 38, y: 19)))

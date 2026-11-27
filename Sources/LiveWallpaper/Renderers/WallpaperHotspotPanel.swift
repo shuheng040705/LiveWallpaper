@@ -8,11 +8,13 @@ enum WallpaperPointerPhase: String {
 /// AppKit keeps sending drags and the release to the surface that received mouseDown.
 final class WallpaperHotspotPanel: NSPanel {
     private final class ClickSurface: NSView {
+        let canStart: (CGPoint) -> Bool
         let onPointer: (WallpaperPointerPhase, CGPoint, Int) -> Void
         private var lastPoint: CGPoint?
         private let modifiers: NSEvent.ModifierFlags = [.command, .option, .control, .shift]
 
-        init(frame: CGRect, onPointer: @escaping (WallpaperPointerPhase, CGPoint, Int) -> Void) {
+        init(frame: CGRect, canStart: @escaping (CGPoint) -> Bool, onPointer: @escaping (WallpaperPointerPhase, CGPoint, Int) -> Void) {
+            self.canStart = canStart
             self.onPointer = onPointer
             super.init(frame: frame)
         }
@@ -23,7 +25,7 @@ final class WallpaperHotspotPanel: NSPanel {
         override func mouseDown(with event: NSEvent) {
             cancelPress()
             guard event.clickCount > 0, event.modifierFlags.intersection(modifiers).isEmpty,
-                  let point = window?.convertPoint(toScreen: event.locationInWindow) else { return }
+                  let point = window?.convertPoint(toScreen: event.locationInWindow), canStart(point) else { return }
             lastPoint = point
             onPointer(.down, point, event.clickCount)
         }
@@ -46,7 +48,8 @@ final class WallpaperHotspotPanel: NSPanel {
         }
     }
 
-    init(frame: CGRect, onPointer: @escaping (WallpaperPointerPhase, CGPoint, Int) -> Void) {
+    init(frame: CGRect, canStart: @escaping (CGPoint) -> Bool = { _ in true },
+         onPointer: @escaping (WallpaperPointerPhase, CGPoint, Int) -> Void) {
         super.init(contentRect: frame, styleMask: [.borderless, .nonactivatingPanel],
                    backing: .buffered, defer: false)
         level = .init(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
@@ -61,7 +64,7 @@ final class WallpaperHotspotPanel: NSPanel {
         isMovable = false
         isReleasedWhenClosed = false
         animationBehavior = .none
-        contentView = ClickSurface(frame: CGRect(origin: .zero, size: frame.size), onPointer: onPointer)
+        contentView = ClickSurface(frame: CGRect(origin: .zero, size: frame.size), canStart: canStart, onPointer: onPointer)
     }
 
     override var canBecomeKey: Bool { false }

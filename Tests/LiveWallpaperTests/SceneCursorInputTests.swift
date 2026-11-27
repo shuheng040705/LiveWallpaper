@@ -74,9 +74,9 @@ final class SceneCursorInputTests: XCTestCase {
                 engine.routeCursor(.up, at: point)
             }
             let center = CGPoint(x: 0.5, y: 0.5), exposed = CGPoint(x: 0.3, y: 0.5)
-            XCTAssertEqual(engine.cursorHotspots(at: center).contains { $0.contains(center) },
+            XCTAssertEqual(engine.containsCursorHotspot(at: center),
                            scenario.frontReceives || scenario.backReceives, scenario.name)
-            XCTAssertTrue(engine.cursorHotspots(at: exposed).contains { $0.contains(exposed) }, scenario.name)
+            XCTAssertTrue(engine.containsCursorHotspot(at: exposed), scenario.name)
             click(center)
             let overlap = try state()
             XCTAssertEqual(overlap["front"], scenario.frontReceives ? "duc" : nil, scenario.name)
@@ -103,7 +103,7 @@ final class SceneCursorInputTests: XCTestCase {
             guard let engine = SceneRenderEngine() else { throw XCTSkip("Metal unavailable") }
             engine.load(document: doc, source: source)
             engine.update(time: 0, mouseNorm: .zero)
-            XCTAssertTrue(engine.cursorHotspots(at: point).isEmpty)
+            XCTAssertFalse(engine.containsCursorHotspot(at: point))
             XCTAssertEqual(engine.interactiveHitAt(mouseNorm: SIMD2(0.4, 0.6)), solid ? 42 : nil)
         }
     }
@@ -126,7 +126,7 @@ final class SceneCursorInputTests: XCTestCase {
         engine.setScreenResolution(SIMD2(800, 300))
         XCTAssertTrue(engine.needsDesktopInput)
         let point = CGPoint(x: 0.1, y: 0.3)
-        XCTAssertTrue(engine.cursorHotspots(at: point).isEmpty)
+        XCTAssertFalse(engine.containsCursorHotspot(at: point))
         for (phase, pressed) in [(WallpaperPointerPhase.down, true), (.leave, true), (.drag, true), (.up, false),
                                  (.down, true), (.cancel, false)] {
             engine.routeCursor(phase, at: point)
@@ -165,8 +165,8 @@ final class SceneCursorInputTests: XCTestCase {
         engine.load(document: doc, source: source)
         engine.update(time: 0, mouseNorm: .zero)
         let inside = CGPoint(x: 0.73, y: 0.24), outside = CGPoint(x: 0.73, y: 0.76)
-        XCTAssertTrue(engine.cursorHotspots(at: inside).contains { $0.contains(inside) })
-        XCTAssertTrue(engine.cursorHotspots(at: outside).isEmpty)
+        XCTAssertTrue(engine.containsCursorHotspot(at: inside))
+        XCTAssertFalse(engine.containsCursorHotspot(at: outside))
         func result() throws -> [String: Any] {
             try XCTUnwrap(JSONSerialization.jsonObject(with: Data(target.sharedJSON().utf8)) as? [String: Any])
         }

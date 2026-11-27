@@ -6898,22 +6898,16 @@ final class SceneRenderEngine {
         return samples
     }
 
-    func cursorHotspots(at point: CGPoint?) -> [CGRect] {
-        guard let point else { return [] }
+    func containsCursorHotspot(at point: CGPoint) -> Bool {
         for sample in cursorPass(at: point, includeBoxes: true) {
             guard let hit = sample.hit else { continue }
-            if hit.hitBox == nil, let i = hit.imageIndex, let transform = cursorTransform(for: i) {
-                let rect = Self.cursorQuad.applying(transform)
-                if rect.contains(CGRect(x: 0.01, y: 0.01, width: 0.98, height: 0.98)) { continue }
-                if cursorStops.isEmpty, abs(transform.b) < 1e-6, abs(transform.c) < 1e-6 { return [rect] }
+            if hit.hitBox == nil, let i = hit.imageIndex, let transform = cursorTransform(for: i),
+               Self.cursorQuad.applying(transform).contains(CGRect(x: 0.01, y: 0.01, width: 0.98, height: 0.98)) {
+                continue
             }
-            // Only claim a small area at the tested cursor. Overlapping controls, tilted
-            // planes, and animated bones cannot safely claim their screen bounding boxes.
-            let size = screenResolution == .zero ? canvas : screenResolution
-            let dx = 2 / CGFloat(max(1, size.x)), dy = 2 / CGFloat(max(1, size.y))
-            return [CGRect(x: point.x - dx, y: point.y - dy, width: 2 * dx, height: 2 * dy)]
+            return true
         }
-        return []
+        return false
     }
 
     func interactiveHitAt(mouseNorm: SIMD2<Float>) -> Int? {
