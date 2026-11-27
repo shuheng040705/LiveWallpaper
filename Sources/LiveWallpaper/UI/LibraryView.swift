@@ -12,7 +12,7 @@ struct LibraryView: View {
         self.currentID = currentID
         self.actions = actions
         // libraryWindow 在扫描完成后才构造视图；预览模式可在第一帧直接带出侧栏，避免截图时序竞争。
-        _settingsItem = State(initialValue: WPEnv.vars["WP_PREVIEW_PANEL"] != nil ? library.items.first : nil)
+        _settingsItemID = State(initialValue: WPEnv.vars["WP_PREVIEW_PANEL"] != nil ? library.items.first?.id : nil)
     }
 
     /// 首页「创意工坊热门」在线货架数据源(浏览/推荐 Steam 工坊壁纸)。
@@ -43,7 +43,7 @@ struct LibraryView: View {
     }()
     @State private var search = ""
     @State private var favVersion = 0
-    @State private var settingsItem: WallpaperItem?    // 选中壁纸的检视面板
+    @State private var settingsItemID: String?
     @State private var showSettings =
         WPEnv.vars["WP_PREVIEW_SETTINGS"] != nil   // 设置 sheet
 
@@ -141,16 +141,16 @@ struct LibraryView: View {
         .frame(minWidth: 1000, minHeight: 660)
         .preferredColorScheme(.dark)
         .onAppear {
-            if WPEnv.vars["WP_PREVIEW_PANEL"] != nil, settingsItem == nil {
-                settingsItem = filtered.first
+            if WPEnv.vars["WP_PREVIEW_PANEL"] != nil, settingsItemID == nil {
+                settingsItemID = filtered.first?.id
             }
             // 截图验证用:WP_PREVIEW_SETTINGS 时自动打开设置窗口。
             if showSettings { NotificationCenter.default.post(name: .showSettings, object: nil); showSettings = false }
         }
         // UI 截图模式下库扫描可能晚于 onAppear 完成；首项出现时再打开一次侧栏，避免预览图漏掉面板。
         .onChange(of: filtered.first?.id) { _ in
-            if WPEnv.vars["WP_PREVIEW_PANEL"] != nil, settingsItem == nil {
-                settingsItem = filtered.first
+            if WPEnv.vars["WP_PREVIEW_PANEL"] != nil, settingsItemID == nil {
+                settingsItemID = filtered.first?.id
             }
         }
     }
@@ -160,18 +160,18 @@ struct LibraryView: View {
         HStack(spacing: 0) {
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-            if let item = settingsItem {
+            if let settingsItemID, let item = library.item(id: settingsItemID) {
                 Divider().overlay(Color.white.opacity(0.06))
                 WallpaperSettingsPanel(
                     item: item,
                     onApply: { actions.onApplySettings(item) },
-                    onClose: { withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil } },
+                    onClose: { withAnimation(.easeOut(duration: 0.22)) { self.settingsItemID = nil } },
                     onOpenWorkshop: {
                         if let url = WorkshopWebAddress.detailURL(item.id) { openWorkshop(url) }
                     },
                     onUnsubscribe: WallpaperUninstallPolicy.isSteamWorkshopID(item.id) ? {
                         actions.onUnsubscribe(item); favVersion += 1
-                        withAnimation(.easeOut(duration: 0.22)) { settingsItem = nil }
+                        withAnimation(.easeOut(duration: 0.22)) { self.settingsItemID = nil }
                     } : nil
                 )
                 .frame(width: 382)
@@ -226,7 +226,7 @@ struct LibraryView: View {
         return Button {
             withAnimation(.easeOut(duration: 0.18)) {
                 tab = t
-                if t != .library { settingsItem = nil }
+                if t != .library { settingsItemID = nil }
             }
         } label: {
             HStack(spacing: 6) {
@@ -350,7 +350,7 @@ struct LibraryView: View {
 
     private func openWorkshop(_ url: URL) {
         SteamWorkshopBrowser.shared.open(url)
-        settingsItem = nil
+        settingsItemID = nil
         tab = .workshop
     }
 
@@ -660,13 +660,13 @@ struct LibraryView: View {
 
     private func selectAndConfigure(_ item: WallpaperItem) {
         actions.onSelect(item)
-        withAnimation(.easeOut(duration: 0.22)) { settingsItem = item }
+        withAnimation(.easeOut(duration: 0.22)) { settingsItemID = item.id }
     }
 
     @ViewBuilder
     private func cardMenu(_ item: WallpaperItem) -> some View {
         Button { selectAndConfigure(item) } label: { Label("设为壁纸", systemImage: "play.fill") }
-        Button { withAnimation(.easeOut(duration: 0.22)) { settingsItem = item } } label: { Label("壁纸设置…", systemImage: "slider.horizontal.3") }
+        Button { withAnimation(.easeOut(duration: 0.22)) { settingsItemID = item.id } } label: { Label("壁纸设置…", systemImage: "slider.horizontal.3") }
         Button {
             PreferencesStore.shared.toggleFavorite(item.id); favVersion += 1
         } label: {

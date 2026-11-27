@@ -179,9 +179,9 @@ enum SceneSourceFactory {
     static func make(for item: WallpaperItem) -> SceneSource? {
         // 已解包:存在 scene/scene.json 或顶层 scene.json
         let fm = FileManager.default
-        if fm.fileExists(atPath: item.folderURL.appendingPathComponent("scene/scene.json").path) ||
-           fm.fileExists(atPath: item.folderURL.appendingPathComponent("scene.json").path) {
-            return FolderSceneSource(root: item.folderURL)
+        if fm.fileExists(atPath: item.contentFolderURL.appendingPathComponent("scene/scene.json").path) ||
+           fm.fileExists(atPath: item.contentFolderURL.appendingPathComponent("scene.json").path) {
+            return FolderSceneSource(root: item.contentFolderURL)
         }
         if let pkg = item.scenePackageURL {
             return PackageSceneSource(pkgURL: pkg)

@@ -2,6 +2,30 @@ import AppKit
 import Combine
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
+    struct PendingPreset {
+        let folder: URL
+        let dependencyID: String
+
+        init?(_ item: WallpaperItem, libraryRoot: URL) {
+            let folder = item.folderURL.standardizedFileURL
+            guard let dependencyID = item.sharedPresetDependencyID, dependencyID != item.id,
+                  let workshopID = UInt64(dependencyID), workshopID > 0,
+                  item.contentFolderURL.standardizedFileURL == folder,
+                  WallpaperUninstallPolicy.isSafeLibraryChild(folderURL: folder, libraryRoot: libraryRoot)
+            else { return nil }
+            self.folder = folder
+            self.dependencyID = dependencyID
+        }
+
+        func resolvedItem(in items: [WallpaperItem]) -> WallpaperItem? {
+            guard let item = items.first(where: { $0.id == folder.lastPathComponent }),
+                  item.folderURL.standardizedFileURL == folder, item.sharedPresetDependencyID == dependencyID,
+                  item.contentFolderURL.standardizedFileURL != folder, item.playbackUnavailableReason == nil
+            else { return nil }
+            return item
+        }
+    }
+
     private var statusItem: NSStatusItem!
 
     private let library = WallpaperLibrary()
@@ -17,6 +41,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         actions: makeActions()
     )
     private var folderWatcher: FolderWatcher?
+    private var pendingPreset: PendingPreset?
     private lazy var downloadsWindow = DownloadsWindowController()
     private lazy var settingsWindow = SettingsWindowController(
         actions: makeActions(),
@@ -52,6 +77,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             .store(in: &cancellables)
         desktop.start()
         power.start()
+        observePresetInstallation()
         NowPlayingProvider.shared.start()   // 系统正在播放的音乐(喂 Now Playing widget 歌名/艺术家)
         library.scan { [weak self] in
             self?.restoreOrOpenLibrary()
@@ -186,7 +212,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             onLoginChanged: { LoginItem.setEnabled($0) },
             onPowerChanged: { [weak self] on in self?.power.isEnabled = on },
             onAssetsPathChanged: { [weak self] in self?.desktop.reloadCurrent() },
-            onLibraryRootChanged: { [weak self] in self?.library.scan(); self?.startWatchingLibrary() },
+            onLibraryRootChanged: { [weak self] in
+                self?.pendingPreset = nil
+                self?.library.scan()
+                self?.startWatchingLibrary()
+            },
             onNext: { [weak self] in self?.rotation.advance() },
             onTogglePause: { [weak self] in self?.togglePause() },
             onClear: { [weak self] in self?.clearCurrentWallpaper() },
@@ -349,6 +379,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return
         }
         if !subscriptionWasCancelled { SteamSubscriptionRegistry.skipAutomaticDownload(true, id: id) }
+        if pendingPreset?.folder == folderURL.standardizedFileURL { pendingPreset = nil }
         uninstallingIDs.remove(id)
         library.scan()
         completion?(nil)
@@ -411,6 +442,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func clearCurrentWallpaper() {
+        pendingPreset = nil
         desktop.clear()
         PreferencesStore.shared.lastWallpaperID = nil
         libraryWindow.updateCurrent(nil)
@@ -607,26 +639,77 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Log.write("scan done: \(library.items.count) items; lastID=\(PreferencesStore.shared.lastWallpaperID ?? "nil")")
         // 启动时恢复上次壁纸(若有),但不自动弹窗——保持安静后台。
         if let lastID = PreferencesStore.shared.lastWallpaperID,
-           let item = library.item(id: lastID) {
-            apply(item)
-        } else {
-            openLibrary()   // 首次使用没有壁纸,弹窗引导
-        }
+           let item = library.item(id: lastID), apply(item) { return }
+        openLibrary()
     }
 
     // MARK: - Actions
 
-    private func apply(_ item: WallpaperItem, interactive: Bool = false) {
+    private func preparePresetDependency(for item: WallpaperItem, interactive: Bool) {
+        pendingPreset = PendingPreset(item, libraryRoot: library.rootURL)
+        guard let dependencyID = pendingPreset?.dependencyID else { return }
+        let downloader = WorkshopDownloader.shared
+        guard interactive || !SteamSubscriptionRegistry.skipsAutomaticDownload(dependencyID),
+              !downloader.jobs.contains(where: { $0.id == dependencyID && $0.state != .done })
+        else { return }
+        downloader.enqueue(id: dependencyID, title: "壁纸模板 · \(dependencyID)")
+    }
+
+    private func observePresetInstallation() {
+        // Steam can finish writing an existing directory without changing the root watched by FolderWatcher.
+        WorkshopDownloader.shared.$jobs
+            .map { [weak self] jobs -> String? in
+                guard let dependency = self?.pendingPreset?.dependencyID,
+                      jobs.contains(where: { $0.id == dependency && $0.state == .done })
+                else { return nil }
+                return dependency
+            }
+            .removeDuplicates()
+            .compactMap { $0 }
+            .sink { [weak self] _ in self?.library.scan() }
+            .store(in: &cancellables)
+        library.$items
+            .sink { [weak self] items in
+                guard let self, let resolved = self.pendingPreset?.resolvedItem(in: items) else { return }
+                let keepPaused = self.desktop.currentID == resolved.id && self.desktop.isPaused
+                if self.apply(resolved), keepPaused {
+                    self.desktop.pause()
+                    self.updateStatusItemAppearance()
+                }
+            }
+            .store(in: &cancellables)
+    }
+
+    @discardableResult
+    private func apply(_ item: WallpaperItem, interactive: Bool = false) -> Bool {
+        preparePresetDependency(for: item, interactive: interactive)
+        if pendingPreset != nil, desktop.current == item { return true }
         // ⭐用户政策(2026-06-19):渲染壁纸时,pkg 能渲的全渲、**不能渲的弹窗指明**,方便纠错。
         //   受「设置 → 渲染缺口报错」开关控制(默认关,普通使用不打扰);**开启后每次交互切壁纸都弹**。
         // ⚠ 加载已改异步 → 必须等 onLoaded 回调再读缺口,否则 apply 返回时引擎还没加载完,
         //   currentRenderGaps() 恒为空 = 弹窗永远不出现(功能被静默废掉)。
-        desktop.apply(item) { [weak self] in
+        let failure = desktop.apply(item) { [weak self] in
             guard let self else { return }
             if interactive && PreferencesStore.shared.reportRenderGaps { self.showRenderGapsIfAny(item) }
         }
-        libraryWindow.updateCurrent(item.id)
+        if let failure {
+            Log.write("apply: \(item.title) — \(failure)")
+            if interactive {
+                let alert = NSAlert()
+                alert.messageText = "无法播放「\(item.title)」"
+                alert.informativeText = failure
+                alert.addButton(withTitle: "知道了")
+                if let window = NSApp.keyWindow {
+                    alert.beginSheetModal(for: window)
+                } else {
+                    alert.runModal()
+                }
+            }
+            return false
+        }
+        libraryWindow.updateCurrent(desktop.currentID)
         updateStatusItemAppearance()
+        return true
     }
 
     /// 加载后若有渲染缺口(没渲成功的项),弹窗列出。空=全渲成功,不弹。

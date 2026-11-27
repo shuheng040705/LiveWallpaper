@@ -17,6 +17,10 @@ enum LocalWallpaperProbe {
               let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
             return .incomplete
         }
+        if let preset = SharedWallpaperPreset(project: json, folder: folder) {
+            // Steam installs the template separately. Retrying an intact preset cannot supply it.
+            return preset.mediaPaths.allSatisfy { SharedWallpaperPreset.resource($0, in: folder) != nil } ? .ready : .incomplete
+        }
         let type = WallpaperType(raw: json["type"] as? String)
         guard type != .unknown else { return .incomplete }
 

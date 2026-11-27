@@ -5,23 +5,42 @@ import Combine
 final class WallpaperLibrary: ObservableObject {
     @Published private(set) var items: [WallpaperItem] = []
     @Published private(set) var isScanning = false
+    private var scanRevision = 0
+    private var scanCompletions: [() -> Void] = []
+    private let configuredRoot: () -> URL
 
-    var rootURL: URL { PreferencesStore.shared.libraryRoot }
+    init(configuredRoot: @escaping () -> URL = { PreferencesStore.shared.libraryRoot }) {
+        self.configuredRoot = configuredRoot
+    }
+
+    var rootURL: URL { configuredRoot() }
 
     func scan(completion: (() -> Void)? = nil) {
-        isScanning = true
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { self.scan(completion: completion) }
+            return
+        }
+        if let completion { scanCompletions.append(completion) }
+        scanRevision &+= 1
+        let revision = scanRevision
+        if !isScanning { isScanning = true }
         let root = rootURL
         DispatchQueue.global(qos: .userInitiated).async {
             let result = Self.scanFolder(root)
             DispatchQueue.main.async {
+                guard self.scanRevision == revision else { return }
+                guard self.rootURL == root else { self.scan(); return }
                 self.items = result
+                guard self.scanRevision == revision else { return }
+                let completions = self.scanCompletions
+                self.scanCompletions.removeAll()
                 self.isScanning = false
-                completion?()
+                completions.forEach { $0() }
             }
         }
     }
 
-    private static func scanFolder(_ root: URL) -> [WallpaperItem] {
+    static func scanFolder(_ root: URL) -> [WallpaperItem] {
         let fm = FileManager.default
         guard let entries = try? fm.contentsOfDirectory(
             at: root,
@@ -38,7 +57,15 @@ final class WallpaperLibrary: ObservableObject {
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
             else { continue }
 
-            let type = WallpaperType(raw: json["type"] as? String)
+            let preset = SharedWallpaperPreset(project: json, folder: entry)
+            let template = preset?.installedTemplate
+            let media = preset?.singleVideoURL
+            let source = template?.project ?? json
+            var type = WallpaperType(raw: source["type"] as? String)
+            if preset != nil {
+                WallpaperPropertyStore.shared.invalidateProperties(in: entry)
+                if template == nil, media != nil { type = .web }
+            }
             let title = (json["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
             // contentrating 可能是普通字符串,也可能被包成 {"value": "..."}(WE 偶有此格式)。
             let ratingRaw: String?
@@ -50,15 +77,14 @@ final class WallpaperLibrary: ObservableObject {
                 ratingRaw = nil
             }
             let contentRating = ContentRating(raw: ratingRaw)
-            let file = json["file"] as? String
+            let file = (source["file"] as? String)?.replacingOccurrences(of: "\\", with: "/")
             let preview = json["preview"] as? String
             let tags = (json["tags"] as? [String]) ?? []
 
             // 文件夹修改时间(近似下载/更新时间)+ 主文件大小(用于排序)。
             let modified = (try? entry.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
-            var size: Int64 = 0
-            if let file, let attr = try? fm.attributesOfItem(atPath: entry.appendingPathComponent(file).path),
-               let s = attr[.size] as? Int64 { size = s }
+            let mainAsset = file.map { (template?.folder ?? entry).appendingPathComponent($0) } ?? media
+            let size = mainAsset.flatMap { try? $0.resourceValues(forKeys: [.fileSizeKey]).fileSize } ?? 0
 
             result.append(WallpaperItem(
                 id: entry.lastPathComponent,
@@ -70,7 +96,10 @@ final class WallpaperLibrary: ObservableObject {
                 previewName: preview,
                 tags: tags,
                 modifiedDate: modified,
-                fileSize: size
+                fileSize: Int64(size),
+                sharedPresetDependencyID: preset?.dependencyID,
+                templateFolderURL: template?.folder,
+                presetVideoURL: media
             ))
         }
 

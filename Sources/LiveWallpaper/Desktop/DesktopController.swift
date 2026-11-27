@@ -22,9 +22,7 @@ final class DesktopController {
 
     private var windows: [DesktopWindow] = []
     private var displayTargets: [DisplayTarget] = []
-    /// 渲染器 + 它所在屏幕的 frame。⚠ 必须成对存,不能靠下标与 windows 对齐:
-    /// apply() 里 RendererFactory.make 失败会 `continue`,下标就错位了。
-    /// 有了屏幕 frame 才能做**按屏**暂停(见 applyOcclusion)。
+    /// Keep each renderer paired with its screen for per-display occlusion checks.
     private var renderers: [(r: WallpaperRenderer, screenFrame: CGRect)] = []
     private(set) var current: WallpaperItem?
     private(set) var isPaused = false
@@ -67,7 +65,6 @@ final class DesktopController {
         renderers.removeAll()
         windows.forEach { $0.orderOut(nil) }
         windows = screens.map { DesktopWindow(screen: $0) }
-        windows.forEach { $0.orderFrontRegardless() }
         Log.write("rebuildWindows: \(windows.count) screen(s)")
         for (i, w) in windows.enumerated() {
             Log.write("  window[\(i)] level=\(w.level.rawValue) frame=\(NSStringFromRect(w.frame)) visible=\(w.isVisible)")
@@ -78,7 +75,18 @@ final class DesktopController {
     /// 应用一张壁纸到所有屏幕。
     /// - Parameter onLoaded: 全部渲染器**加载完成并已 start** 后在主线程回调一次。
     ///   加载改异步后,调用方不能再假定 apply 返回时场景已就绪(渲染缺口弹窗就依赖这个时序)。
-    func apply(_ item: WallpaperItem, onLoaded: (() -> Void)? = nil) {
+    @discardableResult
+    func apply(_ item: WallpaperItem, onLoaded: (() -> Void)? = nil) -> String? {
+        if let reason = item.playbackUnavailableReason { return reason }
+        guard !windows.isEmpty else { return "目前没有可用的显示器。" }
+        var replacements: [(DesktopWindow, WallpaperRenderer)] = []
+        for window in windows {
+            guard let renderer = RendererFactory.make(for: item) else {
+                return "当前版本无法播放这种壁纸。"
+            }
+            replacements.append((window, renderer))
+        }
+
         applyGeneration &+= 1
         renderers.forEach { $0.r.stop() }
         renderers.removeAll()
@@ -87,14 +95,11 @@ final class DesktopController {
         isPaused = false
 
         Log.write("apply: \(item.title) [\(item.type.rawValue)] file=\(item.fileURL?.path ?? "nil") on \(windows.count) window(s)")
-        var pending = 0   // 待加载渲染器数(闭包按引用捕获;全部回调都在主线程,无需加锁)
-        for window in windows {
+        // Count all screens before the first load: some renderers complete synchronously.
+        var pending = replacements.count
+        for (window, renderer) in replacements {
             let host = window.hostView(for: item.type)
             host.subviews.forEach { $0.removeFromSuperview() }
-            guard let renderer = RendererFactory.make(for: item) else {
-                Log.write("apply: no renderer for type \(item.type.rawValue)")
-                continue
-            }
             renderer.attach(to: host)
             renderers.append((renderer, window.screen?.frame ?? .zero))
             // 异步加载(审计):原来 attach→load→start 全在主线程同步跑,而 load 要解析 pkg + 解码
@@ -103,10 +108,11 @@ final class DesktopController {
             // ⚠ 用 generation 挡住过期回调:加载期间用户又切了壁纸的话,本轮 renderer 已被 stop(),
             //   此时不能再 start()(SceneRenderer.start 内也有 isStopped 守卫,这里是第二道)。
             let gen = applyGeneration
-            pending += 1
             renderer.loadAsync(item) { [weak self, weak renderer] in
                 guard let self, self.applyGeneration == gen else { return }
+                if !window.isVisible { window.orderFrontRegardless() }
                 renderer?.start()
+                if self.isPaused { renderer?.pause() }
                 pending -= 1
                 if pending == 0 {
                     Log.write("apply: 全部 \(self.renderers.count) 个渲染器加载完成")
@@ -114,8 +120,8 @@ final class DesktopController {
                 }
             }
         }
-        if pending == 0 { onLoaded?() }   // 一个渲染器都没建起来(类型不支持)
-        Log.write("apply: \(renderers.count) renderer(s) 已挂载,加载中…")
+        Log.write("apply: \(renderers.count) renderer(s) 已挂载")
+        return nil
     }
 
     /// 当前有几块屏在渲染(PowerManager 据此决定走按屏暂停还是整体暂停)。
@@ -128,7 +134,10 @@ final class DesktopController {
         applyGeneration &+= 1
         renderers.forEach { $0.r.stop() }
         renderers.removeAll()
-        windows.forEach { $0.contentView?.subviews.forEach { $0.removeFromSuperview() } }
+        for window in windows {
+            window.orderOut(nil)
+            window.contentView?.subviews.forEach { $0.removeFromSuperview() }
+        }
         current = nil
     }
 

@@ -73,6 +73,11 @@ struct WallpaperSettingsPanel: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
                     wallpaperInfo
+                    if item.sharedPresetDependencyID != nil, item.templateFolderURL == nil, item.presetVideoURL != nil {
+                        Label("可播放预设中的视频。完整效果需要原壁纸模板。", systemImage: "info.circle")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                     quickActions
                     sectionDivider(title: "属性")
                     GeneralPropertiesSection(item: item, accent: accent,

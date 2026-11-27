@@ -29,6 +29,22 @@ final class DesktopScreenChangeTests: XCTestCase {
     }
 
     @MainActor
+    func testUnsupportedWallpaperLeavesPlaybackAndRestoreStateAlone() {
+        let desktop = DesktopController()
+        let previousID = PreferencesStore.shared.lastWallpaperID
+        defer { PreferencesStore.shared.lastWallpaperID = previousID }
+        let item = WallpaperItem(id: "unsupported-fixture", folderURL: FileManager.default.temporaryDirectory,
+                                 title: "Unsupported wallpaper", type: .unknown,
+                                 fileName: nil, previewName: nil, tags: [])
+        var completed = false
+        let failure = desktop.apply(item) { completed = true }
+        XCTAssertNotNil(failure)
+        XCTAssertFalse(completed)
+        XCTAssertNil(desktop.currentID)
+        XCTAssertEqual(PreferencesStore.shared.lastWallpaperID, previousID)
+    }
+
+    @MainActor
     func testScreenNotificationWithSameRenderTargetsKeepsDesktopWindows() async throws {
         let app = NSApplication.shared
         guard !NSScreen.screens.isEmpty else { throw XCTSkip("Requires a display") }
@@ -41,7 +57,7 @@ final class DesktopScreenChangeTests: XCTestCase {
         desktop.start()
         let original = testWindows()
         XCTAssertFalse(original.isEmpty)
-        original.forEach { $0.orderOut(nil) }
+        XCTAssertTrue(original.allSatisfy { !$0.isVisible }, "An empty host must leave the system wallpaper visible")
         defer {
             NotificationCenter.default.removeObserver(desktop)
             testWindows().forEach { $0.close() }

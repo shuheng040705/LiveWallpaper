@@ -22,7 +22,6 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     private var mediaSuspended = false
     private var masterMuted = PreferencesStore.shared.isMuted
     private var masterVolume = PreferencesStore.shared.volume
-    private var rootURL: URL?           // 壁纸文件夹(资源根)
     private var loadedItem: WallpaperItem?
     private var documentReady = false
     private var frameRateObserver: AnyCancellable?
@@ -95,20 +94,25 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     }
 
     func load(_ item: WallpaperItem) {
-        guard let entry = item.fileName, !entry.isEmpty else { Log.write("WebRenderer.load: no entry file"); return }
+        let entry: String
+        if let file = item.fileName, !file.isEmpty {
+            entry = file
+        } else if item.sharedPresetDependencyID != nil, item.presetVideoURL != nil {
+            entry = Self.presetVideoPage
+        } else {
+            Log.write("WebRenderer.load: no entry file")
+            return
+        }
         webView?.resetPointer(release: true)
-        rootURL = item.folderURL
         loadedItem = item
         documentReady = false
         desktopInput?.invalidateHotspots()
-        // 经自定义 scheme 加载入口页:lwwp://wp/<index.html>
         var comps = URLComponents()
         comps.scheme = Self.scheme
         comps.host = "wp"
         comps.path = "/" + entry
         guard let url = comps.url else { Log.write("WebRenderer.load: bad entry url"); return }
-        let exists = FileManager.default.fileExists(atPath: item.folderURL.appendingPathComponent(entry).path)
-        Log.write("WebRenderer.load: \(url.absoluteString) entryExists=\(exists)")
+        Log.write("WebRenderer.load: \(url.absoluteString)")
         webView?.load(URLRequest(url: url))
     }
 
@@ -130,7 +134,6 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         webView?.uiDelegate = nil
         webView?.removeFromSuperview()
         webView = nil
-        rootURL = nil
         loadedItem = nil
         documentReady = false
         hostPaused = false
@@ -267,7 +270,8 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     private func applyProperties() {
         guard documentReady, let item = loadedItem, let webView else { return }
         let properties = WallpaperPropertyStore.shared.webProperties(for: item)
-        webView.callAsyncJavaScript("""
+        let fileBridge = item.sharedPresetDependencyID == nil ? "" : Self.presetFileBridge
+        webView.callAsyncJavaScript(fileBridge + "\n" + """
             const state = window.__lwUserPropertyState ??= { revision: 0 };
             const revision = ++state.revision;
             // 有些项目会等资源准备好才注册回调。在等待期间发生的修改由最新调用接管。
@@ -295,61 +299,71 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         }
     }
 
+    // Wallpaper Engine's file properties are often prefixed with "file:///" by the
+    // template. Preset files already have an origin-local URL in this renderer.
+    private static let presetFileBridge = #"""
+        if (!window.__lwPresetFileBridge) {
+            window.__lwPresetFileBridge = true;
+            const normalize = value => typeof value === "string"
+                ? value.replace(/file:\/+((?:lwwp:\/\/wp)\/__lw_preset_files__\/)/gi, "$1")
+                : value;
+
+            for (const type of [HTMLImageElement, HTMLMediaElement, HTMLSourceElement]) {
+                const proto = type.prototype;
+                const descriptor = Object.getOwnPropertyDescriptor(proto, "src");
+                if (!descriptor?.set) continue;
+                Object.defineProperty(proto, "src", {...descriptor, set(value) {
+                    descriptor.set.call(this, normalize(value));
+                }});
+            }
+            const set = Element.prototype.setAttribute;
+            Element.prototype.setAttribute = function(name, value) {
+                return set.call(this, name, normalize(value));
+            };
+            // Inline background images set with element.style bypass setAttribute.
+            new MutationObserver(records => {
+                for (const {target} of records) {
+                    const style = target.getAttribute("style");
+                    const fixed = normalize(style);
+                    if (fixed !== style) set.call(target, "style", fixed);
+                }
+            }).observe(document.documentElement, {attributes:true, subtree:true, attributeFilter:["style"]});
+        }
+        """#
+
     // MARK: - WKURLSchemeHandler (经自定义 scheme 直接喂本地文件,XHR/fetch 可用)
 
     func webView(_ webView: WKWebView, start urlSchemeTask: WKURLSchemeTask) {
         // 审计修复(#7):登记为活跃 task;每次回调(didReceive/didFinish/didFail)前检查是否仍活跃,
         //   被 stop: 取消(或 renderer 已 stop)的 task 不再回调,避免 use-after-stop 崩溃。
         beginTask(urlSchemeTask)
-        guard let root = rootURL, let url = urlSchemeTask.request.url else {
-            if isTaskActive(urlSchemeTask) {
-                urlSchemeTask.didFailWithError(NSError(domain: "lwwp", code: -1))
-            }
-            endTask(urlSchemeTask); return
-        }
-        // 用 path 解析相对资源(去掉前导 /,按文件夹根拼接);防目录穿越。
-        var rel = url.path
-        if rel.hasPrefix("/") { rel.removeFirst() }
-        rel = rel.removingPercentEncoding ?? rel
-        // ⚠ 安全(审计):必须 **resolvingSymlinksInPath** 后再比对,且按**路径分量**比对而非裸 hasPrefix。
-        //   ① standardizedFileURL 只消 `.`/`..`,**不解析符号链接** → 壁纸包里放一个指向包外的软链接
-        //      (如 link → ~/.ssh),`lwwp://wp/link/id_rsa` 就能被 Data(contentsOf:) 跟随读出;而响应头
-        //      写死 `Access-Control-Allow-Origin: *`、页面本身能发外网请求 → 可外传。进程无沙箱,读取面
-        //      是整个用户目录。
-        //   ② 裸 hasPrefix 没有分量边界:root=…/123456789 时 `…/1234567890/x` 也算通过(工坊 id 是数字,
-        //      天然容易前缀碰撞)。改用 path components 前缀比对。
-        //   另注:url.path 本身已解码一次,下面又 removingPercentEncoding = 双重解码,`%252e%252e` 能把
-        //   `..` 送进 rel —— 分量比对同时挡住这条。
-        let realRoot = root.standardizedFileURL.resolvingSymlinksInPath()
-        let fileURL = root.appendingPathComponent(rel).standardizedFileURL.resolvingSymlinksInPath()
-        let rootParts = realRoot.pathComponents
-        let fileParts = fileURL.pathComponents
-        let insideRoot = fileParts.count >= rootParts.count && Array(fileParts.prefix(rootParts.count)) == rootParts
-        // TODO(性能):此处 Data(contentsOf:) 同步整文件读入内存,大资源(视频/wasm/纹理)会阻塞且占内存;
-        //   后续可改为按需 mmap / 分块流式喂(didReceive 多段)。本次审计不改。
-        guard insideRoot,
-              let fileData = try? Data(contentsOf: fileURL) else {
-            Log.write("WebRenderer.scheme: 404 \(rel)")
+        guard let item = loadedItem, let url = urlSchemeTask.request.url, url.host == "wp",
+              let (fileData, mime) = Self.webResource(at: url, for: item) else {
+            Log.write("WebRenderer.scheme: unavailable \(urlSchemeTask.request.url?.path ?? "")")
             if isTaskActive(urlSchemeTask) {
                 urlSchemeTask.didFailWithError(URLError(.fileDoesNotExist))
             }
             endTask(urlSchemeTask); return
         }
-        let mime = Self.mimeType(for: fileURL)
-        let resp = HTTPURLResponse(
-            url: url, statusCode: 200, httpVersion: "HTTP/1.1",
-            headerFields: [
-                "Content-Type": mime,
-                "Content-Length": String(fileData.count),
-                "Access-Control-Allow-Origin": "*",
-                "Cache-Control": "no-store"
-            ]
-        )!
+        var headers = ["Content-Type": mime, "Access-Control-Allow-Origin": "*", "Cache-Control": "no-store"]
+        var body = fileData
+        var status = 200
+        if mime.hasPrefix("video/") || mime.hasPrefix("audio/") {
+            headers["Accept-Ranges"] = "bytes"
+            if let range = Self.mediaRange(urlSchemeTask.request.value(forHTTPHeaderField: "Range"), count: fileData.count) {
+                status = range.isEmpty ? 416 : 206
+                headers["Content-Range"] = range.isEmpty ? "bytes */\(fileData.count)"
+                    : "bytes \(range.lowerBound)-\(range.upperBound - 1)/\(fileData.count)"
+                body = fileData[range]
+            }
+        }
+        headers["Content-Length"] = String(body.count)
+        let resp = HTTPURLResponse(url: url, statusCode: status, httpVersion: "HTTP/1.1", headerFields: headers)!
         // 审计修复(#7):每步回调前确认 task 仍活跃,否则提前收尾不再触碰已取消的 task。
         guard isTaskActive(urlSchemeTask) else { endTask(urlSchemeTask); return }
         urlSchemeTask.didReceive(resp)
         guard isTaskActive(urlSchemeTask) else { endTask(urlSchemeTask); return }
-        urlSchemeTask.didReceive(fileData)
+        if !body.isEmpty { urlSchemeTask.didReceive(body) }
         guard isTaskActive(urlSchemeTask) else { endTask(urlSchemeTask); return }
         urlSchemeTask.didFinish()
         endTask(urlSchemeTask)
@@ -358,6 +372,65 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
     func webView(_ webView: WKWebView, stop urlSchemeTask: WKURLSchemeTask) {
         // 审计修复(#7):标记取消——从活跃集合移除。进行中的 start() 回调链会在下一个检查点停下,不再调该 task。
         endTask(urlSchemeTask)
+    }
+
+    private static let presetVideoPage = "__lw_preset_video__.html"
+    private static let presetVideoSource = "__lw_preset_video_source__"
+    static let presetFilesPrefix = "__lw_preset_files__/"
+
+    /// WebKit probes the media header with small byte ranges before starting playback.
+    /// Return nil to serve an ordinary response, or an empty range for a valid request past EOF.
+    static func mediaRange(_ header: String?, count: Int) -> Range<Int>? {
+        guard let header, header.lowercased().hasPrefix("bytes=") else { return nil }
+        let bounds = header.dropFirst(6).split(separator: "-", omittingEmptySubsequences: false)
+        guard bounds.count == 2 else { return nil }
+        func byteOffset(_ value: Substring) -> Int? {
+            value.allSatisfy(\.isNumber) ? Int(value) : nil
+        }
+        if bounds[0].isEmpty {
+            guard let suffix = byteOffset(bounds[1]) else { return nil }
+            return (count - min(count, suffix))..<count
+        }
+        guard let start = byteOffset(bounds[0]) else { return nil }
+        if bounds[1].isEmpty { return min(start, count)..<count }
+        guard let end = byteOffset(bounds[1]), end >= start else { return nil }
+        guard start < count else { return count..<count }
+        return start..<(min(end, count - 1) + 1)
+    }
+
+    private static func webResource(at url: URL, for item: WallpaperItem) -> (Data, String)? {
+        // Decode exactly once so a literal percent sign in a Workshop filename survives.
+        let path = String(url.path(percentEncoded: false).drop(while: { $0 == "/" }))
+        let root: URL
+        let file: URL
+        if item.sharedPresetDependencyID != nil, item.fileName == nil, let video = item.presetVideoURL,
+           path == presetVideoPage || path == presetVideoSource {
+            if path == presetVideoPage {
+                let html = """
+                <!doctype html><meta charset="utf-8">
+                <style>html,body,video{width:100%;height:100%;margin:0;background:black}video{display:block;object-fit:cover}</style>
+                <video autoplay loop playsinline src="/\(presetVideoSource)"></video>
+                """
+                return (Data(html.utf8), "text/html; charset=utf-8")
+            }
+            root = item.folderURL
+            file = video
+        } else if item.sharedPresetDependencyID != nil, path.hasPrefix(presetFilesPrefix) {
+            root = item.folderURL
+            file = root.appendingPathComponent(String(path.dropFirst(presetFilesPrefix.count)))
+        } else {
+            root = item.contentFolderURL
+            file = root.appendingPathComponent(path)
+        }
+
+        // Mounted template and preset directories retain separate containment boundaries,
+        // including for symbolic links and similarly named neighbouring Workshop folders.
+        let rootParts = root.standardizedFileURL.resolvingSymlinksInPath().pathComponents
+        let resolved = file.standardizedFileURL.resolvingSymlinksInPath()
+        guard resolved.pathComponents.count > rootParts.count,
+              resolved.pathComponents.starts(with: rootParts),
+              let data = try? Data(contentsOf: resolved, options: .mappedIfSafe) else { return nil }
+        return (data, mimeType(for: resolved))
     }
 
     private static func mimeType(for url: URL) -> String {

@@ -101,13 +101,25 @@ final class WallpaperPropertyStore: ObservableObject {
         let path = folderURL.appendingPathComponent("project.json").path
         cacheLock.lock(); defer { cacheLock.unlock() }
         if let c = propsCache[path] { return c }
-        let general = (((try? Data(contentsOf: URL(fileURLWithPath: path)))
-            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] })?
-            .flatMap { $0["general"] as? [String: Any] }) ?? [:]
+        let project = SharedWallpaperPreset.project(at: folderURL) ?? [:]
+        let general: [String: Any]
+        if let preset = SharedWallpaperPreset(project: project, folder: folderURL),
+           let template = preset.installedTemplate {
+            general = preset.general(using: template.project)
+        } else {
+            general = project["general"] as? [String: Any] ?? [:]
+        }
         let props = (general["properties"] as? [String: Any]) ?? [:]
         propsCache[path] = props
         localizationCache[path] = Self.pickLocalization(general["localization"] as? [String: Any])
         return props
+    }
+
+    func invalidateProperties(in folder: URL) {
+        let path = folder.appendingPathComponent("project.json").path
+        cacheLock.lock(); defer { cacheLock.unlock() }
+        propsCache.removeValue(forKey: path)
+        localizationCache.removeValue(forKey: path)
     }
 
     /// 取某壁纸已选语言的本地化译文表(可能为空)。依赖 cachedProps 已填充(properties() 入口先调它)。

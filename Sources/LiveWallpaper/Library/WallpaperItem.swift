@@ -76,12 +76,35 @@ struct WallpaperItem: Identifiable, Hashable {
     var modifiedDate: Date = .distantPast   // 文件夹修改时间(近似下载/更新时间)
     var fileSize: Int64 = 0                 // 主文件字节数(用于按大小排序)
 
-    var fileURL: URL? { fileName.map { folderURL.appendingPathComponent($0) } }
+    var sharedPresetDependencyID: String? = nil
+    var templateFolderURL: URL? = nil
+    var presetVideoURL: URL? = nil
+
+    var contentFolderURL: URL { templateFolderURL ?? folderURL }
+    var fileURL: URL? { fileName.map { contentFolderURL.appendingPathComponent($0) } }
+
+    var playbackUnavailableReason: String? {
+        switch type {
+        case .application: return "这张壁纸需要 Windows 应用程序。"
+        case .unknown:
+            if let id = sharedPresetDependencyID { return "这张共享预设需要创意工坊的原壁纸（" + id + "）。" }
+            return "无法识别这张壁纸的播放类型。"
+        case .scene:
+            if scenePackageURL != nil || ["scene.json", "scene/scene.json"].contains(where: {
+                SharedWallpaperPreset.file($0, in: contentFolderURL) != nil
+            }) { return nil }
+        case .video, .web:
+            if let name = fileName, SharedWallpaperPreset.file(name, in: contentFolderURL) != nil { return nil }
+            if type == .web, fileName == nil, presetVideoURL != nil { return nil }
+        }
+        return "缺少这张壁纸的播放文件。"
+    }
+
     var previewURL: URL? { previewName.map { folderURL.appendingPathComponent($0) } }
 
     /// scene 壁纸即便 file 写的是 scene.json,实际数据多在 scene.pkg 里。
     var scenePackageURL: URL? {
-        let pkg = folderURL.appendingPathComponent("scene.pkg")
+        let pkg = contentFolderURL.appendingPathComponent("scene.pkg")
         return FileManager.default.fileExists(atPath: pkg.path) ? pkg : nil
     }
 }
