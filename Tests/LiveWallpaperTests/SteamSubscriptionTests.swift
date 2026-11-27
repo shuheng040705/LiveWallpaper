@@ -1,4 +1,5 @@
 import XCTest
+import Combine
 import WebKit
 @testable import LiveWallpaper
 
@@ -80,6 +81,39 @@ final class SteamSubscriptionTests: XCTestCase {
         XCTAssertTrue(message.contains("本地文件未删除"))
     }
 
+    func testProxyErrorsAndCommunityPagesWithLoginLinksKeepAuthorization() {
+        let html = Data("<html><a href='/login/'>Login</a></html>".utf8)
+        let workshop = URL(string: "https://steamcommunity.com/sharedfiles/subscribe")
+        for code in [200, 403, 502, 503] {
+            guard case .failure = SteamSubscription.classifySubscribeResponse(
+                statusCode: code, data: html, error: nil, finalURL: workshop
+            ) else { return XCTFail("Unexpected authorization loss on HTTP \(code)") }
+        }
+        XCTAssertEqual(SteamSubscription.classifySubscribeResponse(
+            statusCode: 200, data: html, error: nil, finalURL: URL(string: "https://steamcommunity.com/login/home/")
+        ), .authenticationRequired)
+        guard case .failure = SteamSubscription.classifySubscribeResponse(
+            statusCode: 200, data: html, error: nil, finalURL: URL(string: "https://example.org/login/")
+        ) else { return XCTFail("Only official login redirects confirm expiry") }
+    }
+
+    func testSnapshotHonorsExpiryProvidedBySteam() throws {
+        let now = Date()
+        let future = now.addingTimeInterval(3600)
+        func persistent(_ name: String, _ expiration: Date) throws -> HTTPCookie {
+            try XCTUnwrap(HTTPCookie(properties: [
+                .domain: ".steamcommunity.com", .path: "/", .name: name, .value: "fixture",
+                .secure: "TRUE", .expires: expiration
+            ]))
+        }
+        let data = try XCTUnwrap(SteamWebCredentialVault.encodeSnapshot(cookies: [
+            try persistent("steamLoginSecure", now.addingTimeInterval(-10)), try persistent("browserid", future)
+        ]))
+        let restored = SteamWebCredentialVault.decodeSnapshot(data, now: now)
+        XCTAssertEqual(restored.map(\.name), ["browserid"])
+        XCTAssertEqual(try XCTUnwrap(restored.first?.expiresDate).timeIntervalSince(future), 0, accuracy: 1)
+    }
+
     func testKeychainSnapshotKeepsOnlyCommunityAuthenticationCookies() throws {
         let cookies = [
             cookie(name: "sessionid", value: "csrf"),
@@ -156,6 +190,180 @@ final class SteamSubscriptionTests: XCTestCase {
         XCTAssertEqual(stored.count, 2)
         XCTAssertTrue(stored.allSatisfy { $0.isSecure && $0.expiresDate != nil })
         XCTAssertFalse(session.isChecking)
+    }
+
+    @MainActor
+    func testWorkshopRelaunchRestoresOnceAndRemembersSubsequentCookieRotation() async throws {
+        let browser = WKWebsiteDataStore.nonPersistent()
+        let domain = "SteamSessionTests." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        defer { defaults.removePersistentDomain(forName: domain) }
+        let snapshot = [cookie(name: "sessionid", value: "csrf"), cookie(name: "steamLoginSecure", value: "saved")]
+        let read = expectation(description: "One noninteractive query for the first navigation and native request")
+        let rotation = expectation(description: "Cookie observer saves Steam's rotated login without a navigation")
+        let session = SteamWebSession(cookieStore: { browser.httpCookieStore }, defaults: defaults,
+            loadSnapshot: { XCTFail("Unexpected interactive access"); return nil },
+            saveSnapshot: { _ in XCTFail("Unexpected interactive write"); return false },
+            loadSilently: { read.fulfill(); return snapshot },
+            saveSilently: { cookies in
+                if SteamSubscription.communityLoginCookie(in: cookies)?.value == "rotated" { rotation.fulfill() }
+                return true
+            })
+        async let page: Void = session.prepareForWorkshop()
+        let restored = await withCheckedContinuation { session.authenticatedSession(completion: $0.resume(returning:)) }
+        await page
+        XCTAssertEqual(SteamSubscription.communityLoginCookie(in: restored?.cookies ?? [])?.value, "saved")
+        let updated = try XCTUnwrap(HTTPCookie(properties: [
+            .domain: ".steamcommunity.com", .path: "/", .name: "steamLoginSecure", .value: "rotated",
+            .secure: "TRUE", .expires: Date().addingTimeInterval(3600)
+        ]))
+        await browser.httpCookieStore.setCookie(updated)
+        await fulfillment(of: [read, rotation], timeout: 4)
+
+        // Also cover Steam removing its login via XHR without a main-frame
+        // logout navigation. A subsequent app instance must not replay it.
+        let signedOut = expectation(description: "Cookie removal observed")
+        let observer = session.$isAuthenticated.removeDuplicates().dropFirst().sink { authenticated in
+            if !authenticated { signedOut.fulfill() }
+        }
+        await browser.httpCookieStore.delete(updated)
+        await fulfillment(of: [signedOut], timeout: 4)
+        observer.cancel()
+        let relaunched = SteamWebSession(cookieStore: { browser.httpCookieStore }, defaults: defaults,
+            loadSilently: { XCTFail("Removed login should stay retired"); return snapshot })
+        await relaunched.prepareForWorkshop()
+        XCTAssertFalse(relaunched.isAuthenticated)
+    }
+
+    @MainActor
+    func testMissingCSRFRecoversAfterReconnectWithoutRequestingLogin() async throws {
+        let browser = WKWebsiteDataStore.nonPersistent()
+        let domain = "SteamSessionTests." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        defer { defaults.removePersistentDomain(forName: domain) }
+        let account = "76561198000000001"
+        let login = cookie(name: "steamLoginSecure", value: account + "%7C%7Cfixture")
+        let csrf = cookie(name: "sessionid", value: "issued-by-community")
+        await browser.httpCookieStore.setCookie(login)
+        var attempts = 0
+        let session = SteamWebSession(cookieStore: { browser.httpCookieStore }, defaults: defaults,
+            loadSnapshot: { XCTFail("Unexpected interactive access"); return nil }, fetchSessionID: { current in
+                XCTAssertEqual(current.value, login.value)
+                attempts += 1
+                return attempts == 1 ? nil : csrf
+            })
+        let offline = await withCheckedContinuation { session.authenticatedSession(completion: $0.resume(returning:)) }
+        XCTAssertNil(offline)
+        XCTAssertTrue(session.isAuthenticated)
+        XCTAssertEqual(session.steamID64, account)
+        let recovered = await withCheckedContinuation { session.authenticatedSession(completion: $0.resume(returning:)) }
+        XCTAssertEqual(recovered?.sessionID, csrf.value)
+        XCTAssertEqual(recovered?.steamID64, account)
+        XCTAssertEqual(attempts, 2)
+    }
+
+    @MainActor
+    func testRememberedWebsiteRecoveryRetriesAfterReconnectAndSharesTheFirstNavigation() async throws {
+        let browser = WKWebsiteDataStore.nonPersistent()
+        let suite = "SteamSessionTests." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let account = "76561198000000001"
+        let login = cookie(name: "steamLoginSecure", value: account + "%7C%7Cfixture")
+        let csrf = cookie(name: "sessionid", value: "csrf")
+        defaults.set(account, forKey: "steamWebLastAuthenticatedAccount")
+        let started = expectation(description: "Official website navigation started")
+        var finish: CheckedContinuation<Bool, Never>?
+        var attempts = 0
+        let session = SteamWebSession(cookieStore: { browser.httpCookieStore }, defaults: defaults, loadWorkshop: {
+            attempts += 1
+            if attempts == 1 {
+                return await withCheckedContinuation { finish = $0; started.fulfill() }
+            }
+            await browser.httpCookieStore.setCookie(login)
+            await browser.httpCookieStore.setCookie(csrf)
+            return true
+        })
+        let launch = Task { await session.resumeRememberedSession() }
+        await fulfillment(of: [started], timeout: 3)
+        await session.prepareForWorkshop() // Visible navigation can start while the site is offline.
+        let settings = Task { await session.resumeRememberedSession() }
+        await Task.yield()
+        finish?.resume(returning: false)
+        await launch.value
+        await settings.value
+        XCTAssertTrue(session.websiteUnavailable)
+        XCTAssertFalse(session.isChecking)
+        let auth = await withCheckedContinuation { session.authenticatedSession(completion: $0.resume(returning:)) }
+        XCTAssertEqual(auth?.steamID64, account)
+        XCTAssertFalse(session.websiteUnavailable)
+        XCTAssertEqual(attempts, 2)
+        await session.resumeRememberedSession()
+        XCTAssertEqual(attempts, 2)
+    }
+
+    @MainActor
+    func testCommunityCanRenewOnNaturalCookieExpiry() async throws {
+        let browser = WKWebsiteDataStore.nonPersistent()
+        let suite = "SteamSessionTests." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        let renewed = expectation(description: "Steam can renew an expired access cookie")
+        let session = SteamWebSession(cookieStore: { browser.httpCookieStore }, defaults: defaults,
+            loadWorkshop: { renewed.fulfill(); return true })
+        await session.prepareForWorkshop()
+        let account = "76561198000000001%7C%7Cfixture"
+        let previous = try XCTUnwrap(HTTPCookie(properties: [
+            .name: "steamLoginSecure", .value: account, .domain: ".steamcommunity.com", .path: "/",
+            .secure: "TRUE", .expires: Date().addingTimeInterval(-1)
+        ]))
+        let csrf = try XCTUnwrap(HTTPCookie(properties: [
+            .name: "sessionid", .value: "csrf", .domain: ".steamcommunity.com", .path: "/",
+            .secure: "TRUE", .expires: Date().addingTimeInterval(3600)
+        ]))
+        session.updateFromWebsite(cookies: [csrf, previous], afterLogout: false)
+        // Deliver WebKit's removal notification after that observed expiry.
+        session.cookiesDidChange(in: browser.httpCookieStore)
+        await fulfillment(of: [renewed], timeout: 2)
+    }
+
+    @MainActor
+    func testNewInstallationAndRevokedSessionSkipWebsiteRenewal() async throws {
+        let browser = WKWebsiteDataStore.nonPersistent()
+        let suite = "SteamSessionTests." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        func instance() -> SteamWebSession {
+            SteamWebSession(cookieStore: { browser.httpCookieStore }, defaults: defaults,
+                loadWorkshop: { XCTFail("Must not reauthenticate automatically"); return false })
+        }
+        let fresh = instance()
+        await fresh.resumeRememberedSession()
+        let cookies = [cookie(name: "sessionid", value: "csrf"),
+                       cookie(name: "steamLoginSecure", value: "76561198000000001%7C%7Cfixture")]
+        for item in cookies { await browser.httpCookieStore.setCookie(item) }
+        let auth = await withCheckedContinuation { fresh.authenticatedSession(completion: $0.resume(returning:)) }
+        fresh.noteRejected(try XCTUnwrap(auth))
+        await withCheckedContinuation { continuation in fresh.clearAuthenticationCookies { continuation.resume() } }
+        let next = instance()
+        await next.resumeRememberedSession()
+        XCTAssertFalse(next.isAuthenticated)
+    }
+
+    @MainActor
+    func testWorkshopRelaunchHonorsExplicitLogoutWithoutOpeningTheKeychain() async throws {
+        let browser = WKWebsiteDataStore.nonPersistent()
+        let domain = "SteamSessionTests." + UUID().uuidString
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: domain))
+        defer { defaults.removePersistentDomain(forName: domain) }
+        let session = SteamWebSession(cookieStore: { browser.httpCookieStore }, defaults: defaults,
+            loadSilently: { XCTFail("Signed-out sessions must stay retired"); return [] },
+            loadWorkshop: { XCTFail("The official website must not renew an explicit logout"); return false })
+        defaults.set("76561198000000001", forKey: "steamWebLastAuthenticatedAccount")
+        session.updateFromWebsite(cookies: [], afterLogout: true)
+        await session.resumeRememberedSession()
+        let signedOut = await withCheckedContinuation { session.authenticatedSession(completion: $0.resume(returning:)) }
+        XCTAssertNil(signedOut)
     }
 
     @MainActor

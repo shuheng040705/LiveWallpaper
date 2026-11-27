@@ -31,7 +31,7 @@ struct SettingsForm: View {
             SteamLoginSheet(onDone: { steamAccount = PreferencesStore.shared.steamAccount })
         }
         .task {
-            steamWebSession.refresh()
+            await steamWebSession.resumeRememberedSession()
             subscribedSummary = await SteamSubscriptions.summaryLine()
         }
     }
@@ -137,6 +137,7 @@ struct SettingsForm: View {
     @State private var parallax = PreferencesStore.shared.parallaxStrength
     @State private var frameCap = PreferencesStore.shared.frameRateCap
     @State private var showIcons = DesktopIcons.isVisible
+    @State private var canReadDesktopIcons = AXIsProcessTrusted()
 
     private var displaySection: some View {
         Section("显示与渲染") {
@@ -171,6 +172,18 @@ struct SettingsForm: View {
             toggleRow("显示桌面图标", "关闭可获得更干净的壁纸效果(会重启访达)", $showIcons) {
                 DesktopIcons.setVisible($0)
             }
+            if showIcons && WallpaperDesktopInput.stageManagerEnabled && !canReadDesktopIcons {
+                row("操作桌面文件", "按住 Shift 可以点击桌面图标。为 LiveWallpaper 开启辅助功能后，即可直接点击图标。") {
+                    Button("辅助功能设置…") {
+                        if let url = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility") {
+                            NSWorkspace.shared.open(url)
+                        }
+                    }
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in
+            canReadDesktopIcons = AXIsProcessTrusted()
         }
     }
 
@@ -369,14 +382,13 @@ struct SettingsForm: View {
                 steamDownloadStatus) {
                 Button(steamAccount == nil ? "登录" : "重新登录") { showSteamLogin = true }
             }
-            row("Steam 网页订阅授权",
-                steamWebSession.isAuthenticated
-                    ? "已授权并安全保存到 macOS 钥匙串；Steam 未吊销前可长期使用"
-                    : "未授权；与 SteamCMD 下载登录相互独立") {
+            row("Steam 网页订阅授权", steamWebStatus) {
                 if steamWebSession.isChecking {
                     ProgressView().controlSize(.small)
                 } else if steamWebSession.isAuthenticated {
                     Image(systemName: "checkmark.circle.fill").foregroundStyle(.green)
+                } else if steamWebSession.websiteUnavailable {
+                    Button("重试连接") { Task { await steamWebSession.resumeRememberedSession() } }
                 } else {
                     Button("授权…") {
                         SteamWebLoginWindowController.shared.authorize { _ in
@@ -394,10 +406,17 @@ struct SettingsForm: View {
         }
     }
 
+    private var steamWebStatus: String {
+        if steamWebSession.isChecking { return "正在检查 Steam 社区会话" }
+        if steamWebSession.isAuthenticated { return "Steam 社区已登录，可管理壁纸订阅" }
+        if steamWebSession.websiteUnavailable { return "暂时无法连接 Steam 社区，恢复连接后可重新检查登录状态" }
+        return "需要登录 Steam 社区才能管理壁纸订阅"
+    }
+
     private var steamDownloadStatus: String {
         guard let steamAccount else { return "匿名只能下载部分旧壁纸；登录后可下载新壁纸" }
         if downloader.loginExpired {
-            return "账号 \(steamAccount) 的 SteamCMD 下载令牌已失效"
+            return "账号 \(steamAccount) 需要重新登录 SteamCMD 才能下载"
         }
         return "账号 \(steamAccount) 已保存；仅用于 SteamCMD 下载"
     }

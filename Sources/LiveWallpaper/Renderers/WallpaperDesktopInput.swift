@@ -110,7 +110,9 @@ final class WallpaperDesktopInput {
             return
         }
         let protected = desktopItemFrames(on: screen, windows: windows)
-        setPanels(Self.uncoveredRegions([screen.visibleFrame], excluding: protected))
+        // The Dock, menu bar and Stage Manager shelf receive clicks above this panel.
+        // The unused portions of their screen edges still belong to the wallpaper.
+        setPanels(Self.uncoveredRegions([screen.frame], excluding: protected))
         clearCoveredHover(on: screen)
     }
 
@@ -177,21 +179,7 @@ final class WallpaperDesktopInput {
     }
 
     private func desktopItemFrames(on screen: NSScreen, windows: [[String: Any]]) -> [CGRect] {
-        let iconLevel = Int(CGWindowLevelForKey(.desktopIconWindow))
         let mainHeight = CGDisplayBounds(CGMainDisplayID()).height
-        var protected: [CGRect] = []
-        for window in windows {
-            guard let level = window[kCGWindowLayer as String] as? Int, (iconLevel...iconLevel + 1).contains(level),
-                  let owner = window[kCGWindowOwnerPID as String] as? pid_t, owner != getpid(),
-                  let bounds = window[kCGWindowBounds as String] as? NSDictionary,
-                  var frame = CGRect(dictionaryRepresentation: bounds) else { continue }
-            frame.origin.y = mainHeight - frame.maxY
-            guard frame.intersects(screen.frame) else { continue }
-            let bundle = NSRunningApplication(processIdentifier: owner)?.bundleIdentifier
-            if level == iconLevel, bundle == "com.apple.finder" || bundle == "com.apple.WindowManager",
-               Self.isDesktopBackdrop(frame: frame, display: screen.frame, finderRole: nil) { continue }
-            protected.append(frame)
-        }
         // Finder draws its icons in one desktop window. Their individual frames
         // are available through Accessibility when the user has granted access.
         let now = ProcessInfo.processInfo.systemUptime
@@ -199,7 +187,29 @@ final class WallpaperDesktopInput {
             nextIconRead = now + 1
             iconFrames = Self.finderIconFrames(mainHeight: mainHeight)
         }
-        return protected + iconFrames
+        return Self.desktopItemWindowFrames(windows, display: screen.frame, mainHeight: mainHeight) + iconFrames
+    }
+
+    static func desktopItemWindowFrames(_ windows: [[String: Any]], display: CGRect, mainHeight: CGFloat) -> [CGRect] {
+        let iconLevel = Int(CGWindowLevelForKey(.desktopIconWindow))
+        var protected: [CGRect] = []
+        for window in windows {
+            guard let level = window[kCGWindowLayer as String] as? Int, (iconLevel...iconLevel + 1).contains(level),
+                  (window[kCGWindowAlpha as String] as? Double ?? 1) > 0,
+                  let owner = window[kCGWindowOwnerPID as String] as? pid_t, owner != getpid(),
+                  let bounds = window[kCGWindowBounds as String] as? NSDictionary,
+                  var frame = CGRect(dictionaryRepresentation: bounds) else { continue }
+            frame.origin.y = mainHeight - frame.maxY
+            guard frame.intersects(display) else { continue }
+            let bundle = NSRunningApplication(processIdentifier: owner)?.bundleIdentifier
+            // WindowServer draws a screen-wide shadow below the menu bar at this
+            // level. It is present in the compositor list but cannot receive clicks.
+            if bundle == nil, window[kCGWindowOwnerName as String] as? String == "Window Server" { continue }
+            if level == iconLevel, bundle == "com.apple.finder" || bundle == "com.apple.WindowManager",
+               Self.isDesktopBackdrop(frame: frame, display: display, finderRole: nil) { continue }
+            protected.append(frame)
+        }
+        return protected
     }
 
     private static func finderIconFrames(mainHeight: CGFloat) -> [CGRect] {
@@ -238,7 +248,7 @@ final class WallpaperDesktopInput {
         guard event.timestamp >= nextHoverCheck else { return }
         nextHoverCheck = event.timestamp + 0.035
         let point = NSEvent.mouseLocation
-        guard let screen = activeScreen, screen.visibleFrame.contains(point), let location = location(at: point),
+        guard let screen = activeScreen, screen.frame.contains(point), let location = location(at: point),
               Self.canRoute(at: point, on: screen, ignoring: panelNumbers) else { leaveDesktop(); return }
         forward(.hover, at: location)
     }
@@ -249,7 +259,7 @@ final class WallpaperDesktopInput {
         let point = CGPoint(x: quartz.x, y: CGDisplayBounds(CGMainDisplayID()).height - quartz.y)
         if event.type == .leftMouseDown {
             guard event.clickCount > 0, event.modifierFlags.intersection(Self.systemModifiers).isEmpty,
-                  let screen = activeScreen, screen.visibleFrame.contains(point), let pos = location(at: point),
+                  let screen = activeScreen, screen.frame.contains(point), let pos = location(at: point),
                   Self.canRoute(at: point, on: screen, target: Self.globalEventTarget(cgEvent), ignoring: panelNumbers)
             else { return }
             if Self.stageManagerEnabled {

@@ -101,9 +101,9 @@ final class SubscriptionsModel: ObservableObject {
         pendingUnsubscribeCount = todo.count
         unsubscribeFailures.removeAll()
 
-        SteamWebSession.shared.refresh { [weak self] authenticated in
+        SteamWebSession.shared.authenticatedSession { [weak self] auth in
             guard let self else { return }
-            if authenticated {
+            if auth != nil || SteamWebSession.shared.isAuthenticated || SteamWebSession.shared.websiteUnavailable {
                 self.performUnsubscribe(todo)
             } else {
                 SteamWebLoginWindowController.shared.authorize { [weak self] authorized in

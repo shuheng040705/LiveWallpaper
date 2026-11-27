@@ -53,8 +53,8 @@ struct DownloadsView: View {
             Image(systemName: "person.crop.circle.badge.exclamationmark.fill")
                 .font(.system(size: 16)).foregroundStyle(.orange)
             VStack(alignment: .leading, spacing: 1) {
-                Text("Steam 账号登录已失效").font(.system(size: 12.5, weight: .semibold))
-                Text("缓存的登录令牌过期了,重新登录后即可继续下载").font(.system(size: 11)).foregroundStyle(.secondary)
+                Text("SteamCMD 下载账号需要重新验证").font(.system(size: 12.5, weight: .semibold))
+                Text("请重新登录 SteamCMD 下载账号，然后重试下载").font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
             Button { showLogin = true } label: {

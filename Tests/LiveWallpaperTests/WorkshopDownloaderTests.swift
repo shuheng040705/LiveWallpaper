@@ -63,7 +63,8 @@ final class WorkshopDownloaderTests: XCTestCase {
         let library = root.appendingPathComponent("library")
         try FileManager.default.createDirectory(at: library, withIntermediateDirectories: true)
         return (WorkshopDownloader(stagingDirectory: root.appendingPathComponent("cache"), executable: script,
-                                   libraryDirectory: library, account: "fixture", timeouts: timeouts), root)
+                                   libraryDirectory: library, account: "fixture", timeouts: timeouts,
+                                   loginCacheSource: root.appendingPathComponent("saved")), root)
     }
 
     @MainActor
@@ -226,6 +227,83 @@ final class WorkshopDownloaderTests: XCTestCase {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.1) { quiet.fulfill() }
         wait(for: [quiet], timeout: 3)
         XCTAssertEqual(processBoots(at: root).count, 1)
+    }
+
+    @MainActor
+    func testRateLimitedLoginReconnectsWithoutDeclaringTheAccountExpired() throws {
+        let (downloader, root) = try makeDownloaderFixture(timeouts: .init(connectionCheck: 0.05, reconnectDelay: 0.05))
+        defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
+        let script = root.appendingPathComponent("steamcmd-fixture")
+        let body = try String(contentsOf: script, encoding: .utf8).replacingOccurrences(
+            of: "echo 'Waiting for user info...OK'",
+            with: """
+            if mkdir "$base/first-login" 2>/dev/null; then
+              echo 'FAILED login (Rate Limit Exceeded)'
+              exit 1
+            fi
+            echo 'Waiting for user info...OK'
+            """
+        )
+        try body.write(to: script, atomically: true, encoding: .utf8)
+        let connected = expectation(description: "Background login recovers after the rate limit")
+        let observer = downloader.$connectedSessionCount.first(where: { $0 == 3 }).sink { _ in connected.fulfill() }
+        let expired = downloader.$loginExpired.sink { XCTAssertFalse($0) }
+        downloader.prewarm()
+        wait(for: [connected], timeout: 8)
+        observer.cancel()
+        expired.cancel()
+        XCTAssertEqual(processBoots(at: root).count, 4)
+    }
+
+    @MainActor
+    func testStartupRetriesARejectedWorkerCacheFromTheSavedLogin() throws {
+        let (downloader, root) = try makeDownloaderFixture(timeouts: .init(connectionCheck: 0.05))
+        defer { downloader.shutdown(); try? FileManager.default.removeItem(at: root) }
+        let saved = root.appendingPathComponent("saved/config")
+        let existing = root.appendingPathComponent("cache/Workers/0/home/Library/Application Support/Steam/config")
+        for dir in [saved, existing] {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        }
+        try Data("good".utf8).write(to: saved.appendingPathComponent("config.vdf"))
+        try Data("stale".utf8).write(to: existing.appendingPathComponent("config.vdf"))
+        let script = root.appendingPathComponent("steamcmd-fixture")
+        let body = try String(contentsOf: script, encoding: .utf8).replacingOccurrences(
+            of: "echo 'Waiting for user info...OK'",
+            with: """
+            if ! grep -qx good "$HOME/Library/Application Support/Steam/config/config.vdf"; then
+              echo 'ERROR (Invalid Password)'
+              exit 1
+            fi
+            echo 'Waiting for user info...OK'
+            """
+        )
+        try body.write(to: script, atomically: true, encoding: .utf8)
+        let expired = downloader.$loginExpired.sink { XCTAssertFalse($0) }
+        downloader.prewarm()
+        waitForConnections(downloader, count: 3)
+        expired.cancel()
+        XCTAssertEqual(processBoots(at: root).count, 4)
+    }
+
+    func testRestartKeepsWorkerLoginCacheAndRejectedCacheCanUseAnotherAuthorizedCopy() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? fm.removeItem(at: root) }
+        let source = root.appendingPathComponent("source")
+        let worker = root.appendingPathComponent("worker")
+        let file = "config/config.vdf"
+        try fm.createDirectory(at: source.appendingPathComponent("config"), withIntermediateDirectories: true)
+        try Data("initial-fixture".utf8).write(to: source.appendingPathComponent(file))
+        XCTAssertTrue(try WorkshopDownloader.seedLoginCache(from: source, to: worker))
+        try Data("updated-by-steamcmd".utf8).write(to: worker.appendingPathComponent(file))
+        XCTAssertFalse(try WorkshopDownloader.seedLoginCache(from: source, to: worker))
+        XCTAssertEqual(try String(contentsOf: worker.appendingPathComponent(file)), "updated-by-steamcmd")
+
+        try Data("renewed-by-login".utf8).write(to: source.appendingPathComponent(file))
+        XCTAssertTrue(try WorkshopDownloader.seedLoginCache(from: source, to: worker, replacingRejected: true))
+        XCTAssertEqual(try String(contentsOf: worker.appendingPathComponent(file)), "renewed-by-login")
+        XCTAssertFalse(try WorkshopDownloader.seedLoginCache(from: source, to: worker, replacingRejected: true))
+        XCTAssertEqual(try fm.attributesOfItem(atPath: worker.appendingPathComponent(file).path)[.posixPermissions] as? Int, 0o600)
     }
 
     func testIdleDisconnectDetectionIgnoresFailuresBeforeACompletedLogin() {
@@ -530,6 +608,11 @@ final class WorkshopDownloaderTests: XCTestCase {
         XCTAssertFalse(WorkshopDownloader.outputShowsAuthenticationFailure(output))
         XCTAssertTrue(WorkshopDownloader.outputShowsDownloadFailure(output, id: "3458955634"))
         XCTAssertFalse(WorkshopDownloader.outputShowsConnectionFailure("Retrying..."))
+        for detail in ["FAILED login (No Connection)", "FAILED login (Rate Limit Exceeded)", "Login Failure"] {
+            XCTAssertFalse(WorkshopDownloader.outputShowsAuthenticationFailure(detail))
+            XCTAssertTrue(WorkshopDownloader.outputShowsDownloadFailure(detail, id: "3458955634"))
+        }
+        XCTAssertTrue(WorkshopDownloader.outputShowsAuthenticationFailure("FAILED login (Invalid Password)"))
         XCTAssertTrue(WorkshopDownloader.outputShowsAuthenticationFailure("Cached credentials not found.\npassword:"))
     }
 

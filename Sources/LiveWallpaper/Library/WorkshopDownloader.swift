@@ -11,6 +11,7 @@ final class WorkshopDownloader: ObservableObject {
     private let executableOverride: URL?
     private let libraryDirectoryOverride: URL?
     private let accountOverride: String?
+    private let loginCacheSource: URL?
     struct Timeouts {
         var login: TimeInterval = 90
         var commandStart: TimeInterval = 60
@@ -21,12 +22,15 @@ final class WorkshopDownloader: ObservableObject {
     }
     private let timeouts: Timeouts
     init(stagingDirectory: URL? = nil, executable: URL? = nil, libraryDirectory: URL? = nil, account: String? = nil,
-         timeouts: Timeouts = Timeouts()) {
+         timeouts: Timeouts = Timeouts(), loginCacheSource: URL? = nil) {
         stagingDirectoryOverride = stagingDirectory
         executableOverride = executable
         libraryDirectoryOverride = libraryDirectory
         self.timeouts = timeouts
         accountOverride = account
+        self.loginCacheSource = loginCacheSource ?? (executable == nil
+            ? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Steam")
+            : nil)
     }
     private let appID = "431960"
     static let simultaneousDownloads = 3
@@ -466,7 +470,7 @@ final class WorkshopDownloader: ObservableObject {
                     self.connectionFailures = 0
                     self.nextConnectionAttempt = .distantPast
                     Log.write("WorkshopDownloader: 常驻槽位 \(slot) 已连接")
-                case .failure(let reason):
+                case .failure(let reason, _):
                     self.connectionFailures += 1
                     let delay = min(300, self.timeouts.reconnectDelay * pow(2, Double(min(self.connectionFailures - 1, 4))))
                     self.nextConnectionAttempt = Date().addingTimeInterval(delay)
@@ -514,8 +518,9 @@ final class WorkshopDownloader: ObservableObject {
                 try version.write(to: marker, atomically: true, encoding: .utf8)
             }
             executable = runtime.appendingPathComponent("steamcmd")
+        }
+        if let sourceSteam = loginCacheSource {
             // 沿用用户已授权的缓存凭据，不保存密码，不让 worker 修改用户的 Steam 配置。
-            let sourceSteam = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Steam")
             let targetSteam = home.appendingPathComponent("Library/Application Support/Steam")
             try fm.createDirectory(at: targetSteam.appendingPathComponent("config"), withIntermediateDirectories: true)
             // SteamAPI 在 HOME 下查找 macOS 的 IPC helper。缺少入口时会初始化失败，
@@ -526,19 +531,40 @@ final class WorkshopDownloader: ObservableObject {
                     try fm.createSymbolicLink(at: to, withDestinationURL: from)
                 }
             }
-            for name in ["config/config.vdf", "config/loginusers.vdf", "registry.vdf"] {
-                let from = sourceSteam.appendingPathComponent(name), to = targetSteam.appendingPathComponent(name)
-                if fm.fileExists(atPath: from.path) {
-                    try? fm.removeItem(at: to)
-                    try fm.copyItem(at: from, to: to)
-                    try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: to.path)
-                }
-            }
+            try Self.seedLoginCache(from: sourceSteam, to: targetSteam)
         }
         let contentRoot = slotContentRoot(session.slot)
         try fm.createDirectory(at: contentRoot, withIntermediateDirectories: true)
         try WorkshopInstallCache.repairManifest(in: contentRoot, appID: appID)
         return executable
+    }
+
+    /// SteamCMD refreshes login state inside its isolated home. An ordinary launch
+    /// must preserve that state. Only replace it after Steam rejects that copy.
+    @discardableResult
+    static func seedLoginCache(from source: URL, to target: URL, replacingRejected: Bool = false) throws -> Bool {
+        let fm = FileManager.default
+        var changed = false
+        for name in ["config/config.vdf", "config/loginusers.vdf", "registry.vdf"] {
+            let from = source.appendingPathComponent(name)
+            let to = target.appendingPathComponent(name)
+            guard fm.fileExists(atPath: from.path) else { continue }
+            let exists = fm.fileExists(atPath: to.path)
+            if exists && (!replacingRejected || fm.contentsEqual(atPath: from.path, andPath: to.path)) { continue }
+            let directory = to.deletingLastPathComponent()
+            try fm.createDirectory(at: directory, withIntermediateDirectories: true)
+            let pending = directory.appendingPathComponent(".login-" + UUID().uuidString)
+            defer { try? fm.removeItem(at: pending) }
+            try fm.copyItem(at: from, to: pending)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: pending.path)
+            if exists {
+                _ = try fm.replaceItemAt(to, withItemAt: pending, options: .usingNewMetadataOnly)
+            } else {
+                try fm.moveItem(at: pending, to: to)
+            }
+            changed = true
+        }
+        return changed
     }
 
     private func prepareItem(_ id: String, in session: Session) throws {
@@ -593,7 +619,7 @@ final class WorkshopDownloader: ObservableObject {
 
     private enum SessionReadyResult {
         case success
-        case failure(String)
+        case failure(String, credentialsRejected: Bool = false)
     }
 
     /// workerQueue 专用；nil 表示后台预连接，不创建下载条目或安装任何内容。
@@ -624,7 +650,30 @@ final class WorkshopDownloader: ObservableObject {
         do { executable = try prepareWorker(session) }
         catch { return .failure("无法准备独立下载服务：\(error.localizedDescription)") }
         if cancelled() { return .failure("用户取消下载") }
-        return launchSteamCMD(executable, account: wantedAccount, id: id, session: session, allowUpdateRelaunch: true)
+        func launch() -> SessionReadyResult {
+            launchSteamCMD(executable, account: wantedAccount, id: id, session: session, allowUpdateRelaunch: true)
+        }
+        var result = launch()
+        if case .failure(_, true) = result, wantedAccount != "anonymous", let loginCacheSource, !cancelled() {
+            let target = workerHome(session.slot).appendingPathComponent("Library/Application Support/Steam")
+            do {
+                let refreshed = try Self.seedLoginCache(from: loginCacheSource, to: target,
+                                                        replacingRejected: true)
+                if refreshed { result = launch() }
+            } catch {
+                return .failure("无法恢复 SteamCMD 登录缓存：\(error.localizedDescription)")
+            }
+        }
+        if case .failure(_, true) = result { reportCredentialRejection(for: wantedAccount) }
+        return result
+    }
+
+    private func reportCredentialRejection(for account: String) {
+        DispatchQueue.main.async {
+            guard account != "anonymous", self.wantedAccount == account,
+                  !self.sessionPool.values.contains(where: self.sessionIsUsable) else { return }
+            self.loginExpired = true
+        }
     }
 
     private func launchSteamCMD(_ executable: URL, account wantedAccount: String, id: String?,
@@ -718,16 +767,22 @@ final class WorkshopDownloader: ObservableObject {
                 DispatchQueue.main.async { self.loginExpired = false; self.refreshConnectionStatus() }
                 return .success
             }
-            if Self.outputShowsAuthenticationFailure(snapshot) {
-                DispatchQueue.main.async { self.loginExpired = wantedAccount != "anonymous" }
+            if Self.outputShowsRateLimit(snapshot) {
                 shutdownSession(session, graceful: false)
-                return .failure(wantedAccount == "anonymous"
-                    ? "匿名 Steam 会话登录失败"
-                    : "SteamCMD 登录已失效，请在设置中重新登录")
+                return .failure(Self.rateLimitMessage)
             }
             if Self.outputShowsConnectionFailure(snapshot) {
                 shutdownSession(session, graceful: false)
                 return .failure("连接 Steam/CDN 失败，请检查网络或代理后重试")
+            }
+            if Self.outputShowsAuthenticationFailure(snapshot) {
+                shutdownSession(session, graceful: false)
+                return .failure(wantedAccount == "anonymous" ? "匿名 Steam 会话登录失败" : "SteamCMD 需要重新登录",
+                                credentialsRejected: true)
+            }
+            if Self.outputShowsUnspecifiedLoginFailure(snapshot) {
+                shutdownSession(session, graceful: false)
+                return .failure("SteamCMD 未能登录，将重新连接")
             }
             if sessionDidTerminate(session) {
                 // EOF may arrive just before Foundation observes the process exit.
@@ -757,12 +812,21 @@ final class WorkshopDownloader: ObservableObject {
 
     static func outputShowsAuthenticationFailure(_ output: String) -> Bool {
         output.localizedCaseInsensitiveContains("Invalid Password") ||
-        output.localizedCaseInsensitiveContains("FAILED login") ||
-        output.localizedCaseInsensitiveContains("Login Failure") ||
         output.localizedCaseInsensitiveContains("Steam Guard") ||
         output.localizedCaseInsensitiveContains("two-factor") ||
         output.localizedCaseInsensitiveContains("password:") ||
         output.localizedCaseInsensitiveContains("Cached credentials not found")
+    }
+
+    private static let rateLimitMessage = "Steam 登录请求过于频繁，请稍后重试"
+
+    private static func outputShowsRateLimit(_ output: String) -> Bool {
+        output == rateLimitMessage || output.localizedCaseInsensitiveContains("Rate Limit") ||
+        output.localizedCaseInsensitiveContains("RateLimitExceeded")
+    }
+
+    private static func outputShowsUnspecifiedLoginFailure(_ output: String) -> Bool {
+        output.localizedCaseInsensitiveContains("FAILED login") || output.localizedCaseInsensitiveContains("Login Failure")
     }
 
     static func outputShowsConnectionFailure(_ output: String) -> Bool {
@@ -777,6 +841,7 @@ final class WorkshopDownloader: ObservableObject {
             .compactMap { text.range(of: $0, options: .backwards)?.upperBound }.max() ?? text.startIndex
         let recent = String(text[connected...])
         return outputShowsAuthenticationFailure(recent) || outputShowsConnectionFailure(recent) ||
+            outputShowsRateLimit(recent) || outputShowsUnspecifiedLoginFailure(recent) ||
             ["logged off", "logged out", "not logged on", "not logged in", "disconnected from steam"]
                 .contains(where: recent.contains)
     }
@@ -912,24 +977,30 @@ final class WorkshopDownloader: ObservableObject {
         let downloaded = itemRoot(id)
             .appendingPathComponent("steamapps/workshop/content/\(appID)/\(id)").path
         var lastOut = ""
+        var credentialsRejected = false
         var ok = false
         for retry in 1...2 {
             if isCancelled(id) { break }
             setPhase(id, retry == 1 ? .startingDownloader : .preparing, state: .connecting)
             switch ensureSessionReady(for: id, session: session) {
-            case .failure(let reason):
+            case .failure(let reason, let rejected):
                 lastOut = reason
-                break
+                credentialsRejected = rejected
             case .success:
                 setPhase(id, .preparing, state: .connecting)
                 let result = runDownloadCommand(id: id, session: session)
                 lastOut = result.output
+                // A session can lose its grant mid-transfer. Give a new login a chance
+                // to recover from the saved credential before notifying the user.
+                credentialsRejected = retry == 2 && !result.succeeded && Self.outputShowsAuthenticationFailure(lastOut)
+                    && !Self.outputShowsRateLimit(lastOut) && !Self.outputShowsConnectionFailure(lastOut)
+                if credentialsRejected { reportCredentialRejection(for: wantedAccount) }
                 if result.succeeded, FileManager.default.fileExists(atPath: downloaded) {
                     ok = true
                 }
             }
             if ok || isCancelled(id) || lastOut.contains("File Not Found") ||
-                Self.outputShowsAuthenticationFailure(lastOut) {
+                credentialsRejected || Self.outputShowsRateLimit(lastOut) {
                 break
             }
             Log.write("WorkshopDownloader \(id): 独立会话第 \(retry) 次下载失败，保留暂存内容重试")
@@ -944,33 +1015,24 @@ final class WorkshopDownloader: ObservableObject {
         guard ok else {
             if isCancelled(id) { finish(id, .cancelled); return }   // 取消:保留 tmp,UI 决定保留/删除
             let out = lastOut
-            // steamcmd 登录失败的真实文案不止 "FAILED login":缓存过期是 "ERROR (Invalid Password)",
-            // 还有 "Login Failure"/"Rate Limit Exceeded"/Steam Guard 等。统一识别,避免误报成"网络问题"。
-            let rateLimited = out.contains("Rate Limit")
-            let loginIssue = out.contains("Invalid Password") || out.contains("FAILED login") ||
-                             out.contains("Login Failure") || out.contains("Steam Guard") ||
-                             out.contains("two-factor") || out.contains("Two-factor") ||
-                             out.contains("登录已失效") || rateLimited
             let connectionIssue = out.contains("No Connection") ||
                                   out.contains("Failed to get list of download sources") ||
                                   out.contains("连接 Steam/CDN 超时") ||
                                   out.contains("登录超时")
-            let hasAccount = accountOverride != nil || PreferencesStore.shared.steamAccount != nil
+            let hasAccount = wantedAccount != "anonymous"
             let reason: String
             if out.contains("File Not Found") {
                 reason = "工坊条目不存在或已下架"
-            } else if rateLimited {
-                reason = "Steam 登录请求过于频繁,请稍等几分钟后重试"
-            } else if loginIssue && hasAccount {
-                reason = "Steam 账号登录已失效,请重新登录后重试"
-                DispatchQueue.main.async { self.loginExpired = true }   // 触发 UI 重新登录提醒
+            } else if Self.outputShowsRateLimit(out) {
+                reason = Self.rateLimitMessage
+            } else if credentialsRejected && hasAccount {
+                reason = "SteamCMD 需要重新登录后重试"
             } else if connectionIssue || Self.outputShowsConnectionFailure(out) || out.contains("连接 Steam/CDN 失败") {
                 reason = "连接 Steam CDN 失败，请检查网络或代理后重试（暂存进度已保留）"
             } else if out.contains("下载进度长时间未增长") {
                 reason = "下载长时间无响应，已自动重试；暂存进度已保留，可稍后继续"
             } else if !hasAccount {
                 reason = "未登录 Steam,新壁纸需先登录账号"
-                DispatchQueue.main.async { self.loginExpired = true }
             } else {
                 reason = "下载失败(已重试),请检查网络后再试"
             }
@@ -1162,7 +1224,8 @@ final class WorkshopDownloader: ObservableObject {
 
     static func outputShowsDownloadFailure(_ output: String, id: String) -> Bool {
         output.contains("ERROR! Download item \(id) failed") ||
-        outputShowsAuthenticationFailure(output) || outputShowsConnectionFailure(output)
+        outputShowsAuthenticationFailure(output) || outputShowsConnectionFailure(output) ||
+        outputShowsRateLimit(output) || outputShowsUnspecifiedLoginFailure(output)
     }
 
     static func downloadTimeoutReason(sawCommandStart: Bool, elapsed: TimeInterval, idle: TimeInterval, startTimeout: TimeInterval = 60, progressTimeout: TimeInterval = 180) -> String? {
@@ -1271,6 +1334,7 @@ final class WorkshopDownloader: ObservableObject {
                 }
                 let msg: String
                 if success { msg = "登录成功" }
+                else if Self.outputShowsRateLimit(out) { msg = Self.rateLimitMessage }
                 else if timedOut || Self.outputShowsConnectionFailure(out) {
                     msg = "连接 Steam 超时或失败，请检查网络或代理后重试"
                 } else if needGuard { msg = "需要 Steam 令牌验证码" }

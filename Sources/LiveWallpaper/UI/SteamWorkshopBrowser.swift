@@ -19,6 +19,11 @@ final class SteamWorkshopBrowser: NSObject, ObservableObject, WKNavigationDelega
     private var failedURL: URL?
     private var navigation: WKNavigation?
     private var requestedLogout = false
+    private var recoveryCompletion: CheckedContinuation<Bool, Never>?
+    private var recoveryTimeout: Task<Void, Never>?
+    private var pendingOpen: URL?
+    private var preloadingHome = false
+    private var preloadTimedOut = false
 
     override init() {
         let configuration = WKWebViewConfiguration()
@@ -38,18 +43,59 @@ final class SteamWorkshopBrowser: NSObject, ObservableObject, WKNavigationDelega
         webView.publisher(for: \.isLoading).removeDuplicates().assign(to: &$isLoading)
     }
 
+    /// Reuse the same page for background session renewal and the visible tab.
+    /// User navigation takes precedence, including during a background attempt.
+    func loadForSessionRecovery() async -> Bool {
+        await withCheckedContinuation { continuation in
+            recoveryCompletion = continuation
+            recoveryTimeout = Task { @MainActor [weak self] in
+                do { try await Task.sleep(nanoseconds: 8_000_000_000) } catch { return }
+                self?.preloadTimedOut = true
+                self?.finishRecovery(false)
+            }
+            if preloadTimedOut, webView.window == nil, let requestedURL {
+                open(requestedURL)
+                return
+            }
+            guard !webView.isLoading, pendingOpen == nil else { return }
+            if !hasOpenedPage {
+                preloadingHome = true
+                goHome()
+            } else if let failedURL { open(failedURL) }
+            else if webView.window == nil { reload() }
+            else { finishRecovery(true) } // keep an already visible page and its form state
+        }
+    }
+
+    private func finishRecovery(_ loaded: Bool) {
+        recoveryTimeout?.cancel()
+        recoveryTimeout = nil
+        let waiter = recoveryCompletion
+        recoveryCompletion = nil
+        waiter?.resume(returning: loaded)
+    }
+
     func openIfNeeded() {
-        guard !hasOpenedPage else { return }
-        goHome()
+        if preloadingHome {
+            preloadingHome = false
+            if failedURL != nil || preloadTimedOut { reload() }
+        } else if !hasOpenedPage { goHome() }
     }
 
     func open(_ url: URL) {
         guard Self.isSteamPage(url) else { return }
         hasOpenedPage = true
         requestedURL = url
+        pendingOpen = url
+        preloadTimedOut = false
         loadingError = nil
         failedURL = nil
-        webView.load(URLRequest(url: url))
+        Task { @MainActor in
+            await SteamWebSession.shared.prepareForWorkshop()
+            guard pendingOpen == url else { return }
+            pendingOpen = nil
+            webView.load(URLRequest(url: url))
+        }
     }
 
     func goHome() { open(Self.homeURL) }
@@ -140,6 +186,8 @@ final class SteamWorkshopBrowser: NSObject, ObservableObject, WKNavigationDelega
             guard let self, navigation === self.navigation else { return }
             SteamWebSession.shared.updateFromWebsite(cookies: cookies, afterLogout: afterLogout)
             if afterLogout { self.requestedLogout = false }
+            self.preloadTimedOut = false
+            self.finishRecovery(self.failedURL == nil)
         }
     }
 
@@ -159,6 +207,7 @@ final class SteamWorkshopBrowser: NSObject, ObservableObject, WKNavigationDelega
         let address = nsError.userInfo[NSURLErrorFailingURLErrorKey] as? URL
         failedURL = address.flatMap { Self.isSteamPage($0) ? $0 : nil } ?? requestedURL ?? webView.url ?? Self.homeURL
         loadingError = nsError.localizedDescription
+        finishRecovery(false)
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
@@ -166,6 +215,7 @@ final class SteamWorkshopBrowser: NSObject, ObservableObject, WKNavigationDelega
         SteamWorkshopSubscriptionBridge.shared.clearDetail()
         failedURL = webView.url ?? requestedURL ?? Self.homeURL
         loadingError = "Steam 网页进程已退出，请重新加载。"
+        finishRecovery(false)
     }
 
     func webView(_ webView: WKWebView, requestMediaCapturePermissionFor origin: WKSecurityOrigin,

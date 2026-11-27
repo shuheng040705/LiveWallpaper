@@ -59,8 +59,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         setupMenuBar()
         setupMainMenu()
-        // 启动时从 WebKit 恢复网页会话，钥匙串授权由用户打开 Steam 登录时进行。
-        SteamWebSession.shared.refresh()
+        Task { @MainActor in await SteamWebSession.shared.resumeRememberedSession() }
         // 首页预览每次重启重新渲染一遍(清磁盘缓存),反映引擎最新改动(用户要求)。
         RenderedPreviewCache.shared.invalidateAllOnLaunch()
         // UI 预览也使用完整的窗口/订阅事件连接，便于实测原生工坊交互。

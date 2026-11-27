@@ -3,6 +3,27 @@ import XCTest
 @testable import LiveWallpaper
 
 final class WallpaperDesktopRoutingTests: XCTestCase {
+    func testDesktopShadowLeavesWallpaperClickableAndDesktopItemKeepsItsFrame() {
+        let display = CGRect(x: -1200, y: 150, width: 1200, height: 800)
+        let mainHeight: CGFloat = 1080
+        let iconLevel = Int(CGWindowLevelForKey(.desktopIconWindow))
+        func window(_ name: String, _ frame: CGRect, alpha: Double = 1) -> [String: Any] {
+            [kCGWindowOwnerPID as String: pid_t(0), kCGWindowOwnerName as String: name,
+             kCGWindowLayer as String: iconLevel + 1, kCGWindowAlpha as String: alpha,
+             kCGWindowBounds as String: frame.dictionaryRepresentation]
+        }
+        let shadow = CGRect(x: -1200, y: 130, width: 1200, height: 94)
+        let item = CGRect(x: -80, y: 175, width: 64, height: 64)
+        let exclusions = WallpaperDesktopInput.desktopItemWindowFrames(
+            [window("Window Server", shadow), window("Desktop widget", item),
+             window("Hidden widget", shadow, alpha: 0)], display: display, mainHeight: mainHeight)
+        XCTAssertEqual(exclusions, [CGRect(x: -80, y: mainHeight - item.maxY, width: 64, height: 64)])
+        let panels = WallpaperDesktopInput.uncoveredRegions([display], excluding: exclusions)
+        XCTAssertTrue(panels.contains { $0.contains(CGPoint(x: -600, y: display.maxY - 50)) })
+        XCTAssertTrue(panels.contains { $0.contains(CGPoint(x: display.minX + 5, y: display.minY + 2)) })
+        XCTAssertFalse(panels.contains { $0.contains(CGPoint(x: item.midX, y: mainHeight - item.midY)) })
+    }
+
     @MainActor
     func testPassiveSceneAndVideoInstallOneDesktopRouterAndReleaseItOnStop() throws {
         _ = NSApplication.shared
