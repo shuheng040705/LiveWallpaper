@@ -169,6 +169,7 @@ final class WebRenderer: NSObject, WallpaperRenderer, WKNavigationDelegate, WKUR
         let paused = hostPaused
         let js = """
         (() => {
+            window.__lwSetHostMediaPaused?.(\(paused));
             const listener = window.wallpaperPropertyListener;
             if (typeof listener?.setPaused === 'function') listener.setPaused(\(paused));
             else {
